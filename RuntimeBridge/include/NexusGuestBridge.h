@@ -22,7 +22,8 @@ char *nexus_acp_start_gemini(const char *rootfs_data_path, const char *expected_
 char *nexus_acp_new_session(const char *session_new_request);
 // Explicit model-network consent; one fixed prompt, no arbitrary content.
 char *nexus_acp_prompt_probe(void);
-// One consented text turn (max 1024 UTF-8 bytes); no project mount.
+// Up to three consented text turns (max 1024 UTF-8 bytes each); no project mount.
+// Smoke test and chat are mutually exclusive within one boot.
 char *nexus_acp_chat(const char *text);
 // Concurrent-safe status and cancel request; does not wait for completion.
 char *nexus_acp_prompt_progress(void);

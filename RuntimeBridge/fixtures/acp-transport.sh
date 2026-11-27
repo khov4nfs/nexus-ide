@@ -20,6 +20,22 @@ if [ "${NEXUS_FIXTURE_CHAT:-0}" = 1 ]; then
     sleep 2
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Nexus!"}}}}\n' "$$"
     printf '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}\n'
+    # A stateful test peer: the second and third requests must arrive at
+    # this same process/session, with distinct correlated IDs.
+    IFS= read -r fourth
+    case "$fourth" in *'"id":4'*) ;; *) exit 62 ;; esac
+    case "$fourth" in *'"method":"session/prompt"'*) ;; *) exit 63 ;; esac
+    case "$fourth" in *'"sessionId":"fixture-'$$'"'*) ;; *) exit 64 ;; esac
+    case "$fourth" in *'Bạn nhớ lời chào không?'*) ;; *) exit 65 ;; esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Nhớ lời chào Nexus."}}}}\n' "$$"
+    printf '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}\n'
+    IFS= read -r fifth
+    case "$fifth" in *'"id":5'*) ;; *) exit 66 ;; esac
+    case "$fifth" in *'"method":"session/prompt"'*) ;; *) exit 67 ;; esac
+    case "$fifth" in *'"sessionId":"fixture-'$$'"'*) ;; *) exit 68 ;; esac
+    case "$fifth" in *'Cảm ơn'*) ;; *) exit 69 ;; esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Không có gì."}}}}\n' "$$"
+    printf '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}\n'
     IFS= read -r unexpected
     exit 61
 fi

@@ -29,7 +29,13 @@ require(r.get("chatMode") is chat and r.get("cancelMode") is cancel and r["idleC
 require(p.get("ok") is True and p.get("active") is True and p.get("responseId") == 3, "Prompt failed")
 if chat:
     require(r.get("progressSeen") is True and p.get("chatCompleted") is True and p.get("chunkCount") == 2 and p.get("stopReason") == "end_turn", "Missing streaming chat evidence")
-    require(r["finishedProgress"].get("text") == "Xin chào Nexus!", "Incorrect final chat text")
+    require(r["finishedProgress"].get("text") == "Xin chào Nexus!" and r["finishedProgress"].get("responseId") == 3, "Incorrect first chat text")
+    for name, expected_id, expected_text in (("followup", 4, "Nhớ lời chào Nexus."), ("third", 5, "Không có gì.")):
+        turn = r[name]
+        progress = r[name + "Progress"]
+        require(turn.get("ok") is True and turn.get("active") is True and turn.get("chatCompleted") is True and turn.get("responseId") == expected_id and turn.get("stopReason") == "end_turn", "Missing followup response")
+        require(progress.get("running") is False and progress.get("responseId") == expected_id and progress.get("text") == expected_text, "Stale or incorrect followup snapshot")
+    require(r["overLimit"].get("ok") is False and r["overLimit"].get("active") is True, "Fourth turn not rejected")
 elif cancel:
     require(r.get("progressSeen") is True and r["cancelRequest"].get("ok") is True and r["duplicateCancel"].get("ok") is False, "Missing live progress or cancel request")
     require(p.get("cancelled") is True and p.get("stopReason") == "cancelled" and p.get("chunkCount") == 1 and "marker" not in p, "Missing cancellation acknowledgement")
