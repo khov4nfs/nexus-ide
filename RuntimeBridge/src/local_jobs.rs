@@ -110,7 +110,7 @@ fn parse_cli(input:&str)->Option<(String,String,String,Option<String>,Option<Nat
     let interactive=matches!(action,"codexSession"|"claudeSession");
     let prompt=if interactive||matches!(action,"appServerChat"|"claudeChat") {
         let p=v["prompt"].as_str()?;
-        if fields!=if interactive{6}else{4} || !valid_agent_text(p){return None;}
+        if fields!=(if interactive{6}else{4}) || !valid_agent_text(p){return None;}
         Some(p.to_owned())
     }else{if fields!=3{return None;}None};
     let session=if interactive{
@@ -375,6 +375,62 @@ mod tests {
         let evidence=json!({"ok":ok&&clean,"fixtureOnly":true,"phase":phase,"shutdownClean":clean});
         std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
         assert!(ok&&clean);
+    }
+    #[test]
+    #[ignore = "requires independent Ubuntu guest boot for each phase"]
+    fn real_native_conversation_fixture(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let kind=std::env::var("NEXUS_CONVERSATION_KIND").expect("kind");
+        let phase=std::env::var("NEXUS_CONVERSATION_PHASE").expect("phase");
+        let handle=if kind=="codex"{"fixture-thread"}else{"550e8400-e29b-41d4-a716-446655440000"};
+        let config=NativeSession{retain:true,resume:if phase=="resume"{Some(handle.into())}else{None}};
+        {
+            let mut s=STATE.lock().unwrap();
+            s.running=true;s.mode=7;s.stop=false;s.agent=Some(AgentMailbox::default());
+        }
+        let driver=std::thread::spawn(||{
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);
+            let mut sent=false;
+            while std::time::Instant::now()<deadline{
+                let p=progress();
+                if p["agentWaiting"]==true{
+                    let n=p["agentTurns"].as_array().unwrap().len();
+                    if n==1&&!sent{
+                        assert_eq!(enqueue(Control::Input(b"forbidden".to_vec()))["ok"],false);
+                        assert_eq!(agent_send(Some("Second fixture".into()))["ok"],true);
+                        assert_eq!(agent_send(Some("duplicate".into()))["ok"],false);
+                        sent=true;
+                    }else if n==2{assert_eq!(agent_send(None)["ok"],true);return true;}
+                }
+                if p["running"]!=true{return false;}
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let _=enqueue(Control::Stop);
+            false
+        });
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin".into()),("HOME".into(),"/root".into()),("NEXUS_CONVERSATION_PHASE".into(),phase.clone()),("NEXUS_CLAUDE_FIXTURE_PHASE".into(),"conversation".into())]);
+        let r=if kind=="codex"{rt.block_on(process_probe::codex_session(&guest,&env,"First fixture",&config,true))}else{rt.block_on(process_probe::claude_session(&guest,&env,"First fixture",&config,true))};
+        let p=progress();
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        STATE.lock().unwrap().running=false;
+        let driven=driver.join().unwrap();
+        let ok=driven&&r["ok"]==true&&r["turnsCompleted"]==2&&p["agentHandle"]==handle&&p["agentTurns"][0]["response"]=="First reply"&&p["agentTurns"][1]["response"]=="Second reply"&&clean;
+        let evidence=json!({"ok":ok,"fixtureOnly":true,"kind":kind,"phase":phase,"turnsCompleted":r["turnsCompleted"],"shutdownClean":clean});
+        std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        assert!(ok,"conversation fixture failed: {r}");
+    }
+    #[test]
+    fn native_session_request_bounds(){
+        let valid=json!({"kind":"codex","sha256":"a".repeat(64),"action":"codexSession","prompt":"hello","retain":true,"resume":"fixture-thread"});
+        assert!(parse_cli(&valid.to_string()).is_some());
+        let mut v=valid.clone();v["retain"]=json!(false);assert!(parse_cli(&v.to_string()).is_none());
+        let mut v=valid.clone();v["resume"]=json!("../../bad");assert!(parse_cli(&v.to_string()).is_none());
+        let mut v=valid.clone();v["prompt"]=json!("x".repeat(2049));assert!(parse_cli(&v.to_string()).is_none());
+        assert!(valid_uuid("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!valid_uuid("not-a-session-id"));
     }
     #[test]
     #[ignore = "requires fresh Ubuntu fakefs; synthetic Claude JSON peer"]

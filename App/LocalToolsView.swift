@@ -103,7 +103,7 @@ struct LocalToolsView: View {
                         }.disabled(model.guestClaimed)
                         if ["appServerChat","claudeChat","codexSession","claudeSession"].contains(cliAction) {
                             TextField("Message to agent (max 2048 bytes)", text: $cliPrompt, axis: .vertical).disabled(model.guestClaimed)
-                            Text("One text turn; requires CLI-owned sign-in. Model request may incur charges. Codex requests read-only policy; Claude disables customizations and tools. No native grants. Output is untrusted and may contain guest secrets.").font(.caption)
+                            Text("Requires CLI-owned sign-in. Model request may incur charges. Codex requests read-only policy; Claude disables customizations and tools. No native grants. Output is untrusted and may contain guest secrets.").font(.caption)
                         }
                         Toggle("Keep separate agent guest and CLI login", isOn: $keepCLIGuest).disabled(model.guestClaimed || importingCLI)
                         if ["codexSession","claudeSession"].contains(cliAction) {
@@ -347,7 +347,8 @@ struct LocalToolsView: View {
         selectedVSIX = nil
         frozenCLI = nil
         if cli != nil { cliImport = nil }
-        nativeChat = selectedMode == 6 && ["codexSession","claudeSession"].contains(cliAction)
+        let reviewedAction = (try? JSONSerialization.jsonObject(with: Data(input.utf8)) as? [String: Any])?["action"] as? String ?? ""
+        nativeChat = selectedMode == 6 && ["codexSession","claudeSession"].contains(reviewedAction)
         agentWaiting = false; agentTurns = []; agentHandle = ""; followup = ""
         running = true
         report = "Starting local guest"

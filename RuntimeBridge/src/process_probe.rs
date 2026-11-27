@@ -1071,9 +1071,13 @@ async fn codex_run(guest:&IshInstance,env:&HashMap<String,String>,fixture:bool,p
 // Official Claude CLI JSON mode. Never parse or export account identity,
 // arbitrary stderr or auth tokens; the harness owns its authentication.
 async fn claude_json(guest:&IshInstance,env:&HashMap<String,String>,argv:Vec<&str>,fixture:bool,seconds:u64)->Result<(Value,i32),String>{
-    let mut opts=SpawnOpts::cmd(argv);
+    let mut opts=SpawnOpts::cmd(argv.iter().copied());
     #[cfg(test)]
-    if fixture{opts=shell(include_str!("../fixtures/claude-json.sh"),env);}
+    if fixture{
+        let mut args=vec!["/bin/sh","-c",include_str!("../fixtures/claude-json.sh"),"nexus-fixture"];
+        args.extend(argv.iter().skip(1).copied());
+        opts=SpawnOpts::cmd(args);
+    }
     #[cfg(not(test))]
     if fixture{return Err("Fixture unavailable".into());}
     opts.cwd=Some(Path::new("/tmp").to_path_buf());
