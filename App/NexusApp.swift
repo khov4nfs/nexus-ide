@@ -94,6 +94,7 @@ struct IDEView: View {
                     Section { Text("No remote execution backend. ACP framing is implemented; no live agent transport yet.") }
                 }.navigationTitle("Agents & runtimes")
             }.tabItem { Label("Agents", systemImage: "cpu") }
+            GuestProbeView().tabItem { Label("Linux Lab", systemImage: "terminal.fill") }
         }.task { await model.start() }
     }
     private func editor(_ file: String) -> some View {

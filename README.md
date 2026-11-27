@@ -21,3 +21,11 @@ Select your signing team and unique bundle identifier, then build/run on an iPho
 
 ## Roadmap
 See [architecture](docs/architecture.md) and [upstream integration gates](docs/runtime-gates.md). AGY, OpenVSCode, embedded Linux, MCP, Docker and extensions are not bundled or operational. No upstream code or proprietary binaries are redistributed. Licensing and App Store eligibility must be reviewed before distribution.
+
+## Experimental on-device Linux probe (0.2 development)
+
+The Linux Lab tab is disabled in the ordinary build. An opt-in device build links
+the pinned litter-ish Rust host library in-process, copies a bundled fakefs into
+a disposable writable directory, and runs a fixed smoke probe (ARM64, shell,
+stdout and nonzero exit). See [device build and acceptance gate](docs/guest-probe.md).
+This is not an available general Linux terminal or an AGY integration yet.
