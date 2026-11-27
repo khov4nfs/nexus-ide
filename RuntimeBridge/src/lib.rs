@@ -73,7 +73,11 @@ fn probe(path: &Path, packages: bool, toolchains: bool, workspace_text: &str) ->
 
 // A separate process is required for each guest boot. This never boots
 // Ubuntu after Alpine in the same process.
-fn compatibility_probe(path: &Path, agy: bool) -> Value {
+fn compatibility_probe(path: &Path, agy_digest: Option<&str>) -> Value {
+    let agy = agy_digest.is_some();
+    if agy_digest.is_some_and(|d| !process_probe::agy_digest_ok(d)) {
+        return json!({"ok":false,"stage":"compatibility","error":"Invalid expected AGY SHA-256"});
+    }
     if !path.is_dir() || !path.parent().map(|p| p.join("meta.db").is_file()).unwrap_or(false) {
         return json!({"ok":false,"stage":"rootfs","error":"Missing prepared fakefs"});
     }
@@ -90,16 +94,40 @@ fn compatibility_probe(path: &Path, agy: bool) -> Value {
     let shutdown = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt.block_on(async {
             rows.push(process_probe::glibc_compat(&guest, &env).await);
-            if agy && rows[0]["passed"] == true {
-                rows.push(process_probe::agy_initialize(&guest, &env).await);
+            if let Some(digest) = agy_digest {
+                if rows[0]["passed"] == true {
+                    rows.push(process_probe::agy_binary_digest(&guest, &env, digest).await);
+                    if rows[1]["passed"] == true {
+                        rows.push(process_probe::agy_initialize(&guest, &env).await);
+                    }
+                }
             }
             guest.shutdown().await.map_err(|e| e.to_string())
         }),
         Err(e) => Err(e.to_string()),
     };
-    let ok = shutdown.is_ok() && rows.len() == (if agy { 2 } else { 1 }) &&
+    let ok = shutdown.is_ok() && rows.len() == (if agy { 3 } else { 1 }) &&
         rows.iter().all(|r| r["passed"] == true);
     json!({"ok":ok,"stage":"compatibility","agyRequested":agy,"checks":rows,"shutdownError":shutdown.err()})
+}
+
+/// # Safety
+/// path must be a valid C string. digest may be null for libc-only mode,
+/// otherwise it must point to a valid expected lowercase SHA-256 string.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_guest_probe_glibc(path: *const c_char, digest: *const c_char) -> *mut c_char {
+    let report = std::panic::catch_unwind(|| {
+        if path.is_null() { return json!({"ok":false,"error":"Missing rootfs"}); }
+        let Ok(path) = CStr::from_ptr(path).to_str() else { return json!({"ok":false,"error":"Invalid rootfs path"}); };
+        let sha = if digest.is_null() { None } else {
+            match CStr::from_ptr(digest).to_str() {
+                Ok(s) => Some(s),
+                Err(_) => return json!({"ok":false,"error":"Invalid digest"}),
+            }
+        };
+        compatibility_probe(Path::new(path), sha)
+    }).unwrap_or_else(|_| json!({"ok":false,"error":"Runtime panic; restart app"}));
+    CString::new(report.to_string()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
 }
 
 /// # Safety
@@ -168,7 +196,8 @@ mod tests {
         let path = std::env::var_os("NEXUS_GLIBC_ROOTFS").expect("set NEXUS_GLIBC_ROOTFS");
         let evidence = std::env::var_os("NEXUS_GLIBC_EVIDENCE").expect("set NEXUS_GLIBC_EVIDENCE");
         let agy = std::env::var("NEXUS_TEST_AGY").as_deref() == Ok("1");
-        let report = compatibility_probe(Path::new(&path), agy);
+        let digest = if agy { Some(std::env::var("NEXUS_AGY_SHA256").expect("set reviewed AGY SHA-256")) } else { None };
+        let report = compatibility_probe(Path::new(&path), digest.as_deref());
         std::fs::write(evidence, serde_json::to_vec_pretty(&report).unwrap()).expect("write completed evidence");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         assert_eq!(report["ok"].as_bool(), Some(true), "{report}");

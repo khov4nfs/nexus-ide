@@ -10,6 +10,11 @@ on:
       - 'scripts/preflight-runtime.py'
       - 'scripts/build-glibc-rootfs.sh'
       - 'scripts/verify-glibc-evidence.py'
+      - 'scripts/prepare-agy-rootfs.py'
+      - 'scripts/test-agy-import.py'
+      - 'scripts/stage-ubuntu-device.sh'
+      - 'project-glibc.yml'
+      - 'App/UbuntuLabApp.swift'
       - 'project-guest.yml'
       - 'App/GuestProbeView.swift'
       - '.github/workflows/guest-probe.yml'
@@ -27,6 +32,7 @@ jobs:
         run: |
           rustup component add rustfmt
           python3 scripts/preflight-runtime.py
+          python3 scripts/test-agy-import.py
       - name: Install guest build dependencies
         run: brew install meson ninja llvm lld libarchive sqlite xcodegen
       - name: Build pinned runtime and rootfs
@@ -68,6 +74,10 @@ jobs:
           retention-days: 7
       - name: Build separate Ubuntu ARM64 compatibility rootfs
         run: bash scripts/build-glibc-rootfs.sh
+      - name: Unsigned Ubuntu Lab device build (no AGY binary)
+        run: |
+          bash scripts/stage-ubuntu-device.sh
+          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
       - name: Real glibc compatibility test (separate process)
         env:
           NEXUS_GLIBC_ROOTFS: ${{ github.workspace }}/Vendor/litter-ish/build/ubuntu-fs/data

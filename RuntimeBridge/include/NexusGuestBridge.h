@@ -11,6 +11,8 @@ char *nexus_guest_probe_packages(const char *rootfs_data_path);
 char *nexus_guest_probe_toolchains(const char *rootfs_data_path);
 // Offline text-only transfer, max 2048 UTF-8 bytes, no embedded NUL.
 char *nexus_guest_probe_workspace(const char *rootfs_data_path, const char *text);
+// Ubuntu compatibility; NULL digest means no AGY execution.
+char *nexus_guest_probe_glibc(const char *rootfs_data_path, const char *expected_agy_sha256);
 void nexus_guest_free(char *result);
 #ifdef __cplusplus
 }
