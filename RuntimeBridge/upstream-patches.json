@@ -37,6 +37,22 @@
       [
         "            if guard.is_some() {\n                return Ok(());\n            }\n            let timed_out = exit\n                .cv\n                .wait_for(&mut guard, Duration::from_secs(5))\n                .timed_out();\n            if timed_out && guard.is_none() {\n                Err(IshError::Supervisor(\"kernel exit timeout\".into()))\n            } else {\n                Ok(())\n            }",
         "            let deadline = std::time::Instant::now() + Duration::from_secs(5);\n            while guard.is_none() {\n                let remaining = deadline.saturating_duration_since(std::time::Instant::now());\n                if remaining.is_zero() {\n                    return Err(IshError::Supervisor(\"kernel exit timeout\".into()));\n                }\n                exit.cv.wait_for(&mut guard, remaining);\n            }\n            match *guard {\n                Some(0) => Ok(()),\n                Some(status) => Err(IshError::Supervisor(format!(\"kernel exit status {status}\"))),\n                None => Err(IshError::Supervisor(\"kernel exit timeout\".into())),\n            }"
+      ],
+      [
+        "eprintln!(\"[ish-out] {frame:?}\");",
+        "eprintln!(\"[ish-out] frame sent (payload omitted)\");"
+      ],
+      [
+        "eprintln!(\"[ish-in] {frame:?}\");",
+        "eprintln!(\"[ish-in] frame received (payload omitted)\");"
+      ],
+      [
+        "Err(e) => {\n                if trace {\n                    eprintln!(\"[ish-out] writer rx closed: {e}\");",
+        "Err(_) => {\n                if trace {\n                    eprintln!(\"[ish-out] writer rx closed\");"
+      ],
+      [
+        "if let Err(e) = ish_embed_protocol::write_frame(&mut writer, &frame) {\n            if trace {\n                eprintln!(\"[ish-out] writer write_frame error: {e}\");",
+        "if ish_embed_protocol::write_frame(&mut writer, &frame).is_err() {\n            if trace {\n                eprintln!(\"[ish-out] writer write_frame error\");"
       ]
     ],
     "embed/supervisor/src/session.rs": [
