@@ -639,7 +639,13 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
             // A stopped or failed process may have descendants. Only a clean
             // guest shutdown is final evidence of cleanup.
             if !workbench { publish_output(&capture.pty, !capture.exited && !capture.closed); }
-            else { publish_output(&[], !capture.exited && !capture.closed); }
+            else {
+                // Do not expose the server URL/token. Only a matching bind log
+                // from the reviewed process permits the native loopback view.
+                let bound = contains(&capture.stdout,b"Server bound to 127.0.0.1:18765") ||
+                    contains(&capture.stderr,b"Server bound to 127.0.0.1:18765");
+                publish_output(&[], bound && !capture.exited && !capture.closed);
+            }
             if capture.closed { break; }
         }
         Ok(())

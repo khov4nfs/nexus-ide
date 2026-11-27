@@ -56,7 +56,9 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
     }
-    if mode == 3 && !path.join("opt/nexus/workbench/bin/openvscode-server").is_file() {
+    if mode == 3 && (!path.join("opt/nexus/workbench/bin/openvscode-server").is_file() ||
+        path.parent().and_then(|p| std::fs::read_to_string(p.join("workbench.sha256")).ok())
+            .as_deref().map(str::trim) != Some("36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc")) {
         return fail("Reviewed workbench not staged");
     }
     let Ok(mut s) = STATE.lock() else { return fail("Local job lock failed"); };
@@ -64,11 +66,11 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     *s = State { running:true,ready:false,mode,output:String::new(),controls:VecDeque::new(),stop:false };
     drop(s);
     let _guard = Guard;
-    let guest = match IshInstance::boot(path,Some(Path::new("/"))) {
-        Ok(g) => g, Err(_) => return fail("Guest boot failed"),
-    };
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt, Err(_) => return fail("Runtime creation failed; restart app"),
+    };
+    let guest = match IshInstance::boot(path,Some(Path::new("/"))) {
+        Ok(g) => g, Err(_) => return fail("Guest boot failed"),
     };
     let mut env = HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),
         ("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into()),

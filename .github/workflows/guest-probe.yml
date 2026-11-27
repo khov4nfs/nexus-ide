@@ -13,6 +13,8 @@ on:
       - 'scripts/verify-acp-transport.py'
       - 'Sources/NexusCore/**'
       - 'scripts/prepare-agy-rootfs.py'
+      - 'scripts/prepare-workbench-rootfs.py'
+      - 'scripts/test-workbench-import.py'
       - 'scripts/test-agy-import.py'
       - 'scripts/stage-ubuntu-device.sh'
       - 'project-glibc.yml'
@@ -38,6 +40,7 @@ jobs:
           rustup component add rustfmt
           python3 scripts/preflight-runtime.py
           python3 scripts/test-agy-import.py
+          python3 scripts/test-workbench-import.py
       - name: Install guest build dependencies
         run: brew install meson ninja llvm lld libarchive sqlite xcodegen
       - name: Build pinned runtime and rootfs

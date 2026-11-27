@@ -1,15 +1,20 @@
 # Nexus IDE — on-device iOS R&D
 
-Independent prototype, not affiliated with Google. All project execution must stay on iPhone/iPad; model APIs may be used for inference only. No SSH or cloud compute fallback. Target iOS 17+ (provisional).
+Independent prototype, not affiliated with Google. iOS 17+; all project execution is local. Model inference APIs and explicit downloads may use the network. No remote shell, remote IDE, remote agent runtime or Docker service fallback.
 
-## Implemented in 0.1.0
-- Swift package with local workspace, UTF-8 editing, path validation and basic file tools.
-- Native SwiftUI app source with file explorer/editor, console (ls/cat/echo/pwd only), capability status.
-- ACP JSON-RPC request encoding (initialize, session/new, session/prompt) and bounded newline framing. **No live ACP client transport or agent loop yet.**
-- Six core tests passed with Swift 6.2.1 on Linux. iOS build and physical device tests not performed.
+## Build variants
 
-## Build
-On macOS with Xcode and XcodeGen:
+| Target | Purpose |
+|---|---|
+| NexusIDE | Native Files, UTF-8 editor, bounded native console; simulator build |
+| NexusIDEGuest | Pinned ARM64 Alpine in-process runtime and offline/network opt-in probes |
+| NexusIDEUbuntuLab | Integrated native Files + Console + Agent + Local tools; disposable Ubuntu guest, optional reviewed AGY and pinned OpenVSCode |
+
+Previous PR #17 CI passed native tests, both unsigned ARM64 device builds, real macOS-hosted guest process/toolchain tests and ACP fixtures. No physical iPhone or original AGY execution has been verified. This integration PR adds edit proposals, actual local PTY and MCP discovery paths, optional workbench launcher; new CI is required. No signed IPA or production release.
+
+## Build on Apple Silicon macOS
+
+Use Xcode and XcodeGen. For the native target:
 
 ```sh
 swift test
@@ -17,17 +22,11 @@ brew install xcodegen
 xcodegen generate
 open NexusIDE.xcodeproj
 ```
-Select your signing team and unique bundle identifier, then build/run on an iPhone. CI is configured for an unsigned iOS Simulator build; it is not a signed IPA release. The development machine is needed for building/signing, not app execution.
 
-## Roadmap
-See [architecture](docs/architecture.md) and [upstream integration gates](docs/runtime-gates.md). AGY, OpenVSCode, embedded Linux, MCP, Docker and extensions are not bundled or operational. No upstream code or proprietary binaries are redistributed. Licensing and App Store eligibility must be reviewed before distribution.
+For the device target, follow [integrated build instructions](docs/final-integration.md). Select your signing team in Xcode. The build host is only for preparation/signing/testing; no execution backend is required by the app.
 
-## Experimental on-device Linux probe (0.2 development)
+## Architecture and evidence
 
-The Linux Lab tab is disabled in the ordinary build. An opt-in device build links
-the pinned litter-ish Rust host library in-process, copies a bundled fakefs into
-a disposable writable directory, and runs a fixed smoke probe (ARM64, shell,
-stdout and nonzero exit). See [device build and acceptance gate](docs/guest-probe.md).
-This is not an available general Linux terminal or an AGY integration yet.
+See [architecture](docs/architecture.md), [integration gates](docs/runtime-gates.md), [guest evidence](docs/guest-probe.md), and [AGY compatibility](docs/agy-compatibility.md).
 
-PR #3 CI verified six real guest process checks on macOS and an unsigned ARM64 iOS build. The optional signed Alpine jq package probe (v0.2.3 development) is pending new CI and iPhone evidence. No general-purpose Linux shell is exposed.
+The embedded runtime is not a security sandbox. Agent uses an explicitly consented credential and selected context only; no unrestricted native file/tool grants. One guest boot per app process. Do not use production secrets or private code in the lab. Licensing, App Store eligibility, original AGY authentication, OpenVSCode compatibility, full VM/Docker and physical-device validation remain release gates.

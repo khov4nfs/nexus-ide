@@ -1,5 +1,7 @@
 # Integration gates (not completed)
 
+See [final integration candidate](final-integration.md) for the implemented source paths, current CI scope and remaining release blockers. The gates below still require physical-device evidence.
+
 | Gate | Candidate | Required evidence |
 |---|---|---|
 | G1 | litter-ish / ios-linuxkit | Pin upstream commit and license; compile for iOS ARM64 without JIT; boot guest; verify process, PTY, network, files and cancellation on real device |

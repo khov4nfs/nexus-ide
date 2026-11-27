@@ -4,14 +4,15 @@ cd "$(dirname "$0")/.."
 case "${1:-}" in
   "") source=Vendor/litter-ish/build/ubuntu-fs ;;
   --agy) source=Vendor/litter-ish/build/agy-fs ;;
-  *) echo "Usage: $0 [--agy]" >&2; exit 2 ;;
+  --workbench) source=Vendor/litter-ish/build/workbench-fs ;;
+  *) echo "Usage: $0 [--agy|--workbench]" >&2; exit 2 ;;
 esac
 [[ $# -le 1 ]]
 test -d "$source/data"
 test -f "$source/meta.db"
 test -f RuntimeAssets/lib/libnexus_guest_bridge.a
 test ! -e RuntimeAssets/ubuntu-fs || { echo "Move existing RuntimeAssets/ubuntu-fs aside first" >&2; exit 1; }
-if [[ "${1:-}" == --agy ]]; then
+if [[ "${1:-}" == --agy ]] || [[ "${1:-}" == --workbench && -f "$source/agy.sha256" ]]; then
   test -f "$source/agy.sha256"
   expected=$(cat "$source/agy.sha256")
   [[ "$expected" =~ ^[a-f0-9]{64}$ ]]
@@ -19,6 +20,17 @@ if [[ "${1:-}" == --agy ]]; then
 else
   test ! -e "$source/agy.sha256"
   test ! -e "$source/data/opt/nexus/agy"
+fi
+if [[ "${1:-}" == --workbench ]]; then
+  test "$(cat "$source/workbench.sha256")" = 36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc
+  for item in launcher node; do
+    expected=$(cat "$source/workbench-$item.sha256")
+    [[ "$expected" =~ ^[a-f0-9]{64}$ ]]
+    if [[ "$item" == launcher ]]; then rel=bin/openvscode-server; else rel=node; fi
+    printf '%s  %s\n' "$expected" "$source/data/opt/nexus/workbench/$rel" | shasum -a 256 -c -
+  done
+else
+  test ! -e "$source/workbench.sha256"
 fi
 # Source must be fresh and stopped. No copying an active fakefs database.
 test ! -e "$source/meta.db-wal"

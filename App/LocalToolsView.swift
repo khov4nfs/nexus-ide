@@ -20,11 +20,12 @@ struct LocalToolsView: View {
     @State private var frozenInput = ""
     @State private var token = ""
     @State private var workbenchShown = false
+    @State private var webStatus = ""
     @State private var manifestPicker = false
     @State private var manifestName = ""
     private var stagedWorkbench: Bool {
         guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else { return false }
-        return FileManager.default.fileExists(atPath: root.appendingPathComponent("workbench.sha256").path)
+        return (try? String(contentsOf: root.appendingPathComponent("workbench.sha256"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) == "36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc"
     }
     var body: some View {
         NavigationStack {
@@ -63,7 +64,7 @@ struct LocalToolsView: View {
                             Button("Send Ctrl-C") { _ = LocalRunner.input("\u{3}") }.disabled(!ready)
                             Button("Resize to 111 × 33") { _ = LocalRunner.resize() }.disabled(!ready)
                         } else {
-                            Button("Open local workbench") { workbenchShown = true }.disabled(!ready || token.isEmpty)
+                            Button("Open local workbench") { webStatus = "Opening verified bind endpoint…"; workbenchShown = true }.disabled(!ready || token.isEmpty)
                             Text("Server launch requested; web view may fail until ready.").font(.caption)
                         }
                         Button("Stop process", role: .destructive) {
@@ -114,7 +115,10 @@ struct LocalToolsView: View {
             }
             .sheet(isPresented: $workbenchShown) {
                 NavigationStack {
-                    LoopbackWorkbench(token: token)
+                    VStack {
+                        Text(webStatus).font(.caption)
+                        LoopbackWorkbench(token: token, status: $webStatus)
+                    }
                         .navigationTitle("Guest workbench")
                         .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close view") { workbenchShown = false } } }
                 }
@@ -184,7 +188,8 @@ private enum LocalRunner {
 /// Content rules block ordinary non-loopback HTTP(S)/WebSocket resource requests.
 private struct LoopbackWorkbench: UIViewRepresentable {
     let token: String
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    @Binding var status: String
+    func makeCoordinator() -> Coordinator { Coordinator(status: $status) }
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent()
@@ -194,7 +199,10 @@ private struct LoopbackWorkbench: UIViewRepresentable {
         WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "NexusLoopback-v1", encodedContentRuleList: rules) { list, _ in
             DispatchQueue.main.async {
                 guard let list, token.utf8.count == 64,
-                      let url = URL(string: "http://127.0.0.1:18765/?tkn=" + token) else { return }
+                      let url = URL(string: "http://127.0.0.1:18765/?tkn=" + token) else {
+                    status = "Local resource filter unavailable; preview blocked"; return
+                }
+                guard web.navigationDelegate != nil else { return }
                 web.configuration.userContentController.add(list)
                 web.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData))
             }
@@ -207,6 +215,11 @@ private struct LoopbackWorkbench: UIViewRepresentable {
         view.navigationDelegate = nil
     }
     final class Coordinator: NSObject, WKNavigationDelegate {
+        @Binding var status: String
+        init(status: Binding<String>) { _status = status }
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { status = "Loopback page loaded; editor compatibility not verified" }
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { status = "Local workbench navigation failed" }
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { status = "Local workbench unavailable" }
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                      decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             let url = navigationAction.request.url
