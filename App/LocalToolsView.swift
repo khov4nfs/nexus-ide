@@ -48,6 +48,9 @@ struct LocalToolsView: View {
     @State private var cliImport: LocalCLIImport?
     @State private var frozenCLI: LocalCLIImport?
     @State private var importingCLI = false
+    @State private var adapterArgv = #"["/usr/local/bin/claude-agent-acp"]"#
+    @State private var adapterDigest = ""
+    @State private var adapterPrompt = ""
     @State private var transferName = ""
     @State private var transferAction = "push"
     @State private var transferSnapshot: WorkspaceSnapshot?
@@ -95,8 +98,14 @@ struct LocalToolsView: View {
                         Text("Original agent CLI").tag(UInt8(6))
                         Text("Native LSP").tag(UInt8(8))
                         Text("Native/Linux file transfer").tag(UInt8(9))
+                        Text("Local ACP adapter (Claude etc.)").tag(UInt8(10))
                     }.disabled(model.guestClaimed)
-                    if mode == 9 {
+                    if mode == 10 {
+                        TextField("Reviewed absolute adapter argv (JSON)", text: $adapterArgv, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
+                        TextField("Adapter executable SHA-256", text: $adapterDigest).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
+                        TextField("First message", text: $adapterPrompt, axis: .vertical).disabled(model.guestClaimed)
+                        Text("Use an upstream ACP v1 adapter installed and authenticated in the saved local-tools guest. Review its executable and dependencies. No native grants, no automatic install/login, permissions denied, no saved session resume. Agent may access guest data and network.").font(.caption)
+                    } else if mode == 9 {
                         Picker("Direction", selection: $transferAction) { Text("Export native file").tag("push"); Text("Import Linux file").tag("pull") }.disabled(model.guestClaimed)
                         TextField("Guest filename", text: $transferName).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
                         Button("Select saved native editor file") {
@@ -213,12 +222,15 @@ struct LocalToolsView: View {
                         Button("Reset saved Linux environment", role: .destructive) { resetWorkbench = false; confirmReset = true }.disabled(model.guestClaimed)
                     }
                     Button("Review and start local job") {
-                        frozenKeep = mode == 9 ? true : mode == 6 ? keepCLIGuest : mode == 3 ? keepWorkbench : keepGuest
+                        frozenKeep = mode == 9 || mode == 10 ? true : mode == 6 ? keepCLIGuest : mode == 3 ? keepWorkbench : keepGuest
                         frozenMode = mode
                         frozenVSIX = mode == 3 ? selectedVSIX : nil
                         frozenCLI = mode == 6 ? cliImport : nil
                         frozenHooks = mode == 1 && enableHooks
-                        if mode == 9 {
+                        if mode == 10 {
+                            guard let argv = try? ACPTerminalApproval.parse(Data(adapterArgv.utf8)), AGYImportFormat.validDigest(adapterDigest), !adapterPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, adapterPrompt.utf8.count <= 2048, !adapterPrompt.utf8.contains(0), let wire = try? JSONSerialization.data(withJSONObject: ["argv":argv.arguments,"sha256":adapterDigest,"prompt":adapterPrompt], options: [.sortedKeys]), wire.count <= 8192 else { report = "Invalid reviewed adapter request"; return }
+                            frozenInput = String(decoding: wire, as: UTF8.self)
+                        } else if mode == 9 {
                             guard let snap = transferSnapshot, !transferName.isEmpty, transferName.utf8.count <= 128, !transferName.hasPrefix("."), transferName.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45,46,95].contains($0) }) else { report = "Invalid guest filename or snapshot"; return }
                             var request = ["action":transferAction,"name":transferName]
                             if transferAction == "push" { request["text"] = snap.text }
@@ -267,7 +279,7 @@ struct LocalToolsView: View {
                             frozenInput = String(decoding: wire,as: UTF8.self)
                         } else { frozenInput = command }
                         confirm = true
-                    }.disabled(model.guestClaimed || importingVSIX || importingCLI || (mode == 9 ? transferLoading || transferSnapshot == nil : mode == 8 ? lspLoading || lspSnapshot == nil || lspArgv.isEmpty : mode == 6 ? cliImport == nil : mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
+                    }.disabled(model.guestClaimed || importingVSIX || importingCLI || (mode == 10 ? adapterPrompt.isEmpty || !AGYImportFormat.validDigest(adapterDigest) : mode == 9 ? transferLoading || transferSnapshot == nil : mode == 8 ? lspLoading || lspSnapshot == nil || lspArgv.isEmpty : mode == 6 ? cliImport == nil : mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
                     Text("No provider key or native workspace injected. Commands and extensions may use the network and are not sandboxed. Restart app for another boot.").font(.caption)
                 }
                 if running && frozenMode != 2 && frozenMode != 4 {
@@ -387,7 +399,7 @@ struct LocalToolsView: View {
                 Button("Start") { start() }
                 Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false; frozenVSIX = nil; frozenCLI = nil }
             } message: {
-                Text(frozenMode == 9 ? "Transfer this exact reviewed file to/from the saved Linux guest?\n" + frozenInput + "\nImport requires separate native review; no automatic overwrite." : frozenMode == 8 ? "Send this reviewed snapshot to the specified local LSP server?\n" + frozenInput + "\nNo native write grant. Server may use network or retain data." : frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(frozenMode == 10 ? "Start this reviewed ACP adapter and send the first model message?\n" + frozenInput + "\nModel requests may incur charges; saved guest can retain credentials and history. No native grants." : frozenMode == 9 ? "Transfer this exact reviewed file to/from the saved Linux guest?\n" + frozenInput + "\nImport requires separate native review; no automatic overwrite." : frozenMode == 8 ? "Send this reviewed snapshot to the specified local LSP server?\n" + frozenInput + "\nNo native write grant. Server may use network or retain data." : frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
             .sheet(isPresented: $transferReview) {
                 NavigationStack {
@@ -466,7 +478,7 @@ struct LocalToolsView: View {
         frozenCLI = nil
         if cli != nil { cliImport = nil }
         let reviewedAction = (try? JSONSerialization.jsonObject(with: Data(input.utf8)) as? [String: Any])?["action"] as? String ?? ""
-        nativeChat = selectedMode == 6 && ["codexSession","claudeSession"].contains(reviewedAction)
+        nativeChat = selectedMode == 10 || selectedMode == 6 && ["codexSession","claudeSession"].contains(reviewedAction)
         agentWaiting = false; agentTurns = []; agentHandle = ""; followup = ""
         running = true
         report = "Starting local guest"

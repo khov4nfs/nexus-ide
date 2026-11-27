@@ -813,6 +813,74 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     }
 }
 
+// Reviewed local upstream adapter: ACP v1, no native callbacks or auth secrets.
+// The adapter/SDK owns its authentication and may use guest files/network.
+// A digest validates only the chosen executable, not its dependencies.
+pub(crate) async fn local_adapter_session(guest:&IshInstance,env:&HashMap<String,String>,input:&crate::local_jobs::AdapterInput,fixture:bool)->Value{
+    use crate::local_jobs::{agent_complete,agent_next,AgentNext,stop_requested};
+    if !fixture&&process_probe::guest_file_digest(guest,env,&input.argv[0],&input.digest).await["passed"]!=true{return json!({"ok":false,"error":"Adapter executable digest mismatch"});}
+    let mut opts=SpawnOpts::cmd(input.argv.iter().map(String::as_str));
+    #[cfg(test)]
+    if fixture{opts=SpawnOpts::cmd(["/bin/sh","-c",include_str!("../fixtures/local-acp-adapter.sh")]);}
+    #[cfg(not(test))]
+    if fixture{return json!({"ok":false});}
+    opts.cwd=Some(PathBuf::from("/tmp"));
+    opts.envp=Some(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect());
+    opts.pipe_stdin=true;
+    let Ok(session)=guest.spawn(opts)else{return json!({"ok":false,"error":"ACP adapter spawn failed"});};
+    let mut exchange=ACPExchange::new(session);
+    let result:Result<Value,String>=async{
+        let init=exchange.request(process_probe::AGY_INITIALIZE_REQUEST,1).await?;
+        if init["result"]["protocolVersion"]!=1||init.get("error").is_some(){return Err("Unsupported ACP version or login required".into());}
+        let created=exchange.request(NEW_REQUEST,2).await?;
+        if !session_created(&created){return Err("Session creation rejected; use upstream login first".into());}
+        let id=created["result"]["sessionId"].as_str().filter(|s|valid_session_handle(s)).ok_or("Invalid ACP session handle")?;
+        let mut message=input.prompt.clone();
+        let mut turns=0i64;
+        let mut denials=0usize;
+        loop{
+            if stop_requested(){return Err("Adapter stopped".into());}
+            let rid=turns+3;
+            let request=json!({"jsonrpc":"2.0","id":rid,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":message}]}});
+            let mut evidence=PromptEvidence::default();
+            let mut cancelled=false;
+            let mut requests=0usize;
+            let r=exchange.request_controlled(format!("{request}\n").as_bytes(),rid,
+                |frame|{
+                    evidence.update(frame,id)?;
+                    if evidence.text.chars().any(|c|c.is_control()&&c!='\n'&&c!='\t'){return Err("Unsupported output".into());}
+                    Ok(())
+                },
+                ||{
+                    if stop_requested()&&!cancelled{
+                        cancelled=true;
+                        Some(format!("{}\n",json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":id}})).into_bytes())
+                    }else{None}
+                },
+                |frame,_|{
+                    requests+=1;if requests>8{return Err("Permission limit".into());}
+                    let reply=permission_reply(frame,id,stop_requested())?;
+                    if reply["result"]["outcome"]["outcome"]=="selected"{denials+=1;}
+                    Ok(reply)
+                },None).await?;
+            if stop_requested()||r.get("error").is_some()||r["result"]["stopReason"]!="end_turn"||evidence.text.trim().is_empty()||evidence.text.len()>8192{return Err("Adapter turn rejected".into());}
+            if !agent_complete(&message,&evidence.text,None){return Err("Session stopped".into());}
+            turns+=1;
+            match agent_next().await{
+                AgentNext::Prompt(p)=>message=p,
+                AgentNext::Finish=>break,
+                AgentNext::Stop=>return Err("Session stopped".into()),
+            }
+        }
+        Ok(json!({"ok":true,"turnsCompleted":turns,"permissionDenials":denials,"sessionFinished":true}))
+    }.await;
+    let closed=exchange.close().await;
+    let mut r=result.unwrap_or_else(|_|json!({"ok":false,"error":"ACP adapter rejected, stopped, unsupported or authentication required"}));
+    r["transportClosed"]=json!(closed);
+    r["ok"]=json!(r["ok"]==true&&closed&&!stop_requested());
+    r
+}
+
 fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, google: bool) -> Value {
     if google && key.is_some() { return failure("Choose one authentication method"); }
     if key.as_deref().is_some_and(|s| !valid_key(s)) { return failure("Invalid credential shape"); }

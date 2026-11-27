@@ -24,6 +24,7 @@ def gates(variant):
     groups = {
         "acp-review": ("allow", "deny", "cancel"),
         "acp-hooks": ("success", "beforeFailure", "afterFailure"),
+        "adapter": ("success", "unexpectedCallback"),
         "acp-resume": ("create", "resume"),
         "codex-turn": ("success", "policy", "mismatch"),
         "claude": ("signedIn", "signedOut", "success", "error"),
