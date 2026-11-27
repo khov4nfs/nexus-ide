@@ -894,7 +894,13 @@ pub(crate) async fn local_hook(guest:&IshInstance,env:&HashMap<String,String>,co
     local_hook_with_timeout(guest,env,command,30).await
 }
 pub(crate) async fn local_hook_with_timeout(guest:&IshInstance,env:&HashMap<String,String>,command:&str,seconds:u64)->bool {
-    if crate::local_jobs::stop_requested() {return false;}
+    run_hook(guest,env,command,seconds,crate::local_jobs::stop_requested).await
+}
+pub(crate) async fn acp_turn_hook(guest:&IshInstance,env:&HashMap<String,String>,command:&str)->bool{
+    run_hook(guest,env,command,30,crate::persistent_acp::prompt_cancel_requested).await
+}
+async fn run_hook(guest:&IshInstance,env:&HashMap<String,String>,command:&str,seconds:u64,cancel:fn()->bool)->bool{
+    if cancel(){return false;}
     let mut opts=shell(command,env);
     opts.cwd=Some(Path::new("/tmp").to_path_buf());
     opts.pipe_stdin=false;
@@ -903,7 +909,7 @@ pub(crate) async fn local_hook_with_timeout(guest:&IshInstance,env:&HashMap<Stri
     let deadline=Instant::now()+Duration::from_secs(seconds);
     let result:Result<(),String>=async {
         while !capture.closed {
-            if crate::local_jobs::stop_requested() {return Err("Hook cancelled".into());}
+            if cancel() {return Err("Hook cancelled".into());}
             capture.poll(&session,deadline).await?;
         }
         Ok(())
@@ -912,7 +918,7 @@ pub(crate) async fn local_hook_with_timeout(guest:&IshInstance,env:&HashMap<Stri
         let _=session.terminate().await;
         let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
     }
-    result.is_ok() && capture.closed && capture.exited && capture.code==Some(0) && capture.signal.unwrap_or(0)==0 && !crate::local_jobs::stop_requested()
+    result.is_ok() && capture.closed && capture.exited && capture.code==Some(0) && capture.signal.unwrap_or(0)==0 && !cancel()
 }
 
 // Codex app-server JSONL intentionally does not use ACP's JSON-RPC version

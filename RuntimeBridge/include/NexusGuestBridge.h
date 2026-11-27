@@ -33,6 +33,7 @@ char *nexus_acp_prompt_probe(void);
 // Smoke test and chat are mutually exclusive within one boot.
 #include <stdint.h>
 char *nexus_acp_chat(const char *text);
+char *nexus_acp_chat_hooks(const char *text,const char *plan);
 char *nexus_acp_chat_reviewed(const char *text);
 char *nexus_acp_permission_decision(int64_t ticket,uint8_t allow);
 // Optional read-only capability: explicit one-turn virtual snapshot, no native path.
@@ -45,7 +46,7 @@ char *nexus_acp_chat_terminal(const char *text,const char *choice);
 char *nexus_acp_prompt_progress(void);
 char *nexus_acp_cancel_prompt(void);
 char *nexus_acp_close(void);
-// Separate local boot: 1 PTY, 2 MCP discovery, 3 workbench, 4 MCP call, 5 PTY with reviewed lifecycle hooks, 6 reviewed original CLI, 8 LSP diagnostics, 9 workspace transfer.
+// Separate local boot: 1 PTY, 2 MCP discovery, 3 workbench, 4 MCP call, 5 PTY with reviewed lifecycle hooks, 6 reviewed original CLI, 8 LSP diagnostics, 9 workspace transfer, 10 reviewed local ACP adapter.
 #include <stdint.h>
 char *nexus_local_run(const char *rootfs_data_path, uint8_t mode, const char *input);
 char *nexus_local_progress(void);

@@ -16,7 +16,24 @@ const IDLE: Duration = Duration::from_secs(180);
 const REPLY: Duration = Duration::from_secs(300);
 const NEW_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\",\"mcpServers\":[]}}\n";
 type Reply = SyncSender<Value>;
-enum Command { New(Vec<u8>, Reply), Load(String, Reply), Prompt(Option<String>, Option<String>, bool, Option<String>, bool, Reply), Close(Reply) }
+#[derive(Clone,Default)]
+struct TurnHooks { before:Option<String>,after:Option<String> }
+impl TurnHooks {
+    fn parse(wire:&str)->Option<Self>{
+        if wire.len()>8192{return None;}
+        let v:Value=serde_json::from_str(wire).ok()?;
+        if v.as_object()?.len()!=2{return None;}
+        let parse=|name:&str|->Option<Option<String>>{
+            let s=v.get(name)?.as_str()?;
+            if s.is_empty(){Some(None)}else if s.len()<=2048&&!s.trim().is_empty()&&!s.contains('\0'){Some(Some(s.to_owned()))}else{None}
+        };
+        let before=parse("before")?;let after=parse("after")?;
+        if before.is_none()&&after.is_none(){return None;}
+        Some(Self{before,after})
+    }
+    fn contains(&self,key:&str)->bool{self.before.iter().chain(self.after.iter()).any(|s|s.contains(key))}
+}
+enum Command { New(Vec<u8>, Reply), Load(String, Reply), Prompt(Option<String>, Option<String>, bool, Option<String>, bool, TurnHooks, Reply), Close(Reply) }
 static ACTIVE: Mutex<Option<SyncSender<Command>>> = Mutex::new(None);
 static WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct ActiveGuard;
@@ -483,6 +500,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
         let _ = rt.block_on(guest.shutdown());
         let _ = ready.send(failure("Gemini provider preparation failed")); return;
     }
+    let hook_env = env.clone();
     let mut agent_env = env;
     if let Some(key) = key { agent_env.insert("GEMINI_API_KEY".into(), key); }
     #[cfg(test)]
@@ -507,6 +525,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     if matches!(&mode,Mode::Fixture) {if let Ok(phase)=std::env::var("NEXUS_ACP_RESUME_PHASE"){agent_env.insert("NEXUS_FIXTURE_RESUME".into(),phase);}}
     #[cfg(test)]
     if matches!(&mode,Mode::Fixture){if let Ok(phase)=std::env::var("NEXUS_ACP_REVIEW_PHASE"){agent_env.insert("NEXUS_FIXTURE_REVIEW".into(),phase);}}
+    #[cfg(test)]
+    if matches!(&mode,Mode::Fixture){if let Ok(phase)=std::env::var("NEXUS_ACP_HOOK_PHASE"){agent_env.insert("NEXUS_FIXTURE_HOOK".into(),phase);}}
     opts.envp = Some(agent_env.into_iter().collect());
     opts.pipe_stdin = true;
     let session = match guest.spawn(opts) {
@@ -616,7 +636,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     break Some((reply,json!({"ok":false,"active":false,"error":"Session load rejected or replay limit exceeded"})));
                 }
             }
-            Ok(Command::Prompt(chat, snapshot, edit, terminal_choice, review, reply)) => {
+            Ok(Command::Prompt(chat, snapshot, edit, terminal_choice, review, hooks, reply)) => {
                 let Some(id) = session_id.as_deref() else {
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Create a session first"}));
                     continue;
@@ -642,6 +662,10 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     let _=reply.send(json!({"ok":false,"active":true,"error":"Terminal grant unavailable or invalid"}));
                     continue;
                 }
+                let has_hooks=hooks.before.is_some()||hooks.after.is_some();
+                if has_hooks&&(!keyed||google||chat.is_none()||snapshot.is_some()||edit||terminal_choice.is_some()||review||mcp_configured||hooks.contains(key)){
+                    let _=reply.send(json!({"ok":false,"active":true,"error":"Hooks require a plain Gemini chat without other grants"}));continue;
+                }
                 let is_chat = chat.is_some();
                 let review=review && keyed && !google && is_chat && snapshot.is_none() && terminal_choice.is_none() && !edit;
                 let text = chat.as_deref().unwrap_or(SMOKE_PROMPT);
@@ -653,6 +677,20 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                 let wire = format!("{request}\n");
                 let mut evidence = PromptEvidence {observe_granted_tools:edit || terminal_choice.is_some() || mcp_configured || review,..Default::default()};
                 let progress = ProgressGuard::begin(response_id);
+                let before=hooks.before.as_deref().map(|cmd|rt.block_on(process_probe::acp_turn_hook(&guest,&hook_env,cmd)));
+                if before==Some(false)||prompt_cancel_requested(){
+                    drop(progress);
+                    break Some((reply,json!({"ok":false,"active":false,"responseId":response_id,"hooks":{"before":before,"after":null,"afterSkipped":hooks.after.is_some()},"error":"Before-turn hook failed or cancelled; model prompt not sent"})));
+                }
+                // Recheck the reviewed executable after any hook. Guest code is
+                // not isolated; this is an integrity check, not a sandbox.
+                if has_hooks {
+                    if let Mode::Agy(sha)=&mode {
+                        if rt.block_on(process_probe::agy_binary_digest(&guest,&hook_env,sha))["passed"]!=true {
+                            drop(progress);break Some((reply,failure("Agent digest changed after hook")));
+                        }
+                    }
+                }
                 let mut cancel_taken = false;
                 let mut permission_ids = std::collections::HashSet::new();
                 let mut snapshot_reads=0usize;
@@ -714,6 +752,17 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     }, Some(&mut terminal)));
                 let terminal_used=terminal.used();
                 let result=if rt.block_on(terminal.cleanup()).is_ok(){result}else{Err("Terminal cleanup failed".into())};
+                let completed=result.as_ref().is_ok_and(|frame|frame.get("error").is_none()&&frame["result"]["stopReason"]=="end_turn"&&evidence.chunks>0&&visible_prefix(&evidence.text,key).is_ok_and(|s|!s.trim().is_empty()));
+                let after=if completed&&!prompt_cancel_requested(){hooks.after.as_deref().map(|cmd|rt.block_on(process_probe::acp_turn_hook(&guest,&hook_env,cmd)))}else{None};
+                let hook_status=json!({"before":before,"after":after,"afterSkipped":hooks.after.is_some()&&after.is_none()});
+                if has_hooks {
+                    let verified=match &mode{Mode::Agy(sha)=>rt.block_on(process_probe::agy_binary_digest(&guest,&hook_env,sha))["passed"]==true,#[cfg(test)] Mode::Fixture=>true};
+                    if after==Some(false)||!verified||(completed&&prompt_cancel_requested()){
+                        drop(progress);
+                        if let Ok(mut p)=PROGRESS.lock(){p.visible.clear();}
+                        break Some((reply,json!({"ok":false,"active":false,"responseId":response_id,"hooks":hook_status,"error":"After-turn hook failed, cancelled or executable changed"})));
+                    }
+                }
                 drop(progress);
                 let cancel_requested = PROGRESS.lock().map(|p|p.cancel_requested).unwrap_or(true);
                 let cancelled = cancel_taken && result.as_ref().is_ok_and(|frame|
@@ -721,7 +770,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                 if cancelled {
                     // Confirm only the response to the original prompt. No raw text.
                     if reply.send(json!({"ok":true,"active":true,"cancelled":true,
-                        "responseId":response_id,"stopReason":"cancelled","chunkCount":evidence.chunks})).is_err() {
+                        "responseId":response_id,"stopReason":"cancelled","chunkCount":evidence.chunks,"hooks":hook_status})).is_err() {
                         break None;
                     }
                     continue;
@@ -732,7 +781,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         .is_ok_and(|s| !s.trim().is_empty()))));
                 if chat_success {
                     if reply.send(json!({"ok":true,"active":true,"chatCompleted":true,
-                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn","snapshotReads":snapshot_reads,"terminalUsed":terminal_used,"stagedReplacement":if !cancel_requested { staged.take() } else { None }})).is_err() {
+                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn","snapshotReads":snapshot_reads,"terminalUsed":terminal_used,"hooks":hook_status,"stagedReplacement":if !cancel_requested { staged.take() } else { None }})).is_err() {
                         break None;
                     }
                     continue;
@@ -762,6 +811,88 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
         result["ok"] = json!(result["ok"] == true && closed && shutdown);
         let _ = reply.send(result);
     }
+}
+
+// Reviewed local upstream adapter: ACP v1, no native callbacks or auth secrets.
+// The adapter/SDK owns its authentication and may use guest files/network.
+// A digest validates only the chosen executable, not its dependencies.
+pub(crate) async fn local_adapter_session(guest:&IshInstance,env:&HashMap<String,String>,input:&crate::local_jobs::AdapterInput,fixture:bool)->Value{
+    use crate::local_jobs::{agent_complete,agent_next,AgentNext,stop_requested};
+    if !fixture&&process_probe::guest_file_digest(guest,env,&input.argv[0],&input.digest).await["passed"]!=true{return json!({"ok":false,"error":"Adapter executable digest mismatch"});}
+    let mut opts=SpawnOpts::cmd(input.argv.iter().map(String::as_str));
+    #[cfg(test)]
+    if fixture{opts=SpawnOpts::cmd(["/bin/sh","-c",include_str!("../fixtures/local-acp-adapter.sh")]);}
+    #[cfg(not(test))]
+    if fixture{return json!({"ok":false});}
+    opts.cwd=Some(PathBuf::from("/tmp"));
+    opts.envp=Some(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect());
+    opts.pipe_stdin=true;
+    let Ok(session)=guest.spawn(opts)else{return json!({"ok":false,"error":"ACP adapter spawn failed"});};
+    let mut exchange=ACPExchange::new(session);
+    let result:Result<Value,String>=async{
+        let init=exchange.request(process_probe::AGY_INITIALIZE_REQUEST,1).await?;
+        if init["result"]["protocolVersion"]!=1||init.get("error").is_some(){return Err("Unsupported ACP version or login required".into());}
+        let supports_load=init["result"]["agentCapabilities"]["loadSession"]==true;
+        let mut replay=0usize;
+        let id=if let Some(handle)=input.resume.as_deref(){
+            if !supports_load{return Err("Adapter does not advertise session load".into());}
+            let wire=format!("{}\n",json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":handle,"cwd":"/tmp","mcpServers":[]}}));
+            let loaded=exchange.request_updates(wire.as_bytes(),2,|f|{
+                if f["method"]!="session/update"||f["params"]["sessionId"]!=handle||!f["params"]["update"].is_object()||replay>=128{return Err("Invalid or excessive adapter replay".into());}
+                replay+=1;Ok(())
+            }).await?;
+            if loaded.get("error").is_some()||!loaded["result"].is_object(){return Err("Adapter session load rejected".into());}
+            handle.to_owned()
+        }else{
+            let created=exchange.request(NEW_REQUEST,2).await?;
+            if !session_created(&created){return Err("Session creation rejected; use upstream login first".into());}
+            created["result"]["sessionId"].as_str().filter(|s|valid_session_handle(s)).ok_or("Invalid ACP session handle")?.to_owned()
+        };
+        let id=id.as_str();
+        let mut message=input.prompt.clone();
+        let mut turns=0i64;
+        let mut denials=0usize;
+        loop{
+            if stop_requested(){return Err("Adapter stopped".into());}
+            let rid=turns+3;
+            let request=json!({"jsonrpc":"2.0","id":rid,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":message}]}});
+            let mut evidence=PromptEvidence::default();
+            let mut cancelled=false;
+            let mut requests=0usize;
+            let r=exchange.request_controlled(format!("{request}\n").as_bytes(),rid,
+                |frame|{
+                    evidence.update(frame,id)?;
+                    if evidence.text.chars().any(|c|c.is_control()&&c!='\n'&&c!='\t'){return Err("Unsupported output".into());}
+                    Ok(())
+                },
+                ||{
+                    if stop_requested()&&!cancelled{
+                        cancelled=true;
+                        Some(format!("{}\n",json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":id}})).into_bytes())
+                    }else{None}
+                },
+                |frame,_|{
+                    requests+=1;if requests>8{return Err("Permission limit".into());}
+                    let reply=permission_reply(frame,id,stop_requested())?;
+                    if reply["result"]["outcome"]["outcome"]=="selected"{denials+=1;}
+                    Ok(reply)
+                },None).await?;
+            if stop_requested()||r.get("error").is_some()||r["result"]["stopReason"]!="end_turn"||evidence.text.trim().is_empty()||evidence.text.len()>8192{return Err("Adapter turn rejected".into());}
+            if !agent_complete(&message,&evidence.text,if supports_load&&crate::local_jobs::valid_handle(id){Some(id)}else{None}){return Err("Session stopped".into());}
+            turns+=1;
+            match agent_next().await{
+                AgentNext::Prompt(p)=>message=p,
+                AgentNext::Finish=>break,
+                AgentNext::Stop=>return Err("Session stopped".into()),
+            }
+        }
+        Ok(json!({"ok":true,"turnsCompleted":turns,"permissionDenials":denials,"sessionFinished":true,"sessionLoaded":input.resume.is_some(),"replayUpdates":replay,"replayWithheld":true}))
+    }.await;
+    let closed=exchange.close().await;
+    let mut r=result.unwrap_or_else(|_|json!({"ok":false,"error":"ACP adapter rejected, stopped, unsupported or authentication required"}));
+    r["transportClosed"]=json!(closed);
+    r["ok"]=json!(r["ok"]==true&&closed&&!stop_requested());
+    r
 }
 
 fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, google: bool) -> Value {
@@ -795,13 +926,13 @@ fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, googl
     }
 }
 
-enum Action { New(Vec<u8>), Load(String), Prompt, Chat(String), Reviewed(String), Snapshot(String,String), Edit(String,String), Terminal(String,String), Close }
+enum Action { New(Vec<u8>), Load(String), Prompt, Chat(String), Hooked(String,TurnHooks), Reviewed(String), Snapshot(String,String), Edit(String,String), Terminal(String,String), Close }
 
 fn command(action: Action) -> Value {
     let Ok(mut slot) = ACTIVE.lock() else { return failure("Connection lock failed"); };
     let Some(tx) = slot.as_ref() else { return failure("No active connection"); };
     let (reply, wait) = mpsc::sync_channel(1);
-    let message = match action { Action::New(b) => Command::New(b, reply), Action::Load(s)=>Command::Load(s,reply), Action::Prompt => Command::Prompt(None, None, false, None, false, reply), Action::Chat(text) => Command::Prompt(Some(text), None, false, None, false, reply), Action::Reviewed(text)=>Command::Prompt(Some(text),None,false,None,true,reply), Action::Snapshot(text,content) => Command::Prompt(Some(text),Some(content),false,None,false,reply), Action::Edit(text,content) => Command::Prompt(Some(text),Some(content),true,None,false,reply), Action::Terminal(text,choice)=>Command::Prompt(Some(text),None,false,Some(choice),false,reply), Action::Close => Command::Close(reply) };
+    let message = match action { Action::New(b) => Command::New(b, reply), Action::Load(s)=>Command::Load(s,reply), Action::Prompt => Command::Prompt(None, None, false, None, false, TurnHooks::default(), reply), Action::Chat(text) => Command::Prompt(Some(text), None, false, None, false, TurnHooks::default(), reply), Action::Hooked(text,hooks)=>Command::Prompt(Some(text),None,false,None,false,hooks,reply), Action::Reviewed(text)=>Command::Prompt(Some(text),None,false,None,true,TurnHooks::default(), reply), Action::Snapshot(text,content) => Command::Prompt(Some(text),Some(content),false,None,false,TurnHooks::default(), reply), Action::Edit(text,content) => Command::Prompt(Some(text),Some(content),true,None,false,TurnHooks::default(), reply), Action::Terminal(text,choice)=>Command::Prompt(Some(text),None,false,Some(choice),false,TurnHooks::default(), reply), Action::Close => Command::Close(reply) };
     if tx.send(message).is_err() {
         *slot = None; return failure("Connection stopped or idle timeout");
     }
@@ -895,6 +1026,13 @@ pub extern "C" fn nexus_acp_prompt_probe() -> *mut c_char {
 
 /// # Safety
 /// text must be valid NUL-terminated UTF-8. User must consent to model inference.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_acp_chat_hooks(text:*const c_char,plan:*const c_char)->*mut c_char{
+    ffi_result(||match (read_arg(text),read_arg(plan).and_then(|p|TurnHooks::parse(&p))){
+        (Some(t),Some(h)) if valid_chat(&t)=>command(Action::Hooked(t,h)),
+        _=>json!({"ok":false,"active":true,"error":"Invalid reviewed hook plan"}),
+    })
+}
 #[no_mangle]
 pub unsafe extern "C" fn nexus_acp_chat(text: *const c_char) -> *mut c_char {
     ffi_result(|| match read_arg(text) {
@@ -1002,6 +1140,22 @@ mod tests {
         let report=json!({"ok":ok,"fixtureOnly":true,"phase":phase,"reviewVerified":review_ok,"outcomeVerified":outcome,"shutdownClean":close["shutdownClean"]});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         assert!(ok,"review fixture failed: {report}");
+    }
+    #[test]
+    #[ignore = "requires independent guest per hook outcome"]
+    fn real_acp_turn_hooks(){
+        let path=std::env::var_os("NEXUS_ACP_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_ACP_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_ACP_HOOK_PHASE").expect("phase");
+        let init=start(PathBuf::from(path),Mode::Fixture,process_probe::AGY_INITIALIZE_REQUEST.to_vec(),Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()),false);
+        assert_eq!(init["ok"],true);
+        assert_eq!(command(Action::New(NEW_REQUEST.to_vec()))["ok"],true);
+        let before=if phase=="beforeFailure"{"exit 7"}else{"test -z \"${GEMINI_API_KEY:-}\" && printf before >/tmp/nexus-acp-before"};
+        let after=if phase=="afterFailure"{"exit 8"}else{"test -z \"${GEMINI_API_KEY:-}\" && test \"$(cat /tmp/nexus-acp-turn)\" = done"};
+        let result=command(Action::Hooked("Hook fixture".into(),TurnHooks{before:Some(before.into()),after:Some(after.into())}));
+        let ok=if phase=="success"{result["ok"]==true&&result["hooks"]["before"]==true&&result["hooks"]["after"]==true&&command(Action::Close)["shutdownClean"]==true}else if phase=="beforeFailure"{result["ok"]==false&&result["hooks"]["before"]==false&&result["hooks"]["afterSkipped"]==true&&result["shutdownClean"]==true}else{result["ok"]==false&&result["hooks"]["before"]==true&&result["hooks"]["after"]==false&&result["shutdownClean"]==true};
+        std::fs::write(evidence,serde_json::to_vec_pretty(&json!({"ok":ok,"fixtureOnly":true,"phase":phase,"shutdownClean":ok})).unwrap()).unwrap();
+        assert!(ok,"ACP hook fixture failed: {result}");
     }
     #[test]
     fn plan_and_permission_preview_are_bounded() {

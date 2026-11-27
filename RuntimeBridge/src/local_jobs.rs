@@ -124,6 +124,20 @@ fn parse_cli(input:&str)->Option<(String,String,String,Option<String>,Option<Nat
     }else{None};
     Some((kind.into(),digest.into(),action.into(),prompt,session))
 }
+pub(crate) struct AdapterInput {pub argv:Vec<String>,pub digest:String,pub prompt:String,pub resume:Option<String>}
+fn parse_adapter(input:&str)->Option<AdapterInput>{
+    if input.len()>8192{return None;}
+    let v:Value=serde_json::from_str(input).ok()?;
+    let fields=v.as_object()?.len();
+    if !matches!(fields,3|4)||!v["argv"].is_array(){return None;}
+    let argv=process_probe::terminal_command(&v["argv"].to_string())?;
+    let digest=v["sha256"].as_str()?;
+    if !process_probe::agy_digest_ok(digest){return None;}
+    let prompt=v["prompt"].as_str()?;
+    if !valid_agent_text(prompt){return None;}
+    let resume=if fields==4{let s=v["resume"].as_str()?;if !valid_handle(s){return None;}Some(s.to_owned())}else{None};
+    Some(AdapterInput{argv,digest:digest.into(),prompt:prompt.into(),resume})
+}
 pub(crate) struct TransferInput {pub name:String,pub text:Option<String>}
 fn parse_transfer(input:&str)->Option<TransferInput>{
     if input.len()>65536{return None;}
@@ -226,7 +240,8 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let cli=if mode==6 {match parse_cli(input) {Some(v)=>Some(v),None=>return fail("Invalid CLI launch")}} else {None};
     let lsp=if mode==8 {match parse_lsp(input){Some(v)=>Some(v),None=>return fail("Invalid LSP snapshot request")}}else{None};
     let transfer=if mode==9 {match parse_transfer(input){Some(v)=>Some(v),None=>return fail("Invalid workspace transfer")}}else{None};
-    if !matches!(mode,1..=6|8|9) ||
+    let adapter=if mode==10 {match parse_adapter(input){Some(v)=>Some(v),None=>return fail("Invalid reviewed ACP adapter request")}}else{None};
+    if !matches!(mode,1..=6|8|9|10) ||
         (matches!(mode,1|2) && !valid_command(input)) { return fail("Invalid local job"); }
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
@@ -238,7 +253,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     }
     let Ok(mut s) = STATE.lock() else { return fail("Local job lock failed"); };
     if s.running || ATTEMPTED.swap(true,Ordering::AcqRel) { return fail("Restart app before another guest boot"); }
-    let native=cli.as_ref().is_some_and(|c|c.4.is_some());
+    let native=adapter.is_some()||cli.as_ref().is_some_and(|c|c.4.is_some());
     *s = State { running:true,ready:false,mode:if native{7}else if matches!(mode,5|6) {1}else{mode},output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false,agent:if native{Some(AgentMailbox::default())}else{None} };
     drop(s);
     let _guard = Guard;
@@ -253,6 +268,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         ("TERM".into(),if matches!(mode,1|5|6) {"xterm-256color".into()} else {"dumb".into()}),("NODE_OPTIONS".into(),"--jitless".into())]);
     let libc = rt.block_on(process_probe::glibc_compat(&guest,&env));
     let mut result = if libc["passed"] != true { fail("Ubuntu compatibility failed") }
+        else if let Some(request)=adapter.as_ref(){rt.block_on(crate::persistent_acp::local_adapter_session(&guest,&env,request,false))}
         else if let Some(request)=transfer.as_ref(){rt.block_on(process_probe::workspace_transfer(&guest,&env,request))}
         else if let Some(request)=lsp.as_ref(){rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}
         else if let Some(plan)=hooks.as_ref() {
@@ -490,6 +506,52 @@ mod tests {
         let evidence=json!({"ok":ok,"fixtureOnly":true,"kind":kind,"phase":phase,"turnsCompleted":r["turnsCompleted"],"shutdownClean":clean});
         std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
         assert!(ok,"conversation fixture failed: {r}");
+    }
+    #[test]
+    fn adapter_request_bounds(){
+        let mut v=json!({"argv":["/usr/local/bin/claude-agent-acp"],"sha256":"a".repeat(64),"prompt":"hello"});
+        assert!(parse_adapter(&v.to_string()).is_some());
+        v["argv"]=json!(["../adapter"]);assert!(parse_adapter(&v.to_string()).is_none());
+        v["argv"]=json!(["/usr/local/bin/claude-agent-acp"]);v["sha256"]=json!("bad");assert!(parse_adapter(&v.to_string()).is_none());
+    }
+    #[test]
+    #[ignore = "requires fresh Ubuntu guest, synthetic ACP adapter"]
+    fn real_local_adapter_fixture(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_ADAPTER_PHASE").expect("phase");
+        let mut request=json!({"argv":["/usr/bin/true"],"sha256":"a".repeat(64),"prompt":"First adapter prompt"});
+        if matches!(phase.as_str(),"resume"|"unsupportedResume"){request["resume"]=json!("adapter-fixture");}
+        let input=parse_adapter(&request.to_string()).unwrap();
+        {
+            let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=7;s.agent=Some(AgentMailbox::default());
+        }
+        let driver=std::thread::spawn(||{
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);
+            let mut sent=false;
+            while std::time::Instant::now()<deadline{
+                let p=progress();
+                if p["agentWaiting"]==true{
+                    let n=p["agentTurns"].as_array().unwrap().len();
+                    if n==1&&!sent{assert_eq!(agent_send(1,Some("Second adapter prompt".into()))["ok"],true);sent=true;}
+                    else if n==2{return agent_send(2,None)["ok"]==true;}
+                }
+                if p["running"]!=true{return false;}
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let _=enqueue(Control::Stop);false
+        });
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin".into()),("HOME".into(),"/root".into()),("NEXUS_ADAPTER_PHASE".into(),phase.clone())]);
+        let r=rt.block_on(crate::persistent_acp::local_adapter_session(&guest,&env,&input,true));
+        let p=progress();
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        STATE.lock().unwrap().running=false;
+        let driven=driver.join().unwrap();
+        let ok=if matches!(phase.as_str(),"success"|"resume"){driven&&r["ok"]==true&&r["turnsCompleted"]==2&&r["permissionDenials"]==1&&p["agentHandle"]=="adapter-fixture"&&p["agentTurns"][1]["response"]=="Second adapter reply"&&r["sessionLoaded"]==json!(phase=="resume")}else{r["ok"]==false&&p["agentTurns"].as_array().is_some_and(|a|a.is_empty())};
+        std::fs::write(report,serde_json::to_vec_pretty(&json!({"ok":ok&&clean,"fixtureOnly":true,"phase":phase,"shutdownClean":clean})).unwrap()).unwrap();
+        assert!(ok&&clean,"ACP adapter fixture failed: {r}");
     }
     #[test]
     fn transfer_input_bounds(){

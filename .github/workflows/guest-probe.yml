@@ -357,6 +357,25 @@ jobs:
           name: acp-review-fixture-evidence
           path: ${{ runner.temp }}/nexus-acp-review-*.json
           if-no-files-found: error
+      - name: Verify reviewed ACP turn hooks (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for phase in success beforeFailure afterFailure; do
+            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-acp-hooks-$phase"
+            export NEXUS_ACP_ROOTFS="$RUNNER_TEMP/nexus-acp-hooks-$phase/data"
+            export NEXUS_ACP_EVIDENCE="$RUNNER_TEMP/nexus-acp-hooks-$phase.json"
+            export NEXUS_ACP_HOOK_PHASE="$phase"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_acp_turn_hooks -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","shutdownClean"])' "$NEXUS_ACP_EVIDENCE"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acp-turn-hook-evidence
+          path: ${{ runner.temp }}/nexus-acp-hooks-*.json
+          if-no-files-found: error
       - name: Verify ACP session load across independent guest processes (synthetic peer)
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
@@ -451,6 +470,29 @@ jobs:
         with:
           name: native-conversation-fixture-evidence
           path: ${{ runner.temp }}/nexus-conversation-*.json
+          if-no-files-found: error
+      - name: Verify local ACP adapter multi-turn and callback rejection (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for phase in success resume unexpectedCallback unsupportedResume; do
+            if [ "$phase" = resume ]; then
+              export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-adapter-success/data"
+            else
+              cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-adapter-$phase"
+              export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-adapter-$phase/data"
+            fi
+            export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-adapter-$phase.json"
+            export NEXUS_ADAPTER_PHASE="$phase"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_local_adapter_fixture -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","shutdownClean"])' "$NEXUS_LOCAL_EVIDENCE"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: local-adapter-fixture-evidence
+          path: ${{ runner.temp }}/nexus-adapter-*.json
           if-no-files-found: error
       - name: Verify native/Linux file transfer across independent guest boots
         run: |
