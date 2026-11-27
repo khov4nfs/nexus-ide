@@ -48,8 +48,19 @@ struct LocalToolsView: View {
     @State private var cliImport: LocalCLIImport?
     @State private var frozenCLI: LocalCLIImport?
     @State private var importingCLI = false
+    @State private var transferName = ""
+    @State private var transferAction = "push"
+    @State private var transferSnapshot: WorkspaceSnapshot?
+    @State private var transferLoading = false
+    @State private var transferReplacement: String?
+    @State private var transferReview = false
     @State private var lspArgv = ""
     @State private var lspLanguage = "python"
+    @State private var lspCompletion = false
+    @State private var lspLine = "0"
+    @State private var lspCharacter = "0"
+    @State private var lspItems: [LSPTextEdit] = []
+    @State private var reviewTitle = "Review Linux import"
     @State private var lspSnapshot: WorkspaceSnapshot?
     @State private var lspLoading = false
     @State private var cliAction = "shell"
@@ -82,9 +93,23 @@ struct LocalToolsView: View {
                         Text("MCP manual call").tag(UInt8(4))
                         Text("OpenVSCode").tag(UInt8(3))
                         Text("Original agent CLI").tag(UInt8(6))
-                        Text("Native LSP diagnostics").tag(UInt8(8))
+                        Text("Native LSP").tag(UInt8(8))
+                        Text("Native/Linux file transfer").tag(UInt8(9))
                     }.disabled(model.guestClaimed)
-                    if mode == 8 {
+                    if mode == 9 {
+                        Picker("Direction", selection: $transferAction) { Text("Export native file").tag("push"); Text("Import Linux file").tag("pull") }.disabled(model.guestClaimed)
+                        TextField("Guest filename", text: $transferName).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
+                        Button("Select saved native editor file") {
+                            transferLoading = true
+                            Task {
+                                defer { transferLoading = false }
+                                do { let snap = try await model.selectedSnapshot(); guard snap.text.utf8.count <= 8192 else { throw WorkspaceError.tooLarge }; transferSnapshot = snap; transferName = (snap.path as NSString).lastPathComponent; report = "Selected saved file" }
+                                catch { transferSnapshot = nil; report = "Select and save a UTF-8 editor file (8 KiB max)" }
+                            }
+                        }.disabled(model.guestClaimed || transferLoading || model.path.isEmpty)
+                        if let snap = transferSnapshot { Text("Selected: " + snap.path).font(.caption) }
+                        Text("Uses saved local-tools guest, /root/nexus-transfer. Export creates only; never overwrites existing guest files. Import stages a replacement for explicit native review. Restart app between transfer and PTY work.").font(.caption)
+                    } else if mode == 8 {
                         TextField("Reviewed absolute guest argv (JSON array)", text: $lspArgv, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
                         TextField("LSP language ID", text: $lspLanguage).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
                         Button("Attach saved editor snapshot") {
@@ -96,7 +121,12 @@ struct LocalToolsView: View {
                             }
                         }.disabled(model.guestClaimed || lspLoading || model.path.isEmpty)
                         if let snapshot = lspSnapshot { Text(snapshot.path + " · " + String(snapshot.text.utf8.count) + " bytes").font(.caption); Button("Remove snapshot") { lspSnapshot = nil }.disabled(model.guestClaimed) }
-                        Text("One local stdio language server already installed in the guest. Snapshot-only push diagnostics, UTF-16 positions; no native file path, workspace mount or edits. Server may use network or retain the snapshot.").font(.caption)
+                        Toggle("Request completion instead of diagnostics", isOn: $lspCompletion).disabled(model.guestClaimed)
+                        if lspCompletion {
+                            TextField("Zero-based line", text: $lspLine).keyboardType(.numberPad).disabled(model.guestClaimed)
+                            TextField("Zero-based UTF-16 character", text: $lspCharacter).keyboardType(.numberPad).disabled(model.guestClaimed)
+                        }
+                        Text("Snapshot diagnostics or one completion request. Only plain single-range edits may be reviewed; no snippets, commands, automatic edits or native path. Server may use network or retain data.").font(.caption)
                         Toggle("Use saved local-tools guest", isOn: $keepGuest).disabled(model.guestClaimed)
                     } else if mode == 6 {
                         Picker("Official executable", selection: $cliKind) {
@@ -183,15 +213,26 @@ struct LocalToolsView: View {
                         Button("Reset saved Linux environment", role: .destructive) { resetWorkbench = false; confirmReset = true }.disabled(model.guestClaimed)
                     }
                     Button("Review and start local job") {
-                        frozenKeep = mode == 6 ? keepCLIGuest : mode == 3 ? keepWorkbench : keepGuest
+                        frozenKeep = mode == 9 ? true : mode == 6 ? keepCLIGuest : mode == 3 ? keepWorkbench : keepGuest
                         frozenMode = mode
                         frozenVSIX = mode == 3 ? selectedVSIX : nil
                         frozenCLI = mode == 6 ? cliImport : nil
                         frozenHooks = mode == 1 && enableHooks
-                        if mode == 8 {
+                        if mode == 9 {
+                            guard let snap = transferSnapshot, !transferName.isEmpty, transferName.utf8.count <= 128, !transferName.hasPrefix("."), transferName.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45,46,95].contains($0) }) else { report = "Invalid guest filename or snapshot"; return }
+                            var request = ["action":transferAction,"name":transferName]
+                            if transferAction == "push" { request["text"] = snap.text }
+                            guard let wire = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), wire.count <= 65536 else { report = "Invalid transfer"; return }
+                            frozenInput = String(decoding: wire, as: UTF8.self)
+                        } else if mode == 8 {
                             guard let snapshot = lspSnapshot, let approved = try? ACPTerminalApproval.parse(Data(lspArgv.utf8)) else { report = "Select a saved snapshot and valid argv"; return }
                             let ext = (snapshot.path as NSString).pathExtension.lowercased()
-                            guard let wire = try? JSONSerialization.data(withJSONObject: ["argv":approved.arguments,"language":lspLanguage,"extension":ext,"text":snapshot.text], options: [.sortedKeys]), wire.count <= 65536 else { report = "Invalid LSP snapshot"; return }
+                            var request: [String: Any] = ["argv":approved.arguments,"language":lspLanguage,"extension":ext,"text":snapshot.text]
+                            if lspCompletion {
+                                guard let line = Int(lspLine), let character = Int(lspCharacter), LSPTextEdit.offset(.init(line: line, character: character), in: snapshot.text) != nil else { report = "Invalid UTF-16 cursor"; return }
+                                request["completion"] = ["line":line,"character":character]
+                            }
+                            guard let wire = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), wire.count <= 65536 else { report = "Invalid LSP snapshot"; return }
                             frozenInput = String(decoding: wire, as: UTF8.self)
                         } else if mode == 6 {
                             guard let frozenCLI else { report = "Select reviewed executable"; return }
@@ -226,7 +267,7 @@ struct LocalToolsView: View {
                             frozenInput = String(decoding: wire,as: UTF8.self)
                         } else { frozenInput = command }
                         confirm = true
-                    }.disabled(model.guestClaimed || importingVSIX || importingCLI || (mode == 8 ? lspLoading || lspSnapshot == nil || lspArgv.isEmpty : mode == 6 ? cliImport == nil : mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
+                    }.disabled(model.guestClaimed || importingVSIX || importingCLI || (mode == 9 ? transferLoading || transferSnapshot == nil : mode == 8 ? lspLoading || lspSnapshot == nil || lspArgv.isEmpty : mode == 6 ? cliImport == nil : mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
                     Text("No provider key or native workspace injected. Commands and extensions may use the network and are not sandboxed. Restart app for another boot.").font(.caption)
                 }
                 if running && frozenMode != 2 && frozenMode != 4 {
@@ -272,6 +313,17 @@ struct LocalToolsView: View {
                 } else if frozenMode == 1 || frozenMode == 6 {
                     Section("PTY output · plain text") {
                         Text(verbatim: output).font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
+                    }
+                }
+                if !lspItems.isEmpty {
+                    Section("Completion · review before apply") {
+                        ForEach(lspItems.indices, id: \.self) { i in
+                            Button {
+                                guard let snap = lspSnapshot, let replacement = try? lspItems[i].replacement(in: snap.text) else { report = "Completion cannot be applied"; return }
+                                transferSnapshot = snap; transferReplacement = replacement; reviewTitle = "Review completion"; transferReview = true
+                            } label: { VStack(alignment: .leading) { Text(verbatim: lspItems[i].label); Text(verbatim: lspItems[i].text).font(.caption) } }
+                            .disabled(running || model.reviewBusy)
+                        }
                     }
                 }
                 Section("Status") {
@@ -335,7 +387,35 @@ struct LocalToolsView: View {
                 Button("Start") { start() }
                 Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false; frozenVSIX = nil; frozenCLI = nil }
             } message: {
-                Text(frozenMode == 8 ? "Send this reviewed snapshot to the specified local LSP server?\n" + frozenInput + "\nNo native write grant. Server may use network or retain data." : frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(frozenMode == 9 ? "Transfer this exact reviewed file to/from the saved Linux guest?\n" + frozenInput + "\nImport requires separate native review; no automatic overwrite." : frozenMode == 8 ? "Send this reviewed snapshot to the specified local LSP server?\n" + frozenInput + "\nNo native write grant. Server may use network or retain data." : frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+            }
+            .sheet(isPresented: $transferReview) {
+                NavigationStack {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            if let snap = transferSnapshot, let replacement = transferReplacement {
+                                Text(snap.path).font(.headline)
+                                Text("Original").font(.caption)
+                                Text(verbatim: snap.text).textSelection(.enabled)
+                                Text("Proposed replacement (untrusted)").font(.caption)
+                                Text(verbatim: replacement).textSelection(.enabled)
+                                Text("Apply only if the saved file and editor still match the original.").font(.caption)
+                            }
+                        }.padding().frame(maxWidth: .infinity, alignment: .leading)
+                    }.navigationTitle(reviewTitle)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) { Button("Discard") { transferReplacement = nil; transferReview = false }.disabled(model.reviewBusy) }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Apply") {
+                                guard let snap = transferSnapshot, let replacement = transferReplacement else { return }
+                                Task {
+                                    do { try await model.applyReviewedTransfer(snap, replacement: replacement); report = "Reviewed transfer applied"; transferReplacement = nil; transferReview = false }
+                                    catch { report = "Import conflict: native file or editor changed"; transferReplacement = nil; transferReview = false }
+                                }
+                            }.disabled(model.reviewBusy)
+                        }
+                    }
+                }.interactiveDismissDisabled(model.reviewBusy)
             }
             .confirmationDialog("Send reviewed message to model?", isPresented: $confirmFollowup) {
                 Button("Send") { if LocalRunner.agentSend(reviewedFollowup, ticket: reviewedTurn) { followup = ""; agentWaiting = false } else { report = "Message not accepted for this turn" }; reviewedFollowup = "" }
@@ -394,6 +474,12 @@ struct LocalToolsView: View {
             report = await Task.detached(priority: .userInitiated) {
                 LocalRunner.run(mode: selectedMode, input: input, persistent: persistent, vsix: vsix, cli: cli)
             }.value
+            if selectedMode == 9, let obj = try? JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any], obj["ok"] as? Bool == true, obj["shutdownClean"] as? Bool == true, obj["action"] as? String == "pull", let text = obj["text"] as? String, text.utf8.count <= 8192, !text.utf8.contains(0) {
+                transferReplacement = text; reviewTitle = "Review Linux import"; transferReview = true; report = "Linux file retrieved; native review required"
+            }
+            if selectedMode == 8, let obj = try? JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any], obj["ok"] as? Bool == true, obj["shutdownClean"] as? Bool == true, let items = obj["completions"], let data = try? JSONSerialization.data(withJSONObject: items), let decoded = try? JSONDecoder().decode([LSPTextEdit].self, from: data), decoded.count <= 32 {
+                lspItems = decoded; report = "Received \(decoded.count) plain completion suggestions"
+            }
             let progress = LocalRunner.progress()
             output = progress.output
             if nativeChat { agentTurns = progress.turns; agentHandle = progress.handle; agentWaiting = false }

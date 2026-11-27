@@ -34,6 +34,7 @@ on:
       - 'scripts/prepare-workbench-rootfs.py'
       - 'scripts/test-workbench-import.py'
       - 'scripts/build-test-vsix.py'
+      - 'scripts/workbench-browser-probe.py'
       - 'scripts/test-agy-import.py'
       - 'scripts/stage-ubuntu-device.sh'
       - 'scripts/prepare-swiftterm.sh'
@@ -451,13 +452,32 @@ jobs:
           name: native-conversation-fixture-evidence
           path: ${{ runner.temp }}/nexus-conversation-*.json
           if-no-files-found: error
+      - name: Verify native/Linux file transfer across independent guest boots
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-transfer-fs"
+          export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-transfer-fs/data"
+          for phase in push duplicate pull; do
+            export NEXUS_TRANSFER_PHASE="$phase"
+            export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-transfer-$phase.json"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workspace_transfer -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","shutdownClean"])' "$NEXUS_LOCAL_EVIDENCE"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workspace-transfer-evidence
+          path: ${{ runner.temp }}/nexus-transfer-*.json
+          if-no-files-found: error
       - name: Verify LSP snapshot diagnostics and invalid document rejection (synthetic peer)
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
           export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
           export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
           export CC="$(xcrun --sdk macosx --find clang)"
-          for phase in success invalidUri invalidRange; do
+          for phase in success invalidUri invalidRange completion completionInvalid; do
             cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-lsp-$phase"
             export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-lsp-$phase/data"
             export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-lsp-$phase.json"
@@ -540,7 +560,13 @@ jobs:
           python3 scripts/prepare-workbench-rootfs.py --archive "$asset" --confirm-local-use
           mv RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/plain-ubuntu-staged"
           bash scripts/stage-ubuntu-device.sh --workbench
-      - name: Boot reviewed real OpenVSCode and verify loopback HTTP
+      - name: Prepare pinned CI-only Chromium browser harness
+        if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/nexus-browser"
+          "$RUNNER_TEMP/nexus-browser/bin/python" -m pip install 'playwright==1.51.0'
+          "$RUNNER_TEMP/nexus-browser/bin/python" -m playwright install chromium
+      - name: Boot reviewed real OpenVSCode and verify browser editor and extension activation
         if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
@@ -550,11 +576,13 @@ jobs:
           cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-workbench-fs"
           export NEXUS_WORKBENCH_ROOTFS="$RUNNER_TEMP/nexus-workbench-fs/data"
           export NEXUS_WORKBENCH_EVIDENCE="$RUNNER_TEMP/nexus-workbench.json"
+          export NEXUS_WORKBENCH_BROWSER_PYTHON="$RUNNER_TEMP/nexus-browser/bin/python"
+          export NEXUS_WORKBENCH_BROWSER_SCRIPT="$GITHUB_WORKSPACE/scripts/workbench-browser-probe.py"
           python3 scripts/build-test-vsix.py "$RUNNER_TEMP/nexus-fixture.vsix"
           export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-fixture.vsix" | awk '{print $1}')"
           cat "$RUNNER_TEMP/nexus-fixture.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
-          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["extensionInstallVerified"] is True and r["editorVerified"] is False and r["lspVerified"] is False' "$NEXUS_WORKBENCH_EVIDENCE"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is False' "$NEXUS_WORKBENCH_EVIDENCE"
       - name: Upload workbench loopback evidence
         if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
         uses: actions/upload-artifact@v4

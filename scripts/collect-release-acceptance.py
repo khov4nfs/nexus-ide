@@ -28,7 +28,8 @@ def gates(variant):
         "claude": ("signedIn", "signedOut", "success", "error"),
         "conversation-codex": ("create", "resume"),
         "conversation-claude": ("create", "resume"),
-        "lsp": ("success", "invalidUri", "invalidRange"),
+        "lsp": ("success", "invalidUri", "invalidRange", "completion", "completionInvalid"),
+        "transfer": ("push", "duplicate", "pull"),
     }
     for group, phases in groups.items():
         for phase in phases:
@@ -43,7 +44,7 @@ def gates(variant):
     for phase in ("write", "read", "scroll"):
         rows[f"persist-{phase}"] = ("macOS guest persistence", {"ok": True, "verified": True, "shutdownClean": True})
     if variant == "workbench":
-        rows["workbench"] = ("macOS guest HTTP and VSIX install only", {"ok": True, "shutdownClean": True, "extensionInstallVerified": True, "editorVerified": False, "lspVerified": False})
+        rows["workbench"] = ("macOS guest Chromium editor and synthetic VSIX activation", {"ok": True, "shutdownClean": True, "extensionInstallVerified": True, "browserRequested": True, "extensionActivationVerified": True, "editorVerified": True, "lspVerified": False})
     return rows
 
 def read_json(path):

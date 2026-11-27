@@ -124,6 +124,16 @@ struct GuestEditPreview: Identifiable {
         return snap
     }
 
+    func applyReviewedTransfer(_ snapshot: WorkspaceSnapshot, replacement: String) async throws {
+        guard let workspace, !reviewBusy, path == snapshot.path, replacement.utf8.count <= 8192,
+              !replacement.utf8.contains(0), Data(source.utf8) == Data(snapshot.text.utf8) else { throw WorkspaceError.conflict }
+        reviewBusy = true
+        defer { reviewBusy = false }
+        try await workspace.apply(snapshot, replacement: replacement)
+        if path == snapshot.path, Data(source.utf8) == Data(snapshot.text.utf8) { source = replacement }
+        status = "Applied reviewed Linux transfer"
+    }
+
     func applyAgentProposal(_ proposal: AgentEditProposal) async throws {
         guard let workspace, !reviewBusy, path == proposal.snapshot.path,
               Data(source.utf8) == Data(proposal.snapshot.text.utf8) else { throw WorkspaceError.conflict }
