@@ -2,6 +2,7 @@
 use ish_embed_host::IshInstance;
 mod process_probe;
 mod persistent_acp;
+mod local_jobs;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};

@@ -10,8 +10,7 @@ targets:
     type: application
     platform: iOS
     sources:
-      - App/UbuntuLabApp.swift
-      - App/GeminiKeychain.swift
+      - App
       - path: RuntimeAssets/ubuntu-fs
         type: folder
         buildPhase: resources
@@ -22,7 +21,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.nexuside.ubuntu.lab
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: Nexus Ubuntu Lab
+        INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Nexus IDE Ubuntu
         SWIFT_VERSION: '5.0'
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) NEXUS_UBUNTU_LAB"
         SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/RuntimeBridge/include/NexusGuestBridge.h"

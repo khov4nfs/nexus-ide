@@ -4,10 +4,6 @@ import Foundation
 import NexusCore
 import UniformTypeIdentifiers
 
-@main struct UbuntuLabApp: App {
-    var body: some Scene { WindowGroup { UbuntuLabView() } }
-}
-
 private struct ChatTurn: Identifiable {
     let id: Int
     let user: String
@@ -15,7 +11,13 @@ private struct ChatTurn: Identifiable {
     let status: String
 }
 
-private struct UbuntuLabView: View {
+struct UbuntuLabView: View {
+    @ObservedObject var model: IDEModel
+    @State private var editSnapshot: WorkspaceSnapshot?
+    @State private var pendingEdit: WorkspaceSnapshot?
+    @State private var proposal: AgentEditProposal?
+    @State private var editStatus = ""
+    @State private var showingProposal = false
     @State private var attempted = false
     @State private var running = false
     @State private var confirm = false
@@ -59,10 +61,10 @@ private struct UbuntuLabView: View {
             List {
                 Section("Ubuntu ARM64 · glibc lab") {
                     Text("One boot per app process. No remote backend.")
-                    Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted)
-                    Button("Initialize imported AGY (no key)") { useGemini = false; confirm = true }.disabled(attempted || digest == nil)
+                    Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed)
+                    Button("Initialize imported AGY (no key)") { useGemini = false; confirm = true }.disabled(attempted || model.guestClaimed || digest == nil)
                     Button("Connect with saved Gemini API key") { useGemini = true; confirm = true }
-                        .disabled(attempted || digest == nil || !keyStored)
+                        .disabled(attempted || model.guestClaimed || digest == nil || !keyStored)
                     Text(digest == nil ? "No reviewed AGY binary imported." : "Local AGY digest manifest present. Execution not verified.")
                     if running { ProgressView("Keep this app open") }
                 }
@@ -97,6 +99,8 @@ private struct UbuntuLabView: View {
                             Button("Test model response") { confirmPrompt = true }.disabled(running || importingContext || turnCount != 0)
                             TextField("Ask the agent", text: $chatInput, axis: .vertical)
                                 .lineLimit(2...6).disabled(running || smokeUsed || turnCount >= maxTurns)
+                            Button("Attach saved editor file for edit") { attachEditor() }
+                                .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || model.path.isEmpty || model.reviewBusy || proposal != nil)
                             Button("Choose text file") { pickingContext = true }
                                 .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns)
                             if importingContext { ProgressView("Reading selected file") }
@@ -106,14 +110,15 @@ private struct UbuntuLabView: View {
                                     Text(context.text).font(.system(.footnote, design: .monospaced))
                                         .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                                 }.frame(maxHeight: 160)
-                                Button("Remove attachment") { fileContext = nil; contextStatus = "" }
+                                if let editSnapshot { Text("Edit target: " + editSnapshot.path).font(.caption) }
+                                Button("Remove attachment") { fileContext = nil; editSnapshot = nil; contextStatus = "" }
                                     .disabled(running || importingContext)
                             }
                             if !contextStatus.isEmpty { Text(contextStatus).font(.caption) }
                             if let context = fileContext, let combined = try? context.prompt(question: chatInput) {
                                 Text("Combined prompt: \(combined.utf8.count)/1024 bytes").font(.caption)
                             }
-                            Button("Send chat") { prepareChat() }
+                            Button(editSnapshot == nil ? "Send chat" : "Request edit proposal") { prepareChat() }
                                 .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || !UbuntuRunner.validChat(chatInput))
                             Text("Chat turns: \(turnCount)/\(maxTurns)").font(.caption)
                         }
@@ -150,11 +155,55 @@ private struct UbuntuLabView: View {
                         Text("Untrusted response · literal key filter only").font(.caption)
                     }
                 }
+                if !editStatus.isEmpty || proposal != nil {
+                    Section("Agent edit review") {
+                        Text(editStatus)
+                        if proposal != nil {
+                            Button("Review proposal") { showingProposal = true }
+                                .disabled(running || model.reviewBusy)
+                            Button("Discard proposal", role: .destructive) { proposal = nil; editStatus = "Discarded" }
+                                .disabled(model.reviewBusy)
+                        }
+                    }
+                }
                 Section("Evidence") {
                     Text(report).font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
                 }
             }
-            .navigationTitle("Ubuntu Lab")
+            .navigationTitle("Agent · Ubuntu")
+            .sheet(isPresented: $showingProposal) {
+                if let proposal {
+                    NavigationStack {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text(proposal.snapshot.path).font(.headline)
+                                Text("Change preview (not a minimal diff)").font(.caption)
+                                ForEach(Array(proposal.diff.enumerated()), id: \.offset) { _, line in
+                                    Text(line).font(.system(.footnote, design: .monospaced))
+                                        .foregroundStyle(line.hasPrefix("+ ") ? Color.green : line.hasPrefix("- ") ? Color.red : Color.primary)
+                                }
+                                Text("Original · \(proposal.snapshot.text.utf8.count) bytes").font(.headline)
+                                Text(proposal.snapshot.text).textSelection(.enabled)
+                                Text("Replacement · \(proposal.replacement.utf8.count) bytes").font(.headline)
+                                Text(proposal.replacement).textSelection(.enabled)
+                                Text("Review the full replacement. It will not run automatically.").font(.caption)
+                                Text(editStatus).font(.caption)
+                            }.padding().frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .navigationTitle("Review edit")
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Discard") { self.proposal = nil; showingProposal = false; editStatus = "Discarded" }
+                                    .disabled(model.reviewBusy)
+                            }
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button("Apply") { applyProposal(proposal) }.disabled(model.reviewBusy || running)
+                            }
+                        }
+                        .interactiveDismissDisabled(model.reviewBusy)
+                    }
+                }
+            }
             .onAppear { refreshKey() }
             .fileImporter(isPresented: $pickingContext, allowedContentTypes: [.plainText]) { result in
                 importContext(result)
@@ -177,10 +226,11 @@ private struct UbuntuLabView: View {
                 Button("Send message") {
                     let wire = pendingChat
                     let display = pendingDisplay
-                    pendingChat = ""; pendingDisplay = ""
-                    runPrompt(chat: wire, display: display)
+                    let edit = pendingEdit
+                    pendingChat = ""; pendingDisplay = ""; pendingEdit = nil
+                    runPrompt(chat: wire, display: display, edit: edit)
                 }
-                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = "" }
+                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil }
             } message: {
                 Text("Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
             }
@@ -207,7 +257,7 @@ private struct UbuntuLabView: View {
     }
 
     private func run(sha: String?, gemini: Bool = false) {
-        guard !attempted else { return }
+        guard !attempted, model.claimGuest() else { return }
         attempted = true
         running = true
         Task {
@@ -219,9 +269,40 @@ private struct UbuntuLabView: View {
         }
     }
 
+    private func attachEditor() {
+        guard !running, !importingContext, active, created, proposal == nil else { return }
+        importingContext = true
+        fileContext = nil; editSnapshot = nil
+        Task {
+            defer { importingContext = false }
+            do {
+                let snapshot = try await model.selectedSnapshot()
+                let context = try AgentFileContext(data: Data(snapshot.text.utf8))
+                guard let key = try GeminiKeychain.load(), !snapshot.text.contains(key) else {
+                    contextStatus = "Credential detected or unavailable"; return
+                }
+                fileContext = context
+                editSnapshot = snapshot
+                contextStatus = "Review the saved editor snapshot before requesting an edit"
+            } catch { contextStatus = "Save the selected editor file first; text limit 768 bytes" }
+        }
+    }
+
+    private func applyProposal(_ proposal: AgentEditProposal) {
+        Task {
+            do {
+                try await model.applyAgentProposal(proposal)
+                self.proposal = nil
+                showingProposal = false
+                editStatus = "Applied reviewed edit to native workspace"
+            } catch { editStatus = "Edit rejected: file or editor changed; discard and request a new proposal" }
+        }
+    }
+
     private func importContext(_ result: Result<URL, Error>) {
         guard !running, !importingContext, active, created, !smokeUsed, turnCount < maxTurns else { return }
         fileContext = nil
+        editSnapshot = nil
         contextStatus = ""
         guard case .success(let url) = result else { contextStatus = "No file selected"; return }
         importingContext = true
@@ -241,14 +322,19 @@ private struct UbuntuLabView: View {
     private func prepareChat() {
         guard !running, !importingContext, active, created, !smokeUsed, turnCount < maxTurns else { return }
         do {
-            let wire = try fileContext?.prompt(question: chatInput) ?? chatInput
+            let wire: String
+            if let editSnapshot {
+                guard proposal == nil else { contextStatus = "Review or discard the previous proposal"; return }
+                wire = try AgentEditProposal.prompt(snapshot: editSnapshot, question: chatInput)
+            } else { wire = try fileContext?.prompt(question: chatInput) ?? chatInput }
             guard UbuntuRunner.validChat(wire) else {
                 contextStatus = "Question and snapshot must fit 1024 UTF-8 bytes"; return
             }
             guard let key = try GeminiKeychain.load(), !wire.contains(key) else {
-                fileContext = nil; chatInput = ""; contextStatus = "Credential unavailable or detected"; return
+                fileContext = nil; editSnapshot = nil; chatInput = ""; contextStatus = "Credential unavailable or detected"; return
             }
             pendingChat = wire
+            pendingEdit = editSnapshot
             pendingDisplay = fileContext == nil ? chatInput : chatInput + "\n[Selected text snapshot included]"
             confirmChat = true
         } catch {
@@ -256,7 +342,7 @@ private struct UbuntuLabView: View {
         }
     }
 
-    private func runPrompt(chat: String? = nil, display: String? = nil) {
+    private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil) {
         guard active, created, useGemini, !running, !importingContext, !smokeUsed, turnCount < maxTurns,
               chat != nil || turnCount == 0 else { return }
         if let chat {
@@ -270,6 +356,7 @@ private struct UbuntuLabView: View {
             sentChat = display ?? chat
             chatInput = ""
             fileContext = nil
+            editSnapshot = nil
             contextStatus = ""
         }
         chatResponse = ""
@@ -294,6 +381,13 @@ private struct UbuntuLabView: View {
                 let text = result.ok && matches ? snapshot.text : ""
                 transcript.append(ChatTurn(id: expectedID, user: display ?? chat, response: text,
                     status: matches ? result.status : "Turn failed or response mismatch"))
+                if let edit {
+                    if result.ok && matches && result.status == "Chat turn completed", let key = try? GeminiKeychain.load(),
+                       let candidate = try? AgentEditProposal(snapshot: edit, response: text, credential: key) {
+                        proposal = candidate
+                        editStatus = "Untrusted proposal ready for explicit review"
+                    } else { editStatus = "No valid complete replacement returned; nothing written" }
+                }
                 sentChat = ""
                 chatResponse = ""
             }
@@ -320,7 +414,7 @@ private struct UbuntuLabView: View {
             agentStatus = result.status
             active = result.active
             if !close && result.ok { created = true }
-            if !active { fileContext = nil; pendingChat = ""; pendingDisplay = ""; contextStatus = "" }
+            if !active { fileContext = nil; editSnapshot = nil; pendingEdit = nil; pendingChat = ""; pendingDisplay = ""; contextStatus = "" }
             running = false
         }
     }

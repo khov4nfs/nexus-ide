@@ -27,6 +27,13 @@ struct GuestEditPreview: Identifiable {
     @Published var guestPreview: GuestEditPreview?
     @Published var guestBusy = false
 #endif
+    @Published var reviewBusy = false
+    @Published private(set) var guestClaimed = false
+    func claimGuest() -> Bool {
+        guard !guestClaimed else { return false }
+        guestClaimed = true
+        return true
+    }
     private var workspace: Workspace?
     private var runtime: NativeRuntime?
 
@@ -41,17 +48,17 @@ struct GuestEditPreview: Identifiable {
         } catch { status = String(describing: error) }
     }
     func open(_ name: String) async {
-        guard let workspace else { return }
+        guard let workspace, !reviewBusy else { return }
         do { let value = try await workspace.read(name); path = name; source = value; status = "Opened \(name)" }
         catch { status = String(describing: error) }
     }
     func save() async {
-        guard let workspace, !path.isEmpty else { return }
+        guard let workspace, !path.isEmpty, !reviewBusy else { return }
         do { try await workspace.write(path, text: source); status = "Saved \(path)" }
         catch { status = String(describing: error) }
     }
     func create() async {
-        guard let workspace, !newPath.isEmpty else { return }
+        guard let workspace, !newPath.isEmpty, !reviewBusy else { return }
         let name = newPath
         do {
             guard !(try await workspace.list()).contains(name) else { status = "File already exists"; return }
@@ -109,6 +116,26 @@ struct GuestEditPreview: Identifiable {
         guestPreview = nil
     }
 #endif
+    func selectedSnapshot() async throws -> WorkspaceSnapshot {
+        guard let workspace, !path.isEmpty, !reviewBusy else { throw WorkspaceError.invalidPath }
+        let name = path
+        let snap = try await workspace.snapshot(name)
+        guard path == name, Data(source.utf8) == Data(snap.text.utf8) else { throw WorkspaceError.conflict }
+        return snap
+    }
+
+    func applyAgentProposal(_ proposal: AgentEditProposal) async throws {
+        guard let workspace, !reviewBusy, path == proposal.snapshot.path,
+              Data(source.utf8) == Data(proposal.snapshot.text.utf8) else { throw WorkspaceError.conflict }
+        reviewBusy = true
+        defer { reviewBusy = false }
+        try await workspace.apply(proposal.snapshot, replacement: proposal.replacement)
+        if path == proposal.snapshot.path, Data(source.utf8) == Data(proposal.snapshot.text.utf8) {
+            source = proposal.replacement
+        }
+        status = "Applied reviewed agent edit"
+    }
+
     func run() async {
         guard let runtime else { return }
         let input = command
@@ -149,6 +176,10 @@ struct IDEView: View {
                     }
                 }.padding().navigationTitle("Local console")
             }.tabItem { Label("Console", systemImage: "terminal") }
+#if NEXUS_UBUNTU_LAB && os(iOS) && !targetEnvironment(simulator)
+            UbuntuLabView(model: model).tabItem { Label("Agent", systemImage: "cpu") }
+            LocalToolsView(model: model).tabItem { Label("Local tools", systemImage: "terminal.fill") }
+#else
             NavigationStack {
                 List {
                     Section("Original harnesses — integration pending") {
@@ -161,17 +192,20 @@ struct IDEView: View {
                     Section { Text("No remote execution backend. ACP framing is implemented; no live agent transport yet.") }
                 }.navigationTitle("Agents & runtimes")
             }.tabItem { Label("Agents", systemImage: "cpu") }
+#endif
+#if !NEXUS_UBUNTU_LAB
             GuestProbeView().tabItem { Label("Linux Lab", systemImage: "terminal.fill") }
+#endif
         }.task { await model.start() }
     }
     private func editor(_ file: String) -> some View {
         TextEditor(text: $model.source)
             .font(.system(.body, design: .monospaced))
             .autocorrectionDisabled().textInputAutocapitalization(.never)
-            .disabled(model.path != file)
+            .disabled(model.path != file || model.reviewBusy)
             .navigationTitle(file).navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                Button("Save") { Task { await model.save() } }.disabled(model.path != file)
+                Button("Save") { Task { await model.save() } }.disabled(model.path != file || model.reviewBusy)
 #if NEXUS_EMBEDDED_LINUX && os(iOS) && !targetEnvironment(simulator)
                 Button("Guest preview") { confirmGuestEdit = true }
                     .disabled(model.path != file || model.guestBusy)
