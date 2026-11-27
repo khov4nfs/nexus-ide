@@ -105,9 +105,9 @@ struct UbuntuLabView: View {
                         }
                         Text(importStatus).font(.caption)
                     }
-                    Toggle("Enable read-only ACP attachment tool", isOn: $enableSnapshotRead)
+                    Toggle("Enable ACP attachment / staged edit tools", isOn: $enableSnapshotRead)
                         .disabled(attempted || model.guestClaimed)
-                    Text("Optional: only a selected immutable text snapshot can be read, for one confirmed turn. No iOS path or write access.").font(.caption)
+                    Text("Optional: selected text only, for one confirmed turn. Editor edits can be staged for review; no direct iOS file write.").font(.caption)
                     Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed || importingAGY)
                     Button("Initialize imported AGY (no key)") { useGemini = false; useGoogle = false; confirm = true }.disabled(attempted || model.guestClaimed || importingAGY || digest == nil)
                     Button("Connect with saved Gemini API key") { useGemini = true; useGoogle = false; confirm = true }
@@ -158,7 +158,7 @@ struct UbuntuLabView: View {
                 }
                 Section("Native ACP client") {
                     Text(agentStatus)
-                    Text("ACP permissions deny by default. Optional selected snapshot is read-only. Agent internal actions are not sandboxed.").font(.caption)
+                    Text("ACP permissions deny by default. Selected virtual file edits require native review. Agent internal actions are not sandboxed.").font(.caption)
                     if active {
                         Text("Connection closes after 180 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
                         Button("Create empty guest session") { act(close: false) }.disabled(running || created)
@@ -465,7 +465,11 @@ struct UbuntuLabView: View {
             pendingReadContent = nil
             if let editSnapshot {
                 guard proposal == nil else { contextStatus = "Review or discard the previous proposal"; return }
-                wire = try AgentEditProposal.prompt(snapshot: editSnapshot, question: chatInput)
+                if enableSnapshotRead {
+                    guard try credentialAllows(editSnapshot.text) else { contextStatus = "Credential detected"; return }
+                    wire = chatInput + "\nRead /nexus-selected.txt and stage one complete replacement via fs/write_text_file. Native user will review before applying."
+                    pendingReadContent = editSnapshot.text
+                } else { wire = try AgentEditProposal.prompt(snapshot: editSnapshot, question: chatInput) }
             } else if enableSnapshotRead, snapshotReadThisTurn, let context = fileContext {
                 guard try credentialAllows(context.text) else { contextStatus = "Credential detected"; return }
                 wire = chatInput + "\nRead the selected text via fs/read_text_file at /nexus-selected.txt if needed."
@@ -514,7 +518,7 @@ struct UbuntuLabView: View {
         toolUpdates = 0
         cancelRequested = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent, stageEdit: edit != nil && readContent != nil) }.value
             let snapshot = UbuntuRunner.progress()
             if snapshot.responseID == expectedID {
                 permissionDenials = snapshot.permissionDenials
@@ -527,7 +531,7 @@ struct UbuntuLabView: View {
                     status: matches ? result.status : "Turn failed or response mismatch"))
                 if let edit {
                     if result.ok && matches && result.status == "Chat turn completed", let key = try? GeminiKeychain.load(),
-                       let candidate = try? AgentEditProposal(snapshot: edit, response: text, credential: key) {
+                       let candidate = try? AgentEditProposal(snapshot: edit, response: readContent != nil ? (result.stagedResponse ?? "") : text, credential: key) {
                         proposal = candidate
                         editStatus = "Untrusted proposal ready for explicit review"
                     } else { editStatus = "No valid complete replacement returned; nothing written" }
@@ -610,7 +614,7 @@ private enum UbuntuRunner {
                 }
             }
             let data = trial.appendingPathComponent("data", isDirectory: true)
-            let request = sha == nil ? nil : String(decoding: try client.request(readSnapshot: readSnapshot), as: UTF8.self)
+            let request = sha == nil ? nil : String(decoding: try client.request(readSnapshot: readSnapshot, writeSnapshot: readSnapshot), as: UTF8.self)
             let pointer = data.path.withCString { path in
                 if let sha, let request {
                     return sha.withCString { digest in
@@ -695,11 +699,11 @@ private enum UbuntuRunner {
         controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
     }
 
-    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int) {
+    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
-            else if let chat, let readContent { pointer = chat.withCString { t in readContent.withCString { nexus_acp_chat_snapshot(t,$0) } } }
+            else if let chat, let readContent { pointer = chat.withCString { t in readContent.withCString { stageEdit ? nexus_acp_chat_edit(t,$0) : nexus_acp_chat_snapshot(t,$0) } } }
             else if let chat { pointer = chat.withCString { nexus_acp_chat($0) } }
             else if prompt { pointer = nexus_acp_prompt_probe() }
             else {
@@ -708,13 +712,13 @@ private enum UbuntuRunner {
             }
             guard let pointer else {
                 nexus_guest_free(nexus_acp_close())
-                return ("No report", "Connection unavailable", false, false, 0)
+                return ("No report", "Connection unavailable", false, false, 0, nil)
             }
             defer { nexus_guest_free(pointer) }
             let raw = String(cString: pointer)
             guard let object = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] else {
                 nexus_guest_free(nexus_acp_close())
-                return ("Invalid report", "Connection unavailable", false, false, 0)
+                return ("Invalid report", "Connection unavailable", false, false, 0, nil)
             }
             cleanTrialIfShutdown(object)
             let active = object["active"] as? Bool == true
@@ -735,10 +739,18 @@ private enum UbuntuRunner {
             } else {
                 status = "Request failed or connection expired; restart app"
             }
-            return (raw, status, active, ok, object["responseId"] as? Int ?? 0)
+            var reportObject = object
+            let replacement = reportObject.removeValue(forKey: "stagedReplacement") as? String
+            let stagedResponse: String?
+            if stageEdit, ok, status == "Chat turn completed", let replacement,
+               let encoded = try? JSONSerialization.data(withJSONObject: ["replacement": replacement]) {
+                stagedResponse = String(decoding: encoded, as: UTF8.self)
+            } else { stagedResponse = nil }
+            let report = (try? JSONSerialization.data(withJSONObject: reportObject, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) } ?? "Report unavailable"
+            return (report, status, active, ok, object["responseId"] as? Int ?? 0, stagedResponse)
         } catch {
             nexus_guest_free(nexus_acp_close())
-            return ("Request encoding failed", "Connection stopped", false, false, 0)
+            return ("Request encoding failed", "Connection stopped", false, false, 0, nil)
         }
     }
 }

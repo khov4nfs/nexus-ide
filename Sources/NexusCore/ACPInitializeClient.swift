@@ -14,9 +14,9 @@ public struct ACPInitializeClient: Sendable {
 
     public init() {}
 
-    public mutating func request(readSnapshot: Bool = false) throws -> Data {
+    public mutating func request(readSnapshot: Bool = false, writeSnapshot: Bool = false) throws -> Data {
         guard state == .idle else { throw ACPError.unexpectedResponse }
-        let data = try ACPRequest.initialize(id: 1, readSnapshot: readSnapshot)
+        let data = try ACPRequest.initialize(id: 1, readSnapshot: readSnapshot, writeSnapshot: writeSnapshot)
         state = .waiting
         return data
     }

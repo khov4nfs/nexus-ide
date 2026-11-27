@@ -30,6 +30,16 @@ final class ACPInitializeTests: XCTestCase {
         XCTAssertNil(caps["terminal"])
     }
 
+    func testStagedWriteCapabilityIsExplicit() throws {
+        var client = ACPInitializeClient()
+        let request = try client.request(readSnapshot: true, writeSnapshot: true)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: request) as? [String: Any])
+        let params = try XCTUnwrap(object["params"] as? [String: Any])
+        let caps = try XCTUnwrap(params["clientCapabilities"] as? [String: Any])
+        XCTAssertEqual(caps["fs"] as? [String: Bool], ["readTextFile": true, "writeTextFile": true])
+        XCTAssertNil(caps["terminal"])
+    }
+
     func testAuthenticationIsNotSuccess() throws {
         var client = ACPInitializeClient()
         _ = try client.request()
