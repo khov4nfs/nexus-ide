@@ -334,6 +334,25 @@ jobs:
           name: acp-terminal-fixture-evidence
           path: ${{ runner.temp }}/nexus-terminal.json
           if-no-files-found: error
+      - name: Verify ACP reviewed permission decisions and cancellation (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for phase in allow deny cancel; do
+            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-acp-review-$phase"
+            export NEXUS_ACP_ROOTFS="$RUNNER_TEMP/nexus-acp-review-$phase/data"
+            export NEXUS_ACP_EVIDENCE="$RUNNER_TEMP/nexus-acp-review-$phase.json"
+            export NEXUS_ACP_REVIEW_PHASE="$phase"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_acp_permission_review_fixture -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","reviewVerified","outcomeVerified","shutdownClean"])' "$NEXUS_ACP_EVIDENCE"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acp-review-fixture-evidence
+          path: ${{ runner.temp }}/nexus-acp-review-*.json
+          if-no-files-found: error
       - name: Verify ACP session load across independent guest processes (synthetic peer)
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"

@@ -505,6 +505,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_MCP_SESSION").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_MCP_SESSION".into(),"1".into());}
     #[cfg(test)]
     if matches!(&mode,Mode::Fixture) {if let Ok(phase)=std::env::var("NEXUS_ACP_RESUME_PHASE"){agent_env.insert("NEXUS_FIXTURE_RESUME".into(),phase);}}
+    #[cfg(test)]
+    if matches!(&mode,Mode::Fixture){if let Ok(phase)=std::env::var("NEXUS_ACP_REVIEW_PHASE"){agent_env.insert("NEXUS_FIXTURE_REVIEW".into(),phase);}}
     opts.envp = Some(agent_env.into_iter().collect());
     opts.pipe_stdin = true;
     let session = match guest.spawn(opts) {
@@ -959,6 +961,48 @@ pub unsafe extern "C" fn nexus_acp_chat_terminal(text:*const c_char,choice:*cons
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires separate Ubuntu guest per explicit permission outcome"]
+    fn real_acp_permission_review_fixture(){
+        let path=std::env::var_os("NEXUS_ACP_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_ACP_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_ACP_REVIEW_PHASE").expect("phase");
+        let init=start(PathBuf::from(path),Mode::Fixture,process_probe::AGY_INITIALIZE_REQUEST.to_vec(),Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()),false);
+        assert_eq!(init["ok"],true,"fixture init failed: {init}");
+        assert_eq!(command(Action::New(NEW_REQUEST.to_vec()))["ok"],true);
+        let worker=thread::spawn(||command(Action::Reviewed("Review fixture".into())));
+        let deadline=Instant::now()+Duration::from_secs(10);
+        let observed=loop{
+            let p=prompt_progress();
+            if p["permission"]["ticket"].as_i64().is_some(){break Some(p);}
+            if worker.is_finished()||Instant::now()>=deadline{break None;}
+            thread::sleep(Duration::from_millis(20));
+        };
+        let review_ok=if let Some(p)=observed{
+            let ticket=p["permission"]["ticket"].as_i64().unwrap();
+            let stale=decide_permission(ticket+1,true)["ok"]==false;
+            let accepted=match phase.as_str(){
+                "allow"=>decide_permission(ticket,true)["ok"]==true,
+                "deny"=>decide_permission(ticket,false)["ok"]==true,
+                "cancel"=>request_cancel()["ok"]==true,
+                _=>false,
+            };
+            stale&&accepted&&decide_permission(ticket,true)["ok"]==false&&p["plan"][0].as_str().is_some_and(|s|s.contains("Inspect fixture"))&&p["permission"]["title"]=="Reviewed fixture"
+        }else{false};
+        let result=worker.join().unwrap();
+        let p=prompt_progress();
+        let outcome=match phase.as_str(){
+            "allow"=>result["chatCompleted"]==true&&p["permissionAllows"]==1&&p["permissionDenials"]==0,
+            "deny"=>result["chatCompleted"]==true&&p["permissionAllows"]==0&&p["permissionDenials"]==1,
+            "cancel"=>result["cancelled"]==true&&p["permissionAllows"]==0,
+            _=>false,
+        };
+        let close=command(Action::Close);
+        let ok=review_ok&&outcome&&p["permission"].is_null()&&close["shutdownClean"]==true;
+        let report=json!({"ok":ok,"fixtureOnly":true,"phase":phase,"reviewVerified":review_ok,"outcomeVerified":outcome,"shutdownClean":close["shutdownClean"]});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(ok,"review fixture failed: {report}");
+    }
     #[test]
     fn plan_and_permission_preview_are_bounded() {
         let plan=json!({"entries":[{"content":"Inspect","status":"pending","priority":"high"}]});

@@ -83,3 +83,6 @@ New local job mode 8 starts one explicitly reviewed absolute argv in the local-t
 
 ## Native Codex/Claude session lifecycle hooks and turn tickets
 Optional reviewed before/after session shell commands are frozen in the launch request. Each is bounded to 30 seconds; before failure skips the session, after runs only after normal session finish, not stop/failure. No automatic project hook discovery or native credential injection; guest-resident credentials may be accessible. Original binary digest is rechecked after before hook and after session/after hook; changed executable cannot be marked reusable. Follow-up and finish mailbox commands now carry the completed-turn ticket, so stale confirmations cannot become a different turn. Existing multi-turn fixtures check hook markers/order and reject duplicate tickets; real provider hooks and AGY lifecycle hooks still pending.
+
+## ACP review regression gates
+Added real guest transport fixtures for reviewed allow_once, reject_once and cancel while a request is pending, with legacy plan projection, stale/duplicate ticket refusal, mailbox cleanup and clean shutdown. Synthetic peer checks opaque outcome IDs rather than trusting labels; no allow_always or real tool side effects. Actual AGY permission behavior remains unverified.
