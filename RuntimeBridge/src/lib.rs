@@ -223,6 +223,34 @@ mod tests {
         assert_eq!(report["ok"].as_bool(), Some(true), "{report}");
     }
 
+    // A real Ubuntu /usr/bin/true fixture is copied over the import marker
+    // before boot. This proves the metadata slot works, NOT that AGY works.
+    #[test]
+    #[ignore = "requires fresh Ubuntu fakefs with import slot"]
+    fn real_agy_import_slot() {
+        let path = std::env::var_os("NEXUS_SLOT_ROOTFS").expect("slot rootfs");
+        let evidence = std::env::var_os("NEXUS_SLOT_EVIDENCE").expect("slot evidence");
+        let sha = std::env::var("NEXUS_SLOT_SHA256").expect("fixture digest");
+        assert!(process_probe::agy_digest_ok(&sha));
+        let root = Path::new(&path);
+        assert_eq!(std::fs::read(root.join("opt/nexus/agy")).unwrap(), b"NEXUS_AGY_IMPORT_SLOT_V1\n");
+        // Replace bytes in place, not a host-side metadata update.
+        let fixture = std::fs::read(root.join("usr/bin/true")).expect("Ubuntu fixture executable");
+        std::fs::write(root.join("opt/nexus/agy"),fixture).expect("replace slot");
+        let guest = IshInstance::boot(root,Some(Path::new("/"))).expect("boot");
+        let env = HashMap::from([("PATH".to_owned(),"/usr/bin:/bin".to_owned()),
+            ("HOME".to_owned(),"/root".to_owned()),("LANG".to_owned(),"C".to_owned())]);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let digest = rt.block_on(process_probe::agy_binary_digest(&guest,&env,&sha));
+        let (code,output) = guest.run_oneshot(&["/opt/nexus/agy".to_owned()],Path::new("/"),&env,Some(10_000));
+        let shutdown = rt.block_on(guest.shutdown()).is_ok();
+        let report = json!({"ok":digest["passed"] == true && code == 0 && output.is_empty() && shutdown,
+            "fixture":"Ubuntu true, not AGY","digestVerified":digest["passed"],"exitCode":code,"shutdownClean":shutdown});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).expect("slot evidence");
+        println!("{report}");
+        assert_eq!(report["ok"],true);
+    }
+
     // Explicit opt-in host execution gate, never a silent pass without rootfs.
     #[test]
     #[ignore = "requires freshly generated trusted ARM64 fakefs"]

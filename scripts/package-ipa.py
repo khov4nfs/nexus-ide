@@ -84,13 +84,19 @@ def verify(path, variant):
             validate_macho(header+stream.read(size))
         if prefix+"embedded.mobileprovision" in names:
             raise ValueError("Unexpected provisioning profile in public unsigned build")
-        if any(n.startswith(prefix+"ubuntu-fs/data/opt/nexus/agy") or n == prefix+"ubuntu-fs/agy.sha256" for n in names):
+        slot = prefix+"ubuntu-fs/data/opt/nexus/agy"
+        if prefix+"ubuntu-fs/agy.sha256" in names or any(n.startswith(slot) and n != slot for n in names):
             raise ValueError("Proprietary AGY must not be bundled in public candidate")
+        if slot in names and (z.getinfo(slot).file_size != len(b"NEXUS_AGY_IMPORT_SLOT_V1\n") or
+                             z.read(slot) != b"NEXUS_AGY_IMPORT_SLOT_V1\n"):
+            raise ValueError("Expected empty AGY import slot, not a binary")
         guest = prefix+"ubuntu-fs/"
         has_guest = guest+"meta.db" in names
         if has_guest != (variant != "native"):
             raise ValueError("Incorrect embedded guest assets")
         if has_guest:
+            if slot not in names:
+                raise ValueError("Missing AGY import slot")
             with z.open(guest+"meta.db") as db:
                 if db.read(16) != b"SQLite format 3\0":
                     raise ValueError("Invalid fakefs database")
@@ -116,7 +122,7 @@ def verify(path, variant):
             "architecture":"arm64","platform":"iPhoneOS",
             "signing":"unsigned; must be signed by a legitimate installer",
             "variant":variant,"physicalDeviceVerified":False,
-            "agyBundled":False,"guestBundled":has_guest,
+            "agyBundled":False,"agyImportSlot":has_guest,"guestBundled":has_guest,
         }
 
 def package(app, output, variant, commit):

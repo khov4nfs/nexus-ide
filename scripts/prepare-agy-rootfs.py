@@ -19,6 +19,7 @@ BUILD = ROOT / "Vendor/litter-ish/build"
 UBUNTU = BUILD / "ubuntu-base-24.04.5-base-arm64.tar.gz"
 UBUNTU_SHA = "a91d5a93010193712d346d761372b7c9db6dfcf093893161c64ca107f05914f2"
 PIN = "c8e9dcb954963b0d9f359b3ad9da871f19b28652"
+IMPORT_SLOT = b"NEXUS_AGY_IMPORT_SLOT_V1\n"
 
 def digest(path):
     with path.open("rb") as stream:
@@ -70,6 +71,14 @@ def overlay_archive(original, binary, output):
         info.size = binary.stat().st_size
         with binary.open("rb") as stream:
             dst.addfile(info, stream)
+
+def overlay_import_slot(original, output):
+    # A non-executable-content marker in a guest executable metadata slot.
+    # No AGY binary is included; native import replaces bytes before boot.
+    with tempfile.TemporaryDirectory(prefix="agy-slot-") as tmp:
+        marker = Path(tmp) / "slot"
+        marker.write_bytes(IMPORT_SLOT)
+        overlay_archive(original, marker, output)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

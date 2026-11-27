@@ -138,6 +138,9 @@ def main():
             agy.validate_binary(binary, args.agy_sha256)
             original = stage / "with-agy.tar.gz"
             agy.overlay_archive(agy.UBUNTU, binary, original)
+        else:
+            original = stage / "with-slot.tar.gz"
+            agy.overlay_import_slot(agy.UBUNTU, original)
         archive = stage / "rootfs.tar.gz"
         overlay(original, package, archive)
         fs = stage / "fs"

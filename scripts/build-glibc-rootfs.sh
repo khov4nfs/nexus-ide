@@ -19,7 +19,16 @@ fi
 printf '%s  %s\n' "$digest" "$cache" | shasum -a 256 -c -
 stage=$(mktemp -d "$root/Vendor/litter-ish/build/ubuntu-stage.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-"$converter" "$cache" "$stage/fs"
+python3 - "$cache" "$stage/slot.tar.gz" <<'PY'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("agy", "scripts/prepare-agy-rootfs.py")
+agy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(agy)
+agy.overlay_import_slot(Path(sys.argv[1]), Path(sys.argv[2]))
+PY
+"$converter" "$stage/slot.tar.gz" "$stage/fs"
+test "$(cat "$stage/fs/data/opt/nexus/agy")" = NEXUS_AGY_IMPORT_SLOT_V1
 sqlite3 "$stage/fs/meta.db" 'PRAGMA wal_checkpoint(TRUNCATE);'
 test -d "$stage/fs/data"
 test -f "$stage/fs/meta.db"
@@ -27,5 +36,5 @@ rm -f "$stage/fs/meta.db-shm" "$stage/fs/meta.db-wal"
 target="$root/Vendor/litter-ish/build/ubuntu-fs"
 test ! -e "$target" || { echo "Refusing to overwrite existing Ubuntu rootfs; move it aside explicitly" >&2; exit 1; }
 mv "$stage/fs" "$target"
-printf 'source=%s/%s\nsha256=%s\n' "$base" "$name" "$digest" > "$target/provenance.txt"
+printf 'source=%s/%s\nsha256=%s\nagy_import_slot=v1\n' "$base" "$name" "$digest" > "$target/provenance.txt"
 echo "Prepared separate Ubuntu fakefs at $target/data"

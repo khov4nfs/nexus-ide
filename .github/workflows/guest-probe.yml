@@ -38,6 +38,7 @@ on:
       - 'App/NexusApp.swift'
       - 'App/LocalToolsView.swift'
       - 'App/GeminiKeychain.swift'
+      - 'App/LocalAGYImport.swift'
       - 'project-guest.yml'
       - 'App/GuestProbeView.swift'
       - '.github/workflows/guest-probe.yml'
@@ -214,6 +215,24 @@ jobs:
             ${{ runner.temp }}/nexus-local-mcp.json
           if-no-files-found: warn
           retention-days: 7
+      - name: Verify real ELF import slot in fresh Ubuntu guest (not AGY)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-slot-fs"
+          export NEXUS_SLOT_ROOTFS="$RUNNER_TEMP/nexus-slot-fs/data"
+          export NEXUS_SLOT_SHA256="$(shasum -a 256 "$NEXUS_SLOT_ROOTFS/usr/bin/true" | awk '{print $1}')"
+          export NEXUS_SLOT_EVIDENCE="$RUNNER_TEMP/nexus-slot-evidence.json"
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_agy_import_slot -- --ignored --nocapture --test-threads=1
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["digestVerified"] is True and r["exitCode"] == 0 and r["shutdownClean"] is True and r["fixture"] == "Ubuntu true, not AGY"' "$NEXUS_SLOT_EVIDENCE"
+      - name: Upload import slot evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: agy-import-slot-evidence
+          path: ${{ runner.temp }}/nexus-slot-evidence.json
+          if-no-files-found: error
       - name: Optional reviewed workbench asset for device test
         if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
         run: |

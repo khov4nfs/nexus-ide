@@ -19,7 +19,8 @@ if [[ "${1:-}" == --agy ]] || [[ "${1:-}" == --workbench && -f "$source/agy.sha2
   printf '%s  %s\n' "$expected" "$source/data/opt/nexus/agy" | shasum -a 256 -c -
 else
   test ! -e "$source/agy.sha256"
-  test ! -e "$source/data/opt/nexus/agy"
+  test -f "$source/data/opt/nexus/agy"
+  printf 'NEXUS_AGY_IMPORT_SLOT_V1\n' | cmp - "$source/data/opt/nexus/agy"
 fi
 if [[ "${1:-}" == --workbench ]]; then
   test "$(cat "$source/workbench.sha256")" = 36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc

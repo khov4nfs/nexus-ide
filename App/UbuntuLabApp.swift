@@ -49,7 +49,18 @@ struct UbuntuLabView: View {
     @State private var keyStored = false
     @State private var keyStatus = ""
     @State private var useGemini = false
+    @State private var importedAGY: LocalAGYImport?
+    @State private var expectedAGY = ""
+    @State private var frozenAGYDigest = ""
+    @State private var pickingAGY = false
+    @State private var importingAGY = false
+    @State private var importStatus = ""
+    private var importSlot: Bool {
+        guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else { return false }
+        return LocalAGYImport.available(in: root)
+    }
     private var digest: String? {
+        if let importedAGY { return importedAGY.digest }
         guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil),
               let text = try? String(contentsOf: root.appendingPathComponent("agy.sha256"), encoding: .utf8) else { return nil }
         let sha = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -61,11 +72,32 @@ struct UbuntuLabView: View {
             List {
                 Section("Ubuntu ARM64 · glibc lab") {
                     Text("One boot per app process. No remote backend.")
-                    Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed)
-                    Button("Initialize imported AGY (no key)") { useGemini = false; confirm = true }.disabled(attempted || model.guestClaimed || digest == nil)
+                    if importSlot {
+                        Text("Import a reviewed official Linux ARM64 AGY executable from Files. Supply its independently reviewed SHA-256; no archive or installer.")
+                            .font(.caption)
+                        TextField("Expected lowercase SHA-256", text: $expectedAGY)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            .disabled(attempted || model.guestClaimed || importingAGY)
+                        Button("Choose AGY executable") {
+                            frozenAGYDigest = expectedAGY
+                            pickingAGY = true
+                        }.disabled(attempted || model.guestClaimed || importingAGY || !AGYImportFormat.validDigest(expectedAGY))
+                            .fileImporter(isPresented: $pickingAGY, allowedContentTypes: [.data]) { result in
+                                importAGY(result)
+                            }
+                        if importingAGY { ProgressView("Verifying local ELF and SHA-256") }
+                        if importedAGY != nil {
+                            Button("Discard imported executable", role: .destructive) {
+                                importedAGY?.discard(); importedAGY = nil; importStatus = "Discarded"
+                            }.disabled(attempted || model.guestClaimed || importingAGY)
+                        }
+                        Text(importStatus).font(.caption)
+                    }
+                    Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed || importingAGY)
+                    Button("Initialize imported AGY (no key)") { useGemini = false; confirm = true }.disabled(attempted || model.guestClaimed || importingAGY || digest == nil)
                     Button("Connect with saved Gemini API key") { useGemini = true; confirm = true }
-                        .disabled(attempted || model.guestClaimed || digest == nil || !keyStored)
-                    Text(digest == nil ? "No reviewed AGY binary imported." : "Local AGY digest manifest present. Execution not verified.")
+                        .disabled(attempted || model.guestClaimed || importingAGY || digest == nil || !keyStored)
+                    Text(digest == nil ? "No reviewed AGY binary imported." : "Reviewed digest present. Execution and publisher identity not verified.")
                     if running { ProgressView("Keep this app open") }
                 }
                 Section("Gemini credential · device only") {
@@ -256,12 +288,32 @@ struct UbuntuLabView: View {
         } catch { keyStored = false; keyStatus = "Keychain unavailable" }
     }
 
+    private func importAGY(_ result: Result<URL, Error>) {
+        guard !attempted, !model.guestClaimed, !importingAGY, importSlot,
+              case .success(let url) = result else { return }
+        let expected = frozenAGYDigest
+        importingAGY = true
+        importedAGY?.discard(); importedAGY = nil
+        Task {
+            let selected = await Task.detached(priority: .userInitiated) {
+                try? LocalAGYImport.select(url, expected: expected)
+            }.value
+            importingAGY = false
+            guard !model.guestClaimed else { selected?.discard(); return }
+            importedAGY = selected
+            importStatus = selected == nil ? "Import rejected: file, ARM64 ELF or digest mismatch" : "Local import verified. Nothing executed; consent to connect separately."
+        }
+    }
+
     private func run(sha: String?, gemini: Bool = false) {
-        guard !attempted, model.claimGuest() else { return }
+        guard !attempted, !importingAGY, model.claimGuest() else { return }
+        let selected = sha == nil ? nil : importedAGY
         attempted = true
         running = true
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, imported: selected) }.value
+            selected?.discard()
+            if selected != nil { importedAGY = nil }
             report = result.report
             agentStatus = result.status
             active = result.active
@@ -421,7 +473,7 @@ struct UbuntuLabView: View {
 }
 
 private enum UbuntuRunner {
-    static func run(sha: String?, gemini: Bool) -> (report: String, status: String, active: Bool) {
+    static func run(sha: String?, gemini: Bool, imported: LocalAGYImport?) -> (report: String, status: String, active: Bool) {
         var client = ACPInitializeClient()
         func failed(_ reason: String) -> (String, String, Bool) { (reason, "Not initialized", false) }
         do {
@@ -436,6 +488,15 @@ private enum UbuntuRunner {
             }
             let trial = fm.temporaryDirectory.appendingPathComponent("NexusUbuntu-\(UUID().uuidString)", isDirectory: true)
             try fm.copyItem(at: bundled, to: trial)
+            if let imported {
+                do {
+                    guard sha == imported.digest else { throw LocalAGYImport.Failure.invalid }
+                    try imported.install(in: trial)
+                } catch {
+                    try? fm.removeItem(at: trial)
+                    return failed("Reviewed binary could not be staged")
+                }
+            }
             let data = trial.appendingPathComponent("data", isDirectory: true)
             let request = sha == nil ? nil : String(decoding: try client.request(), as: UTF8.self)
             let pointer = data.path.withCString { path in
