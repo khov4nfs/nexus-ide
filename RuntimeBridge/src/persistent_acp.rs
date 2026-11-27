@@ -58,18 +58,20 @@ struct PromptProgress {
     running: bool,
     response_id: i64,
     chunks: usize,
+    permission_denials: usize,
+    tool_updates: usize,
     cancel_requested: bool,
     cancel_taken: bool,
     visible: String,
 }
 static PROGRESS: Mutex<PromptProgress> = Mutex::new(PromptProgress {
-    running: false, response_id: 0, chunks: 0, cancel_requested: false, cancel_taken: false, visible: String::new(),
+    running: false, response_id: 0, chunks: 0, permission_denials: 0, tool_updates: 0, cancel_requested: false, cancel_taken: false, visible: String::new(),
 });
 
 fn prompt_progress() -> Value {
     match PROGRESS.lock() {
         Ok(p) => json!({"ok":true,"running":p.running,"responseId":p.response_id,"chunkCount":p.chunks,
-            "cancelRequested":p.cancel_requested,"text":p.visible}),
+            "cancelRequested":p.cancel_requested,"text":p.visible,"permissionDenials":p.permission_denials,"toolUpdates":p.tool_updates}),
         Err(_) => json!({"ok":false,"running":false,"error":"Progress unavailable"}),
     }
 }
@@ -130,11 +132,55 @@ fn visible_prefix<'a>(text: &'a str, key: &str) -> Result<&'a str,String> {
     Ok(text)
 }
 
+// Explicit deny-only policy. Option IDs are opaque and never shown or logged.
+// Unknown methods, malformed requests, duplicate IDs and requests without a
+// reject-once option fail closed. No native tools are provided.
+fn permission_reply(frame: &Value, session: &str, cancelled: bool) -> Result<Value,String> {
+    if frame["jsonrpc"] != "2.0" || frame["method"] != "session/request_permission" ||
+        frame["params"]["sessionId"] != session || frame.get("result").is_some() ||
+        frame.get("error").is_some() {
+        return Err("Unsupported agent request".into());
+    }
+    let id = frame.get("id").filter(|id| id.as_i64().is_some() ||
+        id.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 256))
+        .ok_or("Invalid permission request ID")?;
+    let params = &frame["params"];
+    if !params["toolCall"]["toolCallId"].as_str().is_some_and(|s| !s.is_empty() && s.len() <= 256) {
+        return Err("Invalid tool call ID".into());
+    }
+    let options = params["options"].as_array().filter(|a| !a.is_empty() && a.len() <= 16)
+        .ok_or("Invalid permission options")?;
+    let mut seen = std::collections::HashSet::new();
+    let mut reject = None;
+    for option in options {
+        let option_id = option["optionId"].as_str().filter(|s| !s.is_empty() && s.len() <= 256)
+            .ok_or("Invalid option ID")?;
+        if !seen.insert(option_id) || !option["name"].is_string() {
+            return Err("Duplicate or malformed permission option".into());
+        }
+        match option["kind"].as_str() {
+            Some("reject_once") => {
+                if reject.is_some() { return Err("Ambiguous reject option".into()); }
+                reject = Some(option_id);
+            }
+            Some("allow_once" | "allow_always" | "reject_always") => {}
+            _ => return Err("Unknown permission option".into()),
+        }
+    }
+    let outcome = if cancelled {
+        json!({"outcome":"cancelled"})
+    } else {
+        json!({"outcome":"selected","optionId":reject.ok_or("No reject-once option")?})
+    };
+    Ok(json!({"jsonrpc":"2.0","id":id,"result":{"outcome":outcome}}))
+}
+
 #[derive(Default)]
 struct PromptEvidence {
     text: String,
     chunks: usize,
     message_id: Option<String>,
+    tool_updates: usize,
 }
 impl PromptEvidence {
     fn update(&mut self, frame: &Value, session: &str) -> Result<(),String> {
@@ -158,6 +204,21 @@ impl PromptEvidence {
                 }
                 self.text.push_str(text);
                 self.chunks += 1;
+                Ok(())
+            }
+            Some("tool_call" | "tool_call_update") => {
+                // Observation only. Do not accept execution/completion or raw
+                // tool content as proof that a denied action did not happen.
+                if !u["toolCallId"].as_str().is_some_and(|s| !s.is_empty() && s.len() <= 256) ||
+                    self.tool_updates >= 32 {
+                    return Err("Invalid or excessive tool updates".into());
+                }
+                match u["status"].as_str() {
+                    Some("pending" | "failed") => {}
+                    None if u.get("status").is_none() && u["sessionUpdate"] == "tool_call" => {}
+                    _ => return Err("Tool execution or unsupported status reported".into()),
+                }
+                self.tool_updates += 1;
                 Ok(())
             }
             Some("agent_thought_chunk" | "user_message_chunk" | "available_commands_update" |
@@ -319,6 +380,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                 let mut evidence = PromptEvidence::default();
                 let progress = ProgressGuard::begin(response_id);
                 let mut cancel_taken = false;
+                let mut permission_ids = std::collections::HashSet::new();
                 let result = rt.block_on(exchange.request_controlled(wire.as_bytes(), response_id,
                     |frame| {
                         evidence.update(frame, id)?;
@@ -332,6 +394,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                         }
                         if let Ok(mut p) = PROGRESS.lock() {
                             p.chunks = evidence.chunks;
+                            p.tool_updates = evidence.tool_updates;
                             if is_chat { p.visible = safe.to_owned(); }
                         }
                         Ok(())
@@ -340,6 +403,20 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                         let wire = take_cancel(id);
                         cancel_taken |= wire.is_some();
                         wire
+                    },
+                    |frame| {
+                        if permission_ids.len() >= 8 {
+                            return Err("Permission request limit exceeded".into());
+                        }
+                        let mut p = PROGRESS.lock().map_err(|_| "Permission status unavailable")?;
+                        let response = permission_reply(frame, id, p.cancel_requested)?;
+                        if !permission_ids.insert(response["id"].to_string()) {
+                            return Err("Duplicate permission request ID".into());
+                        }
+                        if response["result"]["outcome"]["outcome"] == "selected" {
+                            p.permission_denials += 1;
+                        }
+                        Ok(response)
                     }));
                 drop(progress);
                 let cancelled = cancel_taken && result.as_ref().is_ok_and(|frame|
@@ -559,6 +636,35 @@ mod tests {
     }
 
     #[test]
+    fn permission_policy_never_grants() {
+        let frame = json!({"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission",
+            "params":{"sessionId":"s","toolCall":{"toolCallId":"tool-1"},"options":[
+                {"optionId":"reject-looking","name":"Reject","kind":"allow_once"},
+                {"optionId":"opaque-deny","name":"Deny","kind":"reject_once"}]}});
+        let reply = permission_reply(&frame,"s",false).unwrap();
+        assert_eq!(reply, json!({"jsonrpc":"2.0","id":"permission-1","result":{"outcome":{"outcome":"selected","optionId":"opaque-deny"}}}));
+        assert_eq!(permission_reply(&frame,"s",true).unwrap()["result"]["outcome"],json!({"outcome":"cancelled"}));
+        assert!(permission_reply(&frame,"wrong",false).is_err());
+        let mut invalid = frame.clone();
+        invalid["params"]["options"][1]["kind"] = json!("allow_always");
+        assert!(permission_reply(&invalid,"s",false).is_err());
+        invalid = frame.clone();
+        invalid["params"]["options"][0]["optionId"] = json!("opaque-deny");
+        assert!(permission_reply(&invalid,"s",false).is_err());
+        invalid = frame.clone();
+        invalid["method"] = json!("fs/write_text_file");
+        assert!(permission_reply(&invalid,"s",false).is_err());
+        let mut evidence = PromptEvidence::default();
+        let update = |status: &str| json!({"method":"session/update","params":{"sessionId":"s",
+            "update":{"sessionUpdate":"tool_call","toolCallId":"t","status":status}}});
+        assert!(evidence.update(&update("pending"),"s").is_ok());
+        assert!(evidence.update(&update("in_progress"),"s").is_err());
+        assert!(evidence.update(&update("completed"),"s").is_err());
+        assert!(evidence.update(&update("failed"),"s").is_ok());
+        assert_eq!(evidence.tool_updates,2);
+    }
+
+    #[test]
     #[ignore = "requires a separate fresh Ubuntu fakefs"]
     fn real_persistent_acp_transport() {
         let path = std::env::var_os("NEXUS_ACP_ROOTFS").expect("set NEXUS_ACP_ROOTFS");
@@ -620,8 +726,10 @@ mod tests {
                 finished["text"] == "Xin chào Nexus!" && finished["responseId"] == 3 &&
                 followup["ok"] == true && followup["chatCompleted"] == true && followup["responseId"] == 4 &&
                 followup_progress["responseId"] == 4 && followup_progress["text"] == "Nhớ lời chào Nexus." &&
+                followup_progress["permissionDenials"] == 1 && followup_progress["toolUpdates"] == 2 &&
                 third["ok"] == true && third["chatCompleted"] == true && third["responseId"] == 5 &&
                 third_progress["responseId"] == 5 && third_progress["text"] == "Không có gì." &&
+                third_progress["permissionDenials"] == 0 && third_progress["toolUpdates"] == 0 &&
                 over_limit["ok"] == false && over_limit["active"] == true
             } else if cancel_mode {
                 progress_seen && cancel_reply["ok"] == true && duplicate_cancel["ok"] == false &&

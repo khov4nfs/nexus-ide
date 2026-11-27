@@ -27,6 +27,13 @@ if [ "${NEXUS_FIXTURE_CHAT:-0}" = 1 ]; then
     case "$fourth" in *'"method":"session/prompt"'*) ;; *) exit 63 ;; esac
     case "$fourth" in *'"sessionId":"fixture-'$$'"'*) ;; *) exit 64 ;; esac
     case "$fourth" in *'Bạn nhớ lời chào không?'*) ;; *) exit 65 ;; esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"Untrusted fixture title","kind":"execute","status":"pending"}}}\n' "$$"
+    printf '{"jsonrpc":"2.0","id":"perm-4","method":"session/request_permission","params":{"sessionId":"fixture-%s","toolCall":{"toolCallId":"tool-1"},"options":[{"optionId":"allow-trap","name":"Reject","kind":"allow_once"},{"optionId":"opaque-deny","name":"Deny","kind":"reject_once"}]}}\n' "$$"
+    IFS= read -r denial
+    case "$denial" in *'"id":"perm-4"'*) ;; *) exit 70 ;; esac
+    case "$denial" in *'"outcome":"selected"'*'"optionId":"opaque-deny"'*|*'"optionId":"opaque-deny"'*'"outcome":"selected"'*) ;; *) exit 71 ;; esac
+    case "$denial" in *'allow-trap'*|*'"method":'*) exit 72 ;; esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-1","status":"failed"}}}\n' "$$"
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Nhớ lời chào Nexus."}}}}\n' "$$"
     printf '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}\n'
     IFS= read -r fifth
