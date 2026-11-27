@@ -45,6 +45,7 @@ if toolchains:
     row = rows[7]
     e = row["evidence"]
     require(row.get("error") is None and e.get("closed") is True and e.get("exitCode") == 0 and e.get("termSignal") == 0 and not e.get("pty"), "Toolchain process failed")
+    require("NEXUS_GUEST_ENTROPY_OK" in e.get("stderr", "").splitlines(), "Missing guest entropy evidence")
     lines = e.get("stdout", "").splitlines()
     require(len(lines) == 13 and lines[0] == "NEXUS_TOOLCHAINS_ABSENT" and lines[9:11] == ["NEXUS_NODE_DEPENDENCY_OK", "NEXUS_PYTHON_TEST_OK"] and lines[12] == "NEXUS_TOOLCHAINS_OK", "Missing toolchain workflow evidence")
     for line, name in zip(lines[1:5], ("nodejs", "npm", "python3", "git")):

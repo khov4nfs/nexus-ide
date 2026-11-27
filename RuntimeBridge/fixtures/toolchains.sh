@@ -58,10 +58,30 @@ if __name__ == "__main__":
 EOF
 python3 test_math.py >&2
 printf 'NEXUS_PYTHON_TEST_OK\n'
-git init -q
-git -c core.hooksPath=/dev/null add package.json package-lock.json dep test_math.py
-git -c core.hooksPath=/dev/null -c user.name='Nexus Fixture' -c user.email='fixture@localhost' -c commit.gpgsign=false commit -qm 'fixture'
+# Verify actual guest character nodes and readable random bytes, not just
+# getrandom() availability. Do not print random bytes in CI evidence.
+python3 - <<'PY' >&2
+import os
+import stat
+for path, minor in (("/dev/null", 3), ("/dev/zero", 5), ("/dev/random", 8), ("/dev/urandom", 9)):
+    info = os.lstat(path)
+    assert stat.S_ISCHR(info.st_mode), path
+    assert (os.major(info.st_rdev), os.minor(info.st_rdev)) == (1, minor), path
+with open("/dev/urandom", "rb", buffering=0) as stream:
+    a, b = stream.read(32), stream.read(32)
+assert len(a) == len(b) == 32 and a != b and any(a) and any(b)
+print("NEXUS_GUEST_ENTROPY_OK")
+PY
+git init -q --template=
+# Store only local test repo settings; avoid multiple -c argv overrides.
+git config --local core.hooksPath /dev/null
+git config --local user.name 'Nexus Fixture'
+git config --local user.email 'fixture@localhost'
+git config --local commit.gpgsign false
+git add package.json package-lock.json dep test_math.py
+git commit -qm 'fixture'
 git diff --exit-code HEAD -- package.json package-lock.json dep test_math.py
+git fsck --full --no-reflogs >&2
 hash=$(git rev-parse --verify HEAD)
 printf 'NEXUS_GIT_COMMIT=%s\n' "$hash"
 printf 'NEXUS_TOOLCHAINS_OK\n'

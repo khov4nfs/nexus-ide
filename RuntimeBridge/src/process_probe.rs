@@ -263,7 +263,8 @@ pub async fn toolchain_install(guest: &IshInstance, env: &HashMap<String,String>
     if result.is_err() { let _ = session.terminate().await; }
     let passed = result.is_ok() && capture.code == Some(0) &&
         capture.signal == Some(0) && capture.closed && capture.pty.is_empty() &&
-        toolchain_output_ok(&capture.stdout);
+        toolchain_output_ok(&capture.stdout) &&
+        contains(&capture.stderr, b"NEXUS_GUEST_ENTROPY_OK\n");
     json!({"name":name,"passed":passed,"evidence":capture.evidence(),"error":result.err()})
 }
 
