@@ -37,6 +37,11 @@ struct LocalToolsView: View {
     @State private var webStatus = ""
     @State private var manifestPicker = false
     @State private var manifestName = ""
+    @State private var vsixPicker = false
+    @State private var vsixDigest = ""
+    @State private var selectedVSIX: LocalVSIX?
+    @State private var frozenVSIX: LocalVSIX?
+    @State private var importingVSIX = false
     private var stagedWorkbench: Bool {
         guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else { return false }
         return (try? String(contentsOf: root.appendingPathComponent("workbench.sha256"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) == "36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc"
@@ -66,6 +71,14 @@ struct LocalToolsView: View {
                     } else {
                         Text(stagedWorkbench ? "Pinned workbench archive staged; runtime unverified." : "No workbench staged. See build instructions.")
                         Text("Separate guest workspace, not native Files. Token-protected loopback only.")
+                        TextField("Reviewed VSIX SHA-256", text: $vsixDigest).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed || importingVSIX || selectedVSIX != nil)
+                        Button("Choose reviewed VSIX from Files") { vsixPicker = true }.disabled(model.guestClaimed || importingVSIX || !stagedWorkbench || !AGYImportFormat.validDigest(vsixDigest))
+                        if importingVSIX { ProgressView("Verifying VSIX") }
+                        if let selectedVSIX {
+                            Text("Verified SHA-256: " + selectedVSIX.digest).font(.caption).textSelection(.enabled)
+                            Button("Remove selected VSIX") { self.selectedVSIX = nil }.disabled(model.guestClaimed)
+                        }
+                        Text("Optional offline archive, maximum 32 MiB. Extension code can run locally and use network or guest data; review provenance and digest first.").font(.caption)
                         Toggle("Keep workbench files and extensions", isOn: $keepWorkbench).disabled(model.guestClaimed)
                         Text("Uses a separate saved workbench guest. A new token is generated on every launch. Unclean shutdown blocks reuse.").font(.caption)
                         Button("Reset saved workbench", role: .destructive) { resetWorkbench = true; confirmReset = true }.disabled(model.guestClaimed).font(.caption)
@@ -86,6 +99,7 @@ struct LocalToolsView: View {
                     Button("Review and start local job") {
                         frozenKeep = mode == 3 ? keepWorkbench : keepGuest
                         frozenMode = mode
+                        frozenVSIX = mode == 3 ? selectedVSIX : nil
                         frozenHooks = mode == 1 && enableHooks
                         if frozenHooks {
                             do {
@@ -102,7 +116,7 @@ struct LocalToolsView: View {
                             frozenInput = String(decoding: wire,as: UTF8.self)
                         } else { frozenInput = command }
                         confirm = true
-                    }.disabled(model.guestClaimed || (mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
+                    }.disabled(model.guestClaimed || importingVSIX || (mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
                     Text("No provider key or native workspace injected. Commands and extensions may use the network and are not sandboxed. Restart app for another boot.").font(.caption)
                 }
                 if running && frozenMode != 2 && frozenMode != 4 {
@@ -156,6 +170,17 @@ struct LocalToolsView: View {
                     report = "Profile loaded; no execution until confirmed"
                 } catch { report = "Invalid local tool profile" }
             }
+            .fileImporter(isPresented: $vsixPicker, allowedContentTypes: [.data]) { result in
+                guard !model.guestClaimed, !importingVSIX, case .success(let url) = result else { return }
+                let digest = vsixDigest
+                importingVSIX = true
+                Task {
+                    let archive = await Task.detached(priority: .userInitiated) { try? LocalVSIX.read(url, expected: digest) }.value
+                    importingVSIX = false
+                    selectedVSIX = archive
+                    report = archive == nil ? "Invalid VSIX or digest mismatch" : "VSIX verified; install only after confirmation"
+                }
+            }
             .alert(resetWorkbench ? "Delete saved workbench?" : "Delete saved Linux environment?", isPresented: $confirmReset) {
                 Button("Delete saved Linux files", role: .destructive) {
                     guard !model.guestClaimed else { return }
@@ -165,9 +190,9 @@ struct LocalToolsView: View {
             } message: { Text(resetWorkbench ? "This permanently deletes saved workbench files, settings and extensions. Native Files and local-tools guest remain separate." : "This permanently deletes the saved local-tools guest, including installed packages and guest files. Native editor files and Agent are separate.") }
             .confirmationDialog("Execute in local Linux?", isPresented: $confirm) {
                 Button("Start") { start() }
-                Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false }
+                Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false; frozenVSIX = nil }
             } message: {
-                Text(frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
             .task(id: running) {
                 while running && !Task.isCancelled {
@@ -198,16 +223,22 @@ struct LocalToolsView: View {
         if frozenMode == 3 {
             guard stagedWorkbench, let generated = LocalRunner.token() else { report = "Token or archive unavailable"; return }
             token = generated
-            input = generated
+            if let frozenVSIX {
+                guard let wire = try? JSONSerialization.data(withJSONObject: ["token": generated, "vsixSha256": frozenVSIX.digest]) else { return }
+                input = String(decoding: wire, as: UTF8.self)
+            } else { input = generated }
         } else { input = frozenInput }
         guard model.claimGuest() else { return }
         let selectedMode: UInt8 = frozenHooks ? 5 : frozenMode
         let persistent = frozenKeep
+        let vsix = frozenVSIX
+        frozenVSIX = nil
+        selectedVSIX = nil
         running = true
         report = "Starting local guest"
         Task {
             report = await Task.detached(priority: .userInitiated) {
-                LocalRunner.run(mode: selectedMode, input: input, persistent: persistent)
+                LocalRunner.run(mode: selectedMode, input: input, persistent: persistent, vsix: vsix)
             }.value
             output = LocalRunner.progress().output
             ready = false
@@ -307,7 +338,7 @@ private enum LocalRunner {
         return true
     }
 
-    static func run(mode: UInt8, input: String, persistent: Bool) -> String {
+    static func run(mode: UInt8, input: String, persistent: Bool, vsix: LocalVSIX? = nil) -> String {
         do {
             guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else { return "Missing Ubuntu assets" }
             let fm = FileManager.default
@@ -324,12 +355,19 @@ private enum LocalRunner {
                 if store == nil { try? fm.removeItem(at: trial) }
                 return "Workbench executable digest mismatch; saved environment not booted. Reset explicitly or use disposable mode."
             }
+            if let vsix {
+                guard mode == 3 else { return "VSIX requires workbench" }
+                try vsix.install(in: dataPath)
+            }
             var result = dataPath.path.withCString { path in
                 input.withCString { decode(nexus_local_run(path, mode, $0)) }
             }
             if result["shutdownClean"] as? Bool == true {
                 if let store {
-                    do { try store.markClean(); result["savedGuestReusable"] = true }
+                    do {
+                        if mode == 3, vsix != nil { try LocalVSIX.clearSlot(in: dataPath) }
+                        try store.markClean(); result["savedGuestReusable"] = true
+                    }
                     catch { result["savedGuestReusable"] = false }
                 } else { try? fm.removeItem(at: trial) }
             } else if persistent { result["savedGuestReusable"] = false }
@@ -338,6 +376,56 @@ private enum LocalRunner {
         } catch LocalGuestStore.Failure.dirty { return "Saved guest was not cleanly shut down. Reset explicitly or use disposable mode." }
         catch LocalGuestStore.Failure.incompatible { return "Saved guest belongs to a different rootfs. Reset explicitly or use disposable mode." }
         catch { return "Local guest preparation failed" }
+    }
+}
+
+/// User-selected archive, not an installer or automatically downloaded binary.
+private struct LocalVSIX: Sendable {
+    enum Failure: Error { case invalid }
+    static let marker = Data("NEXUS_VSIX_IMPORT_SLOT_V1\n".utf8)
+    static let limit = 32 * 1024 * 1024
+    let bytes: Data
+    let digest: String
+
+    static func read(_ url: URL, expected: String) throws -> Self {
+        guard url.isFileURL, url.pathExtension.lowercased() == "vsix", AGYImportFormat.validDigest(expected) else { throw Failure.invalid }
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        let v = try url.resourceValues(forKeys: [.isRegularFileKey,.isSymbolicLinkKey,.fileSizeKey])
+        guard v.isRegularFile == true, v.isSymbolicLink != true, let size = v.fileSize, size > 4, size <= limit else { throw Failure.invalid }
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var data = Data()
+        while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+            guard data.count + chunk.count <= size else { throw Failure.invalid }
+            data.append(chunk)
+        }
+        guard data.count == size, data.starts(with: [0x50,0x4b,0x03,0x04]),
+              SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == expected else { throw Failure.invalid }
+        return Self(bytes: data, digest: expected)
+    }
+    private static func slot(in dataPath: URL) throws -> URL {
+        let slot = dataPath.appendingPathComponent("opt/nexus/extension.vsix")
+        let v = try slot.resourceValues(forKeys: [.isRegularFileKey,.isSymbolicLinkKey,.fileSizeKey])
+        guard v.isRegularFile == true, v.isSymbolicLink != true, let size = v.fileSize,
+              size <= limit, slot.resolvingSymlinksInPath().path.hasPrefix(dataPath.resolvingSymlinksInPath().path + "/") else { throw Failure.invalid }
+        return slot
+    }
+    func install(in dataPath: URL) throws {
+        let target = try Self.slot(in: dataPath)
+        guard try Data(contentsOf: target) == Self.marker else { throw Failure.invalid }
+        try Self.overwrite(target, bytes: bytes)
+    }
+    static func clearSlot(in dataPath: URL) throws {
+        try overwrite(slot(in: dataPath), bytes: marker)
+    }
+    private static func overwrite(_ target: URL, bytes: Data) throws {
+        // Preserve the existing backing inode and fakefs metadata.
+        let handle = try FileHandle(forWritingTo: target)
+        defer { try? handle.close() }
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: bytes)
+        try handle.synchronize()
     }
 }
 

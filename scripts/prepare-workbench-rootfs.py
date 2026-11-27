@@ -6,6 +6,7 @@ not an independent signature. Do not distribute proprietary AGY.
 """
 import argparse
 import copy
+import io
 import importlib.util
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -23,6 +24,8 @@ PREFIX = f"openvscode-server-v{VERSION}-linux-arm64"
 SHA = "36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc"
 ASSET = f"https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v{VERSION}/{PREFIX}.tar.gz"
 DEST = "opt/nexus/workbench"
+VSIX_SLOT = "opt/nexus/extension.vsix"
+VSIX_MARKER = b"NEXUS_VSIX_IMPORT_SLOT_V1\n"
 
 def add_dir(dst, name):
     info = tarfile.TarInfo("./" + name)
@@ -38,7 +41,7 @@ def overlay(original, package, output):
             if p.is_absolute() or ".." in p.parts:
                 raise ValueError("Unsafe base path")
             name = p.as_posix()
-            if name == DEST or name.startswith(DEST + "/"):
+            if name == DEST or name.startswith(DEST + "/") or name == VSIX_SLOT:
                 raise ValueError("Workbench destination already exists")
             if name in ("opt", "opt/nexus"):
                 if not member.isdir() or name in dirs:
@@ -53,6 +56,10 @@ def overlay(original, package, output):
             if directory not in dirs:
                 add_dir(dst, directory)
         add_dir(dst, DEST)
+        slot = tarfile.TarInfo("./" + VSIX_SLOT)
+        slot.mode = 0o600
+        slot.size = len(VSIX_MARKER)
+        dst.addfile(slot, io.BytesIO(VSIX_MARKER))
         members = {}
         total = 0
         for member in pkg:

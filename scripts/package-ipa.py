@@ -111,6 +111,8 @@ def verify(path, variant):
         if variant == "workbench":
             if z.read(guest+"workbench.sha256").decode().strip() != WORKBENCH_SHA:
                 raise ValueError("Missing pinned workbench")
+            if z.read(guest+"data/opt/nexus/extension.vsix") != b"NEXUS_VSIX_IMPORT_SLOT_V1\n":
+                raise ValueError("Expected empty VSIX import slot")
             for entry in ("data/opt/nexus/workbench/node","data/opt/nexus/workbench/bin/openvscode-server"):
                 if guest+entry not in names:
                     raise ValueError("Missing workbench executable")

@@ -493,8 +493,11 @@ pub fn agy_digest_ok(s: &str) -> bool {
 }
 
 pub async fn agy_binary_digest(guest: &IshInstance, env: &HashMap<String,String>, expected: &str) -> Value {
+    guest_file_digest(guest,env,"/opt/nexus/agy",expected).await
+}
+pub(crate) async fn guest_file_digest(guest:&IshInstance,env:&HashMap<String,String>,path:&str,expected:&str)->Value {
     let name = "agy_binary_digest";
-    let mut opts = SpawnOpts::cmd(["/usr/bin/sha256sum", "/opt/nexus/agy"]);
+    let mut opts = SpawnOpts::cmd(["/usr/bin/sha256sum", path]);
     opts.cwd = Some(Path::new("/").to_path_buf());
     opts.envp = Some(env.iter().map(|(k,v)| (k.clone(),v.clone())).collect());
     let session = match guest.spawn(opts) {
@@ -506,7 +509,7 @@ pub async fn agy_binary_digest(guest: &IshInstance, env: &HashMap<String,String>
     if result.is_err() { let _ = session.terminate().await; }
     let passed = result.is_ok() && capture.code == Some(0) && capture.signal == Some(0)
         && capture.closed && capture.pty.is_empty()
-        && capture.stdout == format!("{expected}  /opt/nexus/agy\n").as_bytes();
+        && capture.stdout == format!("{expected}  {path}\n").as_bytes();
     json!({"name":name,"passed":passed,"sha256":expected,"closed":capture.closed,
            "error":if passed { None } else { Some("Guest executable digest check failed") }})
 }
@@ -870,13 +873,16 @@ fn terminal_command_scope() {
 
 // Run only an explicitly reviewed local lifecycle hook, never an agent string.
 pub(crate) async fn local_hook(guest:&IshInstance,env:&HashMap<String,String>,command:&str)->bool {
+    local_hook_with_timeout(guest,env,command,30).await
+}
+pub(crate) async fn local_hook_with_timeout(guest:&IshInstance,env:&HashMap<String,String>,command:&str,seconds:u64)->bool {
     if crate::local_jobs::stop_requested() {return false;}
     let mut opts=shell(command,env);
     opts.cwd=Some(Path::new("/tmp").to_path_buf());
     opts.pipe_stdin=false;
     let Ok(session)=guest.spawn(opts) else {return false;};
     let mut capture=Capture::default();
-    let deadline=Instant::now()+Duration::from_secs(30);
+    let deadline=Instant::now()+Duration::from_secs(seconds);
     let result:Result<(),String>=async {
         while !capture.closed {
             if crate::local_jobs::stop_requested() {return Err("Hook cancelled".into());}

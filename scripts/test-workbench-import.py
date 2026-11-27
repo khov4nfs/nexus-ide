@@ -49,6 +49,7 @@ class OverlayTests(unittest.TestCase):
                     with tarfile.open(out, "r:gz") as t:
                         p = "./" + workbench.DEST
                         self.assertEqual(t.extractfile(p + "/node").read(), b"fixture")
+                        self.assertEqual(t.extractfile("./" + workbench.VSIX_SLOT).read(), workbench.VSIX_MARKER)
                         self.assertEqual(t.getmember(p + "/bin/link").linkname, "../node")
 
 if __name__ == "__main__":

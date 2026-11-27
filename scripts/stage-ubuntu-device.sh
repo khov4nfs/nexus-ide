@@ -24,6 +24,7 @@ else
 fi
 if [[ "${1:-}" == --workbench ]]; then
   test "$(cat "$source/workbench.sha256")" = 36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc
+  printf 'NEXUS_VSIX_IMPORT_SLOT_V1\n' | cmp - "$source/data/opt/nexus/extension.vsix"
   for item in launcher node; do
     expected=$(cat "$source/workbench-$item.sha256")
     [[ "$expected" =~ ^[a-f0-9]{64}$ ]]

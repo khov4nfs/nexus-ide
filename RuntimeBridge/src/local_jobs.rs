@@ -42,6 +42,17 @@ fn parse_hooks(input:&str)->Option<Value> {
 }
 pub(crate) fn stop_requested()->bool {STATE.lock().map(|s|s.stop).unwrap_or(true)}
 fn valid_token(s: &str) -> bool { s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) }
+fn parse_workbench(input:&str)->Option<(String,Option<String>)> {
+    if valid_token(input) {return Some((input.to_owned(),None));}
+    if input.len()>512 {return None;}
+    let v:Value=serde_json::from_str(input).ok()?;
+    if v.as_object()?.len()!=2 {return None;}
+    let token=v["token"].as_str()?.to_owned();
+    let digest=v["vsixSha256"].as_str()?.to_owned();
+    if !valid_token(&token) || !process_probe::agy_digest_ok(&digest) {return None;}
+    Some((token,Some(digest)))
+}
+const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
 fn progress() -> Value {
     STATE.lock().map(|s| json!({"ok":true,"running":s.running,"ready":s.ready,"output":s.output,"stopRequested":s.stop}))
         .unwrap_or_else(|_| fail("Local status unavailable"))
@@ -80,7 +91,8 @@ impl Drop for Guard {
 fn run(path: &Path, mode: u8, input: &str) -> Value {
     let call=if mode==4 {match parse_call(input) {Some(v)=>Some(v),None=>return fail("Invalid MCP call")}} else {None};
     let hooks=if mode==5 {match parse_hooks(input) {Some(v)=>Some(v),None=>return fail("Invalid hook plan")}} else {None};
-    if !matches!(mode,1..=5) || (mode == 3 && !valid_token(input)) ||
+    let workbench=if mode==3 {match parse_workbench(input) {Some(v)=>Some(v),None=>return fail("Invalid workbench launch")}} else {None};
+    if !matches!(mode,1..=5) ||
         (matches!(mode,1|2) && !valid_command(input)) { return fail("Invalid local job"); }
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
@@ -126,9 +138,19 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         }
         else if let Some(call)=call.as_ref() {rt.block_on(process_probe::mcp_job(&guest,&env,call["command"].as_str().unwrap(),Some((call["name"].as_str().unwrap(),&call["arguments"]))))}
         else if mode == 2 { rt.block_on(process_probe::mcp_discover(&guest,&env,input)) }
-        else {
-            if mode == 3 { env.insert("NEXUS_WORKBENCH_TOKEN".into(),input.into()); }
-            rt.block_on(process_probe::local_process(&guest,&env,if mode == 3 { WORKBENCH } else { input },mode == 3))
+        else if let Some((token,vsix))=workbench.as_ref() {
+            let installed=vsix.as_deref().map(|digest| {
+                let verified=rt.block_on(process_probe::guest_file_digest(&guest,&env,"/opt/nexus/extension.vsix",digest))["passed"]==true;
+                verified && !stop_requested() && rt.block_on(process_probe::local_hook_with_timeout(&guest,&env,INSTALL_VSIX,120))
+            });
+            let mut r=if installed.unwrap_or(true) && !stop_requested() {
+                env.insert("NEXUS_WORKBENCH_TOKEN".into(),token.clone());
+                rt.block_on(process_probe::local_process(&guest,&env,WORKBENCH,true))
+            } else {fail("Reviewed VSIX verification or installation failed, or launch cancelled")};
+            r["extensionInstalled"]=json!(installed);
+            r
+        } else {
+            rt.block_on(process_probe::local_process(&guest,&env,input,false))
         };
     let shutdown = rt.block_on(guest.shutdown()).is_ok();
     result["shutdownClean"] = json!(shutdown);
@@ -199,6 +221,8 @@ mod tests {
         assert!(!valid_command("x\0y"));
         assert!(!valid_command(&"x".repeat(2049)));
         assert!(valid_token(&"a".repeat(64)));
+        assert!(parse_workbench(&json!({"token":"a".repeat(64),"vsixSha256":"b".repeat(64)}).to_string()).is_some());
+        assert!(parse_workbench(&json!({"token":"a".repeat(64),"vsixSha256":"bad"}).to_string()).is_none());
         assert!(!valid_token("token"));
         assert!(parse_call(r#"{"command":"exec server","name":"echo","arguments":{}}"#).is_some());
         assert!(parse_call(r#"{"command":"exec server","name":"echo","arguments":[]}"#).is_none());
@@ -246,9 +270,14 @@ mod tests {
         let evidence=std::env::var_os("NEXUS_WORKBENCH_EVIDENCE").expect("evidence");
         // Synthetic CI-only token. No real account or native workspace.
         let token="f".repeat(64);
-        let worker_token=token.clone();
+        let vsix=std::env::var("NEXUS_WORKBENCH_VSIX_SHA").ok();
+        let worker_token=match vsix.as_deref() {
+            Some(digest)=>json!({"token":token,"vsixSha256":digest}).to_string(),
+            None=>token.clone(),
+        };
+        let guest_path=Path::new(&path).to_path_buf();
         let worker=std::thread::spawn(move||run(Path::new(&path),3,&worker_token));
-        let deadline=Instant::now()+Duration::from_secs(90);
+        let deadline=Instant::now()+Duration::from_secs(240);
         let ready=loop {
             if progress()["ready"]==true {break true;}
             if worker.is_finished() || Instant::now()>=deadline {break false;}
@@ -280,8 +309,17 @@ mod tests {
         }
         let stop=enqueue(Control::Stop);
         let closed=worker.join().expect("workbench owner");
-        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true,
-            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"editorVerified":false});
+        let extension_verified=vsix.as_ref().map(|_| {
+            closed["extensionInstalled"]==true &&
+                std::fs::read_dir(guest_path.join("root/nexus-vscode-extensions")).ok().is_some_and(|dirs|
+                    dirs.filter_map(Result::ok).any(|entry| {
+                        let name=entry.file_name();
+                        name.to_string_lossy().starts_with("nexus.fixture-0.0.1") &&
+                            entry.path().join("package.json").is_file()
+                    }))
+        });
+        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true),
+            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"extensionInstallVerified":extension_verified,"editorVerified":false,"lspVerified":false});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         println!("{report}");
         assert_eq!(report["ok"],true);
