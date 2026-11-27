@@ -144,13 +144,18 @@ struct LocalCLIImport: Sendable {
             return Self(file: file, digest: expected, kind: kind)
         } catch { try? fm.removeItem(at: root); throw error }
     }
-    func install(in data: URL) throws {
+    func install(in data: URL, reuse: Bool = false) throws {
         let target = data.appendingPathComponent("opt/nexus/" + kind)
         let v = try target.resourceValues(forKeys: [.isRegularFileKey,.isSymbolicLinkKey,.fileSizeKey])
         let marker = try Self.marker(kind)
-        guard v.isRegularFile == true, v.isSymbolicLink != true, v.fileSize == marker.count,
-              try Data(contentsOf: target) == marker else { throw Failure.invalid }
-        try LocalAGYImport.transfer(from: file, to: target, expected: digest)
+        guard v.isRegularFile == true, v.isSymbolicLink != true, let size = v.fileSize, size > 0 else { throw Failure.invalid }
+        if size == marker.count, try Data(contentsOf: target) == marker {
+            try LocalAGYImport.transfer(from: file, to: target, expected: digest)
+        } else {
+            // Never replace a mutated saved executable; the guest bridge must
+            // independently verify the exact reviewed digest before execution.
+            guard reuse, size >= 64, UInt64(size) <= AGYImportFormat.maxBytes else { throw Failure.invalid }
+        }
     }
     func remove() { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
 }

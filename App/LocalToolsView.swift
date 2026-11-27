@@ -49,6 +49,8 @@ struct LocalToolsView: View {
     @State private var frozenCLI: LocalCLIImport?
     @State private var importingCLI = false
     @State private var cliAction = "shell"
+    @State private var keepCLIGuest = false
+    @State private var confirmResetCLI = false
     private var stagedWorkbench: Bool {
         guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else { return false }
         return (try? String(contentsOf: root.appendingPathComponent("workbench.sha256"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) == "36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc"
@@ -82,7 +84,10 @@ struct LocalToolsView: View {
                             Text("Version probe").tag("version")
                             if cliKind == "codex" { Text("Native app-server account probe").tag("appServer") }
                         }.disabled(model.guestClaimed)
-                        Text("App-server probe initializes the original Codex binary and reads account status only; no login or model request. Disposable guest, no native credential collection, no automatic installer. Use the original CLI login flow inside the terminal. Do not share codes or terminal output. Linux sandbox/syscall compatibility is unverified; do not bypass native agent safeguards.").font(.caption)
+                        Toggle("Keep separate agent guest and CLI login", isOn: $keepCLIGuest).disabled(model.guestClaimed || importingCLI)
+                        Text("Optional: persists CLI-owned login state and project files for this exact binary digest. May retain secrets. Exit the shell cleanly before restarting. No backup, no sharing with other guests, no native token collection.").font(.caption)
+                        Button("Reset saved CLI guest", role: .destructive) { confirmResetCLI = true }.disabled(model.guestClaimed || importingCLI || !AGYImportFormat.validDigest(cliDigest))
+                        Text("App-server probe reads account status only. Use the original CLI login inside the terminal. Linux sandbox/syscall compatibility remains unverified; do not disable agent safeguards.").font(.caption)
                     } else if mode != 3 {
                         TextField("Reviewed guest shell command", text: $command, axis: .vertical)
                             .font(.system(.body, design: .monospaced)).autocorrectionDisabled()
@@ -124,7 +129,7 @@ struct LocalToolsView: View {
                         Button("Reset saved Linux environment", role: .destructive) { resetWorkbench = false; confirmReset = true }.disabled(model.guestClaimed)
                     }
                     Button("Review and start local job") {
-                        frozenKeep = mode == 6 ? false : mode == 3 ? keepWorkbench : keepGuest
+                        frozenKeep = mode == 6 ? keepCLIGuest : mode == 3 ? keepWorkbench : keepGuest
                         frozenMode = mode
                         frozenVSIX = mode == 3 ? selectedVSIX : nil
                         frozenCLI = mode == 6 ? cliImport : nil
@@ -230,11 +235,18 @@ struct LocalToolsView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: { Text(resetWorkbench ? "This permanently deletes saved workbench files, settings and extensions. Native Files and local-tools guest remain separate." : "This permanently deletes the saved local-tools guest, including installed packages and guest files. Native editor files and Agent are separate.") }
+            .alert("Delete saved CLI guest?", isPresented: $confirmResetCLI) {
+                Button("Delete guest files", role: .destructive) {
+                    guard !model.guestClaimed else { return }
+                    report = LocalRunner.resetCLI(kind: cliKind, digest: cliDigest)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { Text("Deletes this harness and digest guest, including local CLI credentials and project files. Other guests and native files are unaffected.") }
             .confirmationDialog("Execute in local Linux?", isPresented: $confirm) {
                 Button("Start") { start() }
                 Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false; frozenVSIX = nil; frozenCLI = nil }
             } message: {
-                Text(frozenMode == 6 ? "Start this reviewed original CLI in disposable Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. Commands may access guest files and network; no security sandbox." : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
             .task(id: running) {
                 while running && !Task.isCancelled {
@@ -357,6 +369,18 @@ private enum LocalRunner {
         do { try savedStore(workbench: workbench).reset(); return workbench ? "Saved workbench deleted" : "Saved Linux environment deleted" }
         catch { return "Saved environment reset failed" }
     }
+    private static func cliStore(kind: String, digest: String) throws -> LocalGuestStore {
+        guard ["codex","claude"].contains(kind), AGYImportFormat.validDigest(digest) else { throw LocalGuestStore.Failure.invalid }
+        let parent = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        var root = parent.appendingPathComponent("NexusOriginalCLIGuests", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700, .protectionKey: FileProtectionType.complete])
+        var values = URLResourceValues(); values.isExcludedFromBackup = true; try root.setResourceValues(values)
+        return LocalGuestStore(directory: root.appendingPathComponent(kind + "-" + digest, isDirectory: true))
+    }
+    static func resetCLI(kind: String, digest: String) -> String {
+        do { try cliStore(kind: kind, digest: digest).reset(); return "Saved CLI guest deleted" }
+        catch { return "Saved CLI guest reset failed" }
+    }
     private static func verifyWorkbench(dataPath: URL, bundled: URL) -> Bool {
         // Read expected digests only from the installed app bundle, not from
         // mutable guest metadata. This checks launcher and Node, not all files.
@@ -385,11 +409,13 @@ private enum LocalRunner {
 
     static func run(mode: UInt8, input: String, persistent: Bool, vsix: LocalVSIX? = nil, cli: LocalCLIImport? = nil) -> String {
         defer { cli?.remove() }
-        guard mode != 6 || (!persistent && cli != nil) else { return "Original CLI requires a disposable reviewed import" }
+        guard mode != 6 || cli != nil else { return "Original CLI requires a reviewed import" }
         do {
             guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else { return "Missing Ubuntu assets" }
             let fm = FileManager.default
-            let store = persistent ? try savedStore(workbench: mode == 3) : nil
+            let store: LocalGuestStore?
+            if persistent, mode == 6, let cli { store = try cliStore(kind: cli.kind, digest: cli.digest) }
+            else { store = persistent ? try savedStore(workbench: mode == 3) : nil }
             let trial = fm.temporaryDirectory.appendingPathComponent("NexusLocal-\(UUID().uuidString)", isDirectory: true)
             let dataPath: URL
             if let store {
@@ -404,7 +430,7 @@ private enum LocalRunner {
             }
             if let cli {
                 guard mode == 6 else { return "CLI executable requires original agent mode" }
-                try cli.install(in: dataPath)
+                try cli.install(in: dataPath, reuse: persistent)
             }
             if let vsix {
                 guard mode == 3 else { return "VSIX requires workbench" }
@@ -416,6 +442,7 @@ private enum LocalRunner {
             if result["shutdownClean"] as? Bool == true {
                 if let store {
                     do {
+                        if mode == 6, result["binaryDigestVerified"] as? Bool != true { throw LocalGuestStore.Failure.invalid }
                         if mode == 3, vsix != nil { try LocalVSIX.clearSlot(in: dataPath) }
                         try store.markClean(); result["savedGuestReusable"] = true
                     }
