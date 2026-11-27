@@ -11,6 +11,7 @@ targets:
     platform: iOS
     sources:
       - App/UbuntuLabApp.swift
+      - App/GeminiKeychain.swift
       - path: RuntimeAssets/ubuntu-fs
         type: folder
         buildPhase: resources

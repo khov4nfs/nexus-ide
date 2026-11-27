@@ -12,6 +12,8 @@ require(p.is_file(), "Missing transport fixture report")
 r = json.loads(p.read_text())
 require(r.get("ok") is True and r.get("fixtureOnly") is True, "Transport fixture failed")
 i = r["initialize"]
+require(i.get("credentialMode") == "gemini-api-key", "Missing synthetic credential handoff evidence")
+require("NEXUS_TEST_ONLY_NOT_A_REAL_KEY" not in json.dumps(r), "Credential leaked into report")
 require(i.get("ok") is True and i.get("active") is True and i.get("response") == {
     "jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1,
         "agentInfo": {"name": "Nexus Transport Fixture", "version": "test"}}}, "Invalid initialize fixture")

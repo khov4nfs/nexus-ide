@@ -21,6 +21,12 @@ static ACTIVE: Mutex<Option<SyncSender<Command>>> = Mutex::new(None);
 
 enum Mode { Agy(String), #[cfg(test)] Fixture }
 
+// Input shape only, not authentication or validation against Google.
+fn valid_key(s: &str) -> bool {
+    (16..=256).contains(&s.len()) &&
+        s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 fn failure(message: &str) -> Value {
     json!({"ok":false,"active":false,"error":message})
 }
@@ -42,7 +48,7 @@ fn session_created(frame: &Value) -> bool {
         .map(|s| !s.is_empty() && s.len() <= 256).unwrap_or(false)
 }
 
-fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, commands: Receiver<Command>, ready: Reply) {
+fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, commands: Receiver<Command>, ready: Reply) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt, Err(_) => { let _ = ready.send(failure("Runtime creation failed")); return; }
     };
@@ -70,7 +76,14 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, commands: Receiver<Comman
         Mode::Fixture => SpawnOpts::cmd(["/bin/sh", "-c", include_str!("../fixtures/acp-transport.sh")]),
     };
     opts.cwd = Some(PathBuf::from("/tmp"));
-    opts.envp = Some(env.into_iter().collect());
+    let keyed = key.is_some();
+    if keyed && !rt.block_on(process_probe::prepare_gemini_provider(&guest, &env)) {
+        let _ = rt.block_on(guest.shutdown());
+        let _ = ready.send(failure("Gemini provider preparation failed")); return;
+    }
+    let mut agent_env = env;
+    if let Some(key) = key { agent_env.insert("GEMINI_API_KEY".into(), key); }
+    opts.envp = Some(agent_env.into_iter().collect());
     opts.pipe_stdin = true;
     let session = match guest.spawn(opts) {
         Ok(s) => s, Err(_) => {
@@ -82,7 +95,13 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, commands: Receiver<Comman
     let init = rt.block_on(exchange.request(&request, 1));
     let response = match init {
         Ok(frame) => match &mode {
-            Mode::Agy(_) => process_probe::initialize_projection(&frame),
+            Mode::Agy(_) => process_probe::initialize_projection(&frame).map(|mut response| {
+                // In credential mode never export agent-supplied free text.
+                if keyed && response.get("result").is_some() {
+                    response["result"]["agentInfo"] = json!({"name":"Antigravity","version":"withheld"});
+                }
+                response
+            }),
             #[cfg(test)]
             Mode::Fixture => {
                 let expected = json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,
@@ -103,7 +122,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, commands: Receiver<Comman
     }
     // The worker retains exclusive ownership across the native FFI calls.
     // If the caller disappears, a bounded idle wait closes the process.
-    if ready.send(json!({"ok":true,"active":true,"response":response})).is_err() {
+    if ready.send(json!({"ok":true,"active":true,"response":response,"credentialMode":if keyed {"gemini-api-key"} else {"none"}})).is_err() {
         let _ = rt.block_on(exchange.close());
         let _ = rt.block_on(guest.shutdown());
         return;
@@ -150,7 +169,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, commands: Receiver<Comman
     }
 }
 
-fn start(path: PathBuf, mode: Mode, request: Vec<u8>) -> Value {
+fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>) -> Value {
+    if key.as_deref().is_some_and(|s| !valid_key(s)) { return failure("Invalid credential shape"); }
     if !process_probe::valid_initialize_request(&request) {
         return failure("Invalid initialize request");
     }
@@ -167,7 +187,7 @@ fn start(path: PathBuf, mode: Mode, request: Vec<u8>) -> Value {
     let (tx, rx) = mpsc::sync_channel(1);
     let (reply, wait) = mpsc::sync_channel(1);
     if thread::Builder::new().name("nexus-acp-owner".into())
-        .spawn(move || worker(path, mode, request, rx, reply)).is_err() {
+        .spawn(move || worker(path, mode, request, key, rx, reply)).is_err() {
         return failure("Worker creation failed");
     }
     match wait.recv_timeout(REPLY) {
@@ -212,9 +232,20 @@ unsafe fn read_arg(p: *const c_char) -> Option<String> {
 pub unsafe extern "C" fn nexus_acp_start(path: *const c_char, digest: *const c_char, request: *const c_char) -> *mut c_char {
     ffi_result(|| {
         match (read_arg(path), read_arg(digest), read_arg(request)) {
-            (Some(path), Some(sha), Some(req)) => start(PathBuf::from(path), Mode::Agy(sha), req.into_bytes()),
+            (Some(path), Some(sha), Some(req)) => start(PathBuf::from(path), Mode::Agy(sha), req.into_bytes(), None),
             _ => failure("Missing connection arguments"),
         }
+    })
+}
+
+/// # Safety
+/// All pointers must reference valid NUL-terminated UTF-8 strings.
+/// Only call after explicit consent. Key is passed in guest process environment.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_acp_start_gemini(path: *const c_char, digest: *const c_char, request: *const c_char, key: *const c_char) -> *mut c_char {
+    ffi_result(|| match (read_arg(path), read_arg(digest), read_arg(request), read_arg(key)) {
+        (Some(path), Some(sha), Some(req), Some(key)) => start(PathBuf::from(path), Mode::Agy(sha), req.into_bytes(), Some(key)),
+        _ => failure("Missing connection arguments"),
     })
 }
 
@@ -238,6 +269,10 @@ mod tests {
     use super::*;
     #[test]
     fn restricted_request_and_session_shape() {
+        assert!(valid_key("NEXUS_TEST_ONLY_NOT_A_REAL_KEY"));
+        assert!(!valid_key(""));
+        assert!(!valid_key("not a valid secret value"));
+        assert!(!valid_key(&"a".repeat(257)));
         assert!(valid_new(NEW_REQUEST));
         assert!(!valid_new(b""));
         assert!(!valid_new(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\"}\n"));
@@ -250,12 +285,12 @@ mod tests {
     fn real_persistent_acp_transport() {
         let path = std::env::var_os("NEXUS_ACP_ROOTFS").expect("set NEXUS_ACP_ROOTFS");
         let evidence = std::env::var_os("NEXUS_ACP_EVIDENCE").expect("set NEXUS_ACP_EVIDENCE");
-        let first = start(PathBuf::from(path), Mode::Fixture, process_probe::AGY_INITIALIZE_REQUEST.to_vec());
+        let first = start(PathBuf::from(path), Mode::Fixture, process_probe::AGY_INITIALIZE_REQUEST.to_vec(), Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()));
         let second = command(Some(NEW_REQUEST.to_vec()));
         let duplicate = command(Some(NEW_REQUEST.to_vec()));
         let close = command(None);
         let after_close = command(Some(NEW_REQUEST.to_vec()));
-        let ok = first["ok"] == true && first["active"] == true &&
+        let ok = first["ok"] == true && first["active"] == true && first["credentialMode"] == "gemini-api-key" &&
             second["ok"] == true && second["sessionCreated"] == true &&
             duplicate["ok"] == false && duplicate["active"] == true &&
             close["ok"] == true && close["transportClosed"] == true && close["shutdownClean"] == true &&

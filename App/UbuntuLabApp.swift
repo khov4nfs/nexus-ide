@@ -15,6 +15,10 @@ private struct UbuntuLabView: View {
     @State private var agentStatus = "Not initialized"
     @State private var active = false
     @State private var created = false
+    @State private var keyInput = ""
+    @State private var keyStored = false
+    @State private var keyStatus = ""
+    @State private var useGemini = false
     private var digest: String? {
         guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil),
               let text = try? String(contentsOf: root.appendingPathComponent("agy.sha256"), encoding: .utf8) else { return nil }
@@ -28,9 +32,32 @@ private struct UbuntuLabView: View {
                 Section("Ubuntu ARM64 · glibc lab") {
                     Text("One boot per app process. No remote backend.")
                     Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted)
-                    Button("Initialize imported AGY") { confirm = true }.disabled(attempted || digest == nil)
+                    Button("Initialize imported AGY (no key)") { useGemini = false; confirm = true }.disabled(attempted || digest == nil)
+                    Button("Connect with saved Gemini API key") { useGemini = true; confirm = true }
+                        .disabled(attempted || digest == nil || !keyStored)
                     Text(digest == nil ? "No reviewed AGY binary imported." : "Local AGY digest manifest present. Execution not verified.")
                     if running { ProgressView("Keep this app open") }
+                }
+                Section("Gemini credential · device only") {
+                    SecureField("Gemini API key", text: $keyInput)
+                        .textContentType(.password)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .disabled(attempted)
+                    Button("Save to Keychain") {
+                        defer { keyInput = "" }
+                        do {
+                            try GeminiKeychain.save(keyInput)
+                            refreshKey()
+                            keyStatus = "Saved on this device"
+                        } catch { keyStatus = "Invalid key or Keychain unavailable" }
+                    }.disabled(attempted || !GeminiCredential.isValid(keyInput))
+                    Button("Delete saved key", role: .destructive) {
+                        do { try GeminiKeychain.remove(); refreshKey(); keyStatus = "Deleted" }
+                        catch { keyStatus = "Keychain deletion failed" }
+                    }.disabled(attempted || !keyStored)
+                    Text(keyStatus).font(.caption)
+                    Text("Keychain is not synced. Deleting a key does not revoke it at Google.").font(.caption)
                 }
                 Section("Native ACP client") {
                     Text(agentStatus)
@@ -45,21 +72,29 @@ private struct UbuntuLabView: View {
                 }
             }
             .navigationTitle("Ubuntu Lab")
+            .onAppear { refreshKey() }
             .confirmationDialog("Run original AGY in the local guest?", isPresented: $confirm) {
-                Button("Verify digest and connect") { if let sha = digest { run(sha: sha) } }
+                Button("Verify digest and connect") { if let sha = digest { run(sha: sha, gemini: useGemini) } }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("AGY may make startup network requests. No credentials, user project, prompts or permission grants are supplied. This emulator is not a security sandbox. Run only a binary you obtained and reviewed under applicable terms.")
+                Text(useGemini ? "Your saved key will enter the local agent process environment. AGY may connect to Google and write its own logs. The emulator is not a security sandbox. Only use a reviewed official binary and a restricted key. No project or prompt is supplied." : "AGY may make startup network requests. No credentials, user project, prompts or permission grants are supplied. This emulator is not a security sandbox. Run only a reviewed official binary.")
             }
         }
     }
 
-    private func run(sha: String?) {
+    private func refreshKey() {
+        do {
+            keyStored = try GeminiKeychain.load() != nil
+            keyStatus = keyStored ? "Saved key available" : "No key saved"
+        } catch { keyStored = false; keyStatus = "Keychain unavailable" }
+    }
+
+    private func run(sha: String?, gemini: Bool = false) {
         guard !attempted else { return }
         attempted = true
         running = true
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini) }.value
             report = result.report
             agentStatus = result.status
             active = result.active
@@ -82,10 +117,15 @@ private struct UbuntuLabView: View {
 }
 
 private enum UbuntuRunner {
-    static func run(sha: String?) -> (report: String, status: String, active: Bool) {
+    static func run(sha: String?, gemini: Bool) -> (report: String, status: String, active: Bool) {
         var client = ACPInitializeClient()
         func failed(_ reason: String) -> (String, String, Bool) { (reason, "Not initialized", false) }
         do {
+            let key: String?
+            if gemini {
+                guard sha != nil, let saved = try GeminiKeychain.load() else { return failed("Saved key unavailable") }
+                key = saved
+            } else { key = nil }
             let fm = FileManager.default
             guard let bundled = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else {
                 return failed("Missing Ubuntu fakefs.")
@@ -97,7 +137,10 @@ private enum UbuntuRunner {
             let pointer = data.path.withCString { path in
                 if let sha, let request {
                     return sha.withCString { digest in
-                        request.withCString { nexus_acp_start(path, digest, $0) }
+                        request.withCString { wire in
+                            if let key { return key.withCString { nexus_acp_start_gemini(path, digest, wire, $0) } }
+                            return nexus_acp_start(path, digest, wire)
+                        }
                     }
                 }
                 return nexus_guest_probe_glibc(path, nil)
@@ -114,7 +157,7 @@ private enum UbuntuRunner {
                 return (pretty, "Libc only; AGY not executed", false)
             }
             if object["authenticationRequired"] as? Bool == true {
-                return (pretty, "Authentication required; sign-in not implemented", false)
+                return (pretty, "Authentication required; interactive sign-in not implemented", false)
             }
             guard object["ok"] as? Bool == true, object["active"] as? Bool == true,
                   let response = object["response"] as? [String: Any] else {
@@ -127,12 +170,12 @@ private enum UbuntuRunner {
                 try client.receive(frame)
                 try client.finish()
                 if case let .initialized(name, version) = client.state {
-                    return (pretty, "\(name) \(version): ACP v1 connected", true)
+                    return (pretty, gemini ? "ACP connected with key supplied; model access not verified" : "\(name) \(version): ACP v1 connected", true)
                 }
             } catch {}
             nexus_guest_free(nexus_acp_close())
             return (pretty, "Invalid ACP response; connection closed", false)
-        } catch { return failed("Preparation failed: \(error)") }
+        } catch { return failed("Keychain or guest preparation failed") }
     }
 
     static func action(close: Bool) -> (report: String, status: String, active: Bool, ok: Bool) {

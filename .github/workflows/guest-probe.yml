@@ -17,6 +17,7 @@ on:
       - 'scripts/stage-ubuntu-device.sh'
       - 'project-glibc.yml'
       - 'App/UbuntuLabApp.swift'
+      - 'App/GeminiKeychain.swift'
       - 'project-guest.yml'
       - 'App/GuestProbeView.swift'
       - '.github/workflows/guest-probe.yml'
@@ -111,7 +112,18 @@ jobs:
           export CC="$(xcrun --sdk macosx --find clang)"
           cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-acp-fs"
           rm -f "$NEXUS_ACP_EVIDENCE"
-          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_persistent_acp_transport -- --ignored --nocapture --test-threads=1
+          # Synthetic credential only; force frame tracing and check redaction before printing.
+          log="$RUNNER_TEMP/nexus-acp-trace.log"
+          if ! ISH_TRACE_FRAMES=1 cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_persistent_acp_transport -- --ignored --nocapture --test-threads=1 >"$log" 2>&1; then
+            echo "Transport fixture failed; raw trace withheld"
+            exit 1
+          fi
+          if grep -q 'NEXUS_TEST_ONLY_NOT_A_REAL_KEY' "$log"; then
+            echo "Synthetic credential leaked into trace"
+            exit 1
+          fi
+          cat "$log"
+          rm -f "$log"
           python3 scripts/verify-acp-transport.py "$NEXUS_ACP_EVIDENCE"
       - name: Upload transport fixture evidence
         if: always()

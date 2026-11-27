@@ -373,6 +373,25 @@ pub async fn glibc_compat(guest: &IshInstance, env: &HashMap<String,String>) -> 
     json!({"name":name,"passed":passed,"evidence":capture.evidence(),"error":result.err()})
 }
 
+// Configure the documented provider without writing any credential.
+pub(crate) async fn prepare_gemini_provider(guest: &IshInstance, env: &HashMap<String,String>) -> bool {
+    let script = r#"
+set -eu
+umask 077
+test ! -e /root/.gemini
+mkdir -p /root/.gemini/antigravity-cli
+printf '%s\n' '{"modelProvider":"gemini"}' > /root/.gemini/antigravity-cli/settings.json
+"#;
+    let mut opts = shell(script, env);
+    opts.pipe_stdin = false;
+    let session = match guest.spawn(opts) { Ok(s) => s, Err(_) => return false };
+    let mut capture = Capture::default();
+    let result = drain(&session, &mut capture, Instant::now() + TIMEOUT).await;
+    if result.is_err() { let _ = session.terminate().await; }
+    result.is_ok() && capture.closed && capture.code == Some(0) && capture.signal == Some(0)
+        && capture.stdout.is_empty() && capture.stderr.is_empty() && capture.pty.is_empty()
+}
+
 pub fn agy_digest_ok(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
