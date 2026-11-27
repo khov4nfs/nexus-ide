@@ -23,6 +23,14 @@
       [
         "    g_exit_cb = cb;\n    exit_hook",
         "    g_exit_cb = cb;\n    nexus_embedded_shutdown = (cb != NULL);\n    exit_hook"
+      ],
+      [
+        "#include \"fs/path.h\"",
+        "#include \"fs/path.h\"\n#include \"fs/stat.h\"\n#include \"kernel/errno.h\""
+      ],
+      [
+        "int ish_ffi_mount_devpts(void) {\n    if (current == NULL)\n        return -EINVAL;\n    generic_mknodat(AT_PWD, \"/dev/ptmx\", S_IFCHR|0666,\n                    dev_make(TTY_ALTERNATE_MAJOR, DEV_PTMX_MINOR));",
+        "// The Alpine minirootfs may not ship device nodes. In fakefs these are\n// metadata backed by regular host files, not host device creation.\nstatic int ensure_guest_mem_device(const char *path, int minor) {\n    struct statbuf stat;\n    dev_t_ device = dev_make(MEM_MAJOR, minor);\n    int rc = generic_statat(AT_PWD, path, &stat, false);\n    if (rc == _ENOENT) {\n        rc = generic_mknodat(AT_PWD, path, S_IFCHR|0666, device);\n        if (rc < 0)\n            return rc;\n        rc = generic_statat(AT_PWD, path, &stat, false);\n    }\n    if (rc < 0)\n        return rc;\n    if (!S_ISCHR(stat.mode) || stat.rdev != device)\n        return _EINVAL;\n    return 0;\n}\n\nint ish_ffi_mount_devpts(void) {\n    if (current == NULL)\n        return -EINVAL;\n    // All four use the existing emulated memory device drivers. Random\n    // reads call the existing platform CSPRNG; never substitute dummy data.\n    int rc = ensure_guest_mem_device(\"/dev/null\", DEV_NULL_MINOR);\n    if (rc < 0) return rc;\n    rc = ensure_guest_mem_device(\"/dev/zero\", DEV_ZERO_MINOR);\n    if (rc < 0) return rc;\n    rc = ensure_guest_mem_device(\"/dev/random\", DEV_RANDOM_MINOR);\n    if (rc < 0) return rc;\n    rc = ensure_guest_mem_device(\"/dev/urandom\", DEV_URANDOM_MINOR);\n    if (rc < 0) return rc;\n    generic_mknodat(AT_PWD, \"/dev/ptmx\", S_IFCHR|0666,\n                    dev_make(TTY_ALTERNATE_MAJOR, DEV_PTMX_MINOR));"
       ]
     ],
     "embed/host/src/instance.rs": [

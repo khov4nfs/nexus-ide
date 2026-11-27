@@ -44,6 +44,7 @@ jobs:
       - name: Real guest process and signed package tests on macOS build host
         env:
           NEXUS_TEST_PACKAGES: '1'
+          NEXUS_TEST_TOOLCHAINS: '1'
           NEXUS_TEST_ROOTFS: ${{ github.workspace }}/Vendor/litter-ish/build/fs/data
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
@@ -54,7 +55,7 @@ jobs:
           export NEXUS_TEST_EVIDENCE="$RUNNER_TEMP/nexus-guest-evidence.json"
           rm -f "$NEXUS_TEST_EVIDENCE"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_guest_process_probe -- --ignored --nocapture --test-threads=1
-          python3 scripts/verify-guest-evidence.py "$NEXUS_TEST_EVIDENCE" --packages
+          python3 scripts/verify-guest-evidence.py "$NEXUS_TEST_EVIDENCE" --toolchains
       - name: Upload completed guest evidence
         if: always()
         uses: actions/upload-artifact@v4
