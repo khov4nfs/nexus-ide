@@ -534,13 +534,13 @@ impl ACPExchange {
 
     pub(crate) async fn request_updates<F>(&mut self, bytes: &[u8], id: i64, update: F) -> Result<Value,String>
     where F: FnMut(&Value) -> Result<(),String> {
-        self.request_controlled(bytes, id, update, || None).await
+        self.request_controlled(bytes, id, update, || None, |_| Err("Unexpected agent request".into())).await
     }
 
     // Control is checked by the owner of the same stdin stream, never by
     // another writer. Cancellation is a notification, not a new request ID.
-    pub(crate) async fn request_controlled<F, C>(&mut self, bytes: &[u8], id: i64, mut update: F, mut control: C) -> Result<Value,String>
-    where F: FnMut(&Value) -> Result<(),String>, C: FnMut() -> Option<Vec<u8>> {
+    pub(crate) async fn request_controlled<F, C, R>(&mut self, bytes: &[u8], id: i64, mut update: F, mut control: C, mut server_request: R) -> Result<Value,String>
+    where F: FnMut(&Value) -> Result<(),String>, C: FnMut() -> Option<Vec<u8>>, R: FnMut(&Value) -> Result<Value,String> {
         let mut deadline = Instant::now() + Duration::from_secs(90);
         write_ready(&self.session, bytes, deadline).await?;
         loop {
@@ -562,6 +562,13 @@ impl ACPExchange {
                 if frame.get("id").is_none() && frame["method"].is_string() &&
                     frame.get("result").is_none() && frame.get("error").is_none() {
                     update(&frame)?;
+                    continue;
+                }
+                if frame.get("method").is_some() && frame.get("id").is_some() &&
+                    frame.get("result").is_none() && frame.get("error").is_none() && answer.is_none() {
+                    let reply = server_request(&frame)?;
+                    let wire = format!("{reply}\n");
+                    write_ready(&self.session, wire.as_bytes(), deadline).await?;
                     continue;
                 }
                 if frame.get("method").is_some() || frame["id"].as_i64() != Some(id) ||

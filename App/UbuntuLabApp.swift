@@ -33,6 +33,8 @@ private struct UbuntuLabView: View {
     @State private var sentChat = ""
     @State private var promptRunning = false
     @State private var receivedChunks = 0
+    @State private var permissionDenials = 0
+    @State private var toolUpdates = 0
     @State private var cancelRequested = false
     @State private var keyInput = ""
     @State private var keyStored = false
@@ -80,6 +82,7 @@ private struct UbuntuLabView: View {
                 }
                 Section("Native ACP client") {
                     Text(agentStatus)
+                    Text("ACP tool permissions: deny only. No native tool access. Agent internal actions are not sandboxed.").font(.caption)
                     if active {
                         Text("Connection closes after 60 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
                         Button("Create empty guest session") { act(close: false) }.disabled(running || created)
@@ -90,6 +93,9 @@ private struct UbuntuLabView: View {
                             Button("Send chat") { confirmChat = true }
                                 .disabled(running || smokeUsed || turnCount >= maxTurns || !UbuntuRunner.validChat(chatInput))
                             Text("Chat turns: \(turnCount)/\(maxTurns)").font(.caption)
+                        }
+                        if turnCount > 0 {
+                            Text("Permission denials selected: \(permissionDenials) · Tool updates: \(toolUpdates)").font(.caption)
                         }
                         if promptRunning {
                             Text("Received text chunks: \(receivedChunks)").font(.caption)
@@ -133,6 +139,8 @@ private struct UbuntuLabView: View {
                     let progress = UbuntuRunner.progress()
                     if progress.responseID == turnCount + 2 {
                         receivedChunks = progress.chunks
+                        permissionDenials = progress.permissionDenials
+                        toolUpdates = progress.toolUpdates
                         if !sentChat.isEmpty { chatResponse = progress.text }
                         if progress.cancelRequested { cancelRequested = true }
                     }
@@ -201,10 +209,16 @@ private struct UbuntuLabView: View {
         let expectedID = turnCount + 2
         promptRunning = true
         receivedChunks = 0
+        permissionDenials = 0
+        toolUpdates = 0
         cancelRequested = false
         Task {
             let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat) }.value
             let snapshot = UbuntuRunner.progress()
+            if snapshot.responseID == expectedID {
+                permissionDenials = snapshot.permissionDenials
+                toolUpdates = snapshot.toolUpdates
+            }
             let matches = result.responseID == expectedID && snapshot.responseID == expectedID && !snapshot.running
             if let chat {
                 let text = result.ok && matches ? snapshot.text : ""
@@ -315,9 +329,9 @@ private enum UbuntuRunner {
             text.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) || $0.value == 10 || $0.value == 9 }
     }
 
-    static func progress() -> (chunks: Int, cancelRequested: Bool, text: String, responseID: Int, running: Bool) {
+    static func progress() -> (chunks: Int, cancelRequested: Bool, text: String, responseID: Int, running: Bool, permissionDenials: Int, toolUpdates: Int) {
         let obj = controlReport(nexus_acp_prompt_progress())
-        return (obj["chunkCount"] as? Int ?? 0, obj["cancelRequested"] as? Bool == true, obj["text"] as? String ?? "", obj["responseId"] as? Int ?? 0, obj["running"] as? Bool == true)
+        return (obj["chunkCount"] as? Int ?? 0, obj["cancelRequested"] as? Bool == true, obj["text"] as? String ?? "", obj["responseId"] as? Int ?? 0, obj["running"] as? Bool == true, obj["permissionDenials"] as? Int ?? 0, obj["toolUpdates"] as? Int ?? 0)
     }
 
     static func cancelPrompt() -> Bool {

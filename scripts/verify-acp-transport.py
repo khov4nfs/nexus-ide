@@ -35,6 +35,9 @@ if chat:
         progress = r[name + "Progress"]
         require(turn.get("ok") is True and turn.get("active") is True and turn.get("chatCompleted") is True and turn.get("responseId") == expected_id and turn.get("stopReason") == "end_turn", "Missing followup response")
         require(progress.get("running") is False and progress.get("responseId") == expected_id and progress.get("text") == expected_text, "Stale or incorrect followup snapshot")
+    require(r["followupProgress"].get("permissionDenials") == 1 and r["followupProgress"].get("toolUpdates") == 2, "Missing deny-only tool exchange evidence")
+    require(r["thirdProgress"].get("permissionDenials") == 0 and r["thirdProgress"].get("toolUpdates") == 0, "Stale permission counters")
+    require("Untrusted fixture title" not in json.dumps(r) and "opaque-deny" not in json.dumps(r), "Raw tool metadata leaked into evidence")
     require(r["overLimit"].get("ok") is False and r["overLimit"].get("active") is True, "Fourth turn not rejected")
 elif cancel:
     require(r.get("progressSeen") is True and r["cancelRequest"].get("ok") is True and r["duplicateCancel"].get("ok") is False, "Missing live progress or cancel request")
