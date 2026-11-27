@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
-fn probe(path: &Path) -> Value {
+fn probe(path: &Path, packages: bool) -> Value {
     if !path.is_dir() || !path.parent().map(|p| p.join("meta.db").is_file()).unwrap_or(false) {
         return json!({"ok":false,"stage":"rootfs","error":"Expected fakefs data directory with sibling meta.db"});
     }
@@ -47,24 +47,40 @@ fn probe(path: &Path) -> Value {
             let process_rows = process_probe::run(&guest, &env).await;
             ok &= process_rows.iter().all(|row| row["passed"].as_bool() == Some(true));
             rows.extend(process_rows);
+            if packages && ok {
+                let row = process_probe::package_install(&guest, &env).await;
+                ok &= row["passed"].as_bool() == Some(true);
+                rows.push(row);
+            }
             guest.shutdown().await.map_err(|e| e.to_string())
         }),
         Err(e) => Err(e.to_string()),
     };
     ok &= shutdown.is_ok();
-    json!({"ok":ok,"stage":"probe","checks":rows,"shutdownError":shutdown.err()})
+    json!({"ok":ok,"stage":"probe","packageRequested":packages,"checks":rows,"shutdownError":shutdown.err()})
 }
 
 /// # Safety
 /// path must point to a valid, null-terminated string for this call.
 #[no_mangle]
 pub unsafe extern "C" fn nexus_guest_probe(path: *const c_char) -> *mut c_char {
+    run_bridge(path, false)
+}
+
+/// # Safety
+/// Same pointer contract as nexus_guest_probe. Only call after explicit network consent.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_guest_probe_packages(path: *const c_char) -> *mut c_char {
+    run_bridge(path, true)
+}
+
+unsafe fn run_bridge(path: *const c_char, packages: bool) -> *mut c_char {
     let result = std::panic::catch_unwind(|| {
         if path.is_null() {
             return json!({"ok":false,"stage":"rootfs","error":"Missing rootfs"});
         }
         match CStr::from_ptr(path).to_str() {
-            Ok(s) => probe(Path::new(s)),
+            Ok(s) => probe(Path::new(s), packages),
             Err(_) => json!({"ok":false,"stage":"rootfs","error":"Invalid UTF-8 path"}),
         }
     }).unwrap_or_else(|_| json!({"ok":false,"stage":"bridge","error":"Rust panic; restart application"}));
@@ -89,10 +105,11 @@ mod tests {
     fn real_guest_process_probe() {
         let path = std::env::var_os("NEXUS_TEST_ROOTFS").expect("set NEXUS_TEST_ROOTFS to fakefs/data");
         let evidence_path = std::env::var_os("NEXUS_TEST_EVIDENCE").expect("set NEXUS_TEST_EVIDENCE");
-        let report = probe(Path::new(&path));
+        let packages = std::env::var("NEXUS_TEST_PACKAGES").as_deref() == Ok("1");
+        let report = probe(Path::new(&path), packages);
         std::fs::write(evidence_path, serde_json::to_vec_pretty(&report).unwrap()).expect("write completed evidence");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         assert_eq!(report["ok"].as_bool(), Some(true), "{report}");
-        assert_eq!(report["checks"].as_array().map(Vec::len), Some(6));
+        assert_eq!(report["checks"].as_array().map(Vec::len), Some(if packages { 7 } else { 6 }));
     }
 }

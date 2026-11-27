@@ -180,9 +180,73 @@ pub async fn run(guest: &IshInstance, env: &HashMap<String,String>) -> Vec<Value
     rows
 }
 
+
+// Fixed official Alpine package gate. No caller-supplied names, URLs,
+// shell fragments, credentials or user workspace. TLS and APK signature
+// verification stay enabled. No package install scripts/triggers.
+const PACKAGE_SCRIPT: &str = r#"
+set -eu
+if /sbin/apk info -e jq >/dev/null 2>&1; then
+    echo 'Refusing preinstalled jq: need a fresh rootfs' >&2
+    exit 31
+fi
+printf 'NEXUS_PACKAGE_ABSENT\n'
+# Upstream minirootfs may not provide DNS. Only in the explicit network probe.
+if [ ! -s /etc/resolv.conf ]; then
+    printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf
+    printf 'NEXUS_DNS_FALLBACK\n'
+fi
+/sbin/apk --repositories-file /dev/null \
+    --repository https://dl-cdn.alpinelinux.org/alpine/v3.21/main \
+    --no-cache --no-scripts add jq >&2
+/sbin/apk info -e jq >/dev/null
+printf 'NEXUS_PACKAGE_INSTALLED\n'
+/sbin/apk info -v jq
+/usr/bin/jq --version
+printf '%s\n' '{"value":"NEXUS_JQ_OK"}' | /usr/bin/jq -er '.value'
+"#;
+
+pub async fn package_install(guest: &IshInstance, env: &HashMap<String,String>) -> Value {
+    let name = "apk_install_jq";
+    let mut opts = shell(PACKAGE_SCRIPT, env);
+    opts.pipe_stdin = false;
+    let session = match guest.spawn(opts) {
+        Ok(s) => s,
+        Err(e) => return json!({"name":name,"passed":false,"error":e.to_string()}),
+    };
+    let mut capture = Capture::default();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let result = drain(&session, &mut capture, deadline).await;
+    if result.is_err() { let _ = session.terminate().await; }
+    let passed = result.is_ok() && capture.code == Some(0) &&
+        capture.signal.unwrap_or(0) == 0 && package_output_ok(&capture.stdout) &&
+        capture.pty.is_empty();
+    json!({"name":name,"passed":passed,"evidence":capture.evidence(),
+           "repository":"https://dl-cdn.alpinelinux.org/alpine/v3.21/main",
+           "error":result.err()})
+}
+
+fn package_output_ok(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let absent = lines.iter().position(|line| *line == "NEXUS_PACKAGE_ABSENT");
+    let installed = lines.iter().position(|line| *line == "NEXUS_PACKAGE_INSTALLED");
+    matches!((absent, installed), (Some(a), Some(b)) if a < b) &&
+        lines.iter().any(|line| line.starts_with("jq-") && line.contains("-r")) &&
+        lines.iter().any(|line| line.starts_with("jq-") && !line.contains("-r")) &&
+        lines.last() == Some(&"NEXUS_JQ_OK")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn package_evidence_requires_install_and_execution() {
+        let good = b"NEXUS_PACKAGE_ABSENT\nNEXUS_PACKAGE_INSTALLED\njq-1.7.1-r0\njq-1.7.1\nNEXUS_JQ_OK\n";
+        assert!(package_output_ok(good));
+        assert!(!package_output_ok(b"NEXUS_JQ_OK\n"));
+        assert!(!package_output_ok(b"NEXUS_PACKAGE_INSTALLED\nNEXUS_PACKAGE_ABSENT\njq-1.7.1-r0\njq-1.7.1\nNEXUS_JQ_OK\n"));
+    }
     #[test]
     fn capture_preserves_binary_and_streams() {
         let mut c=Capture::default();
