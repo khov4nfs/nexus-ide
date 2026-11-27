@@ -373,6 +373,29 @@ pub async fn glibc_compat(guest: &IshInstance, env: &HashMap<String,String>) -> 
     json!({"name":name,"passed":passed,"evidence":capture.evidence(),"error":result.err()})
 }
 
+pub fn agy_digest_ok(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub async fn agy_binary_digest(guest: &IshInstance, env: &HashMap<String,String>, expected: &str) -> Value {
+    let name = "agy_binary_digest";
+    let mut opts = SpawnOpts::cmd(["/usr/bin/sha256sum", "/opt/nexus/agy"]);
+    opts.cwd = Some(Path::new("/").to_path_buf());
+    opts.envp = Some(env.iter().map(|(k,v)| (k.clone(),v.clone())).collect());
+    let session = match guest.spawn(opts) {
+        Ok(s) => s,
+        Err(e) => return json!({"name":name,"passed":false,"error":e.to_string()}),
+    };
+    let mut capture = Capture::default();
+    let result = drain(&session, &mut capture, Instant::now() + Duration::from_secs(120)).await;
+    if result.is_err() { let _ = session.terminate().await; }
+    let passed = result.is_ok() && capture.code == Some(0) && capture.signal == Some(0)
+        && capture.closed && capture.pty.is_empty()
+        && capture.stdout == format!("{expected}  /opt/nexus/agy\n").as_bytes();
+    json!({"name":name,"passed":passed,"sha256":expected,"closed":capture.closed,
+           "error":if passed { None } else { Some("Guest executable digest check failed") }})
+}
+
 // Do not treat arbitrary JSON or a JSON-RPC error as a successful initialize.
 fn agy_initialize_ok(frame: &Value) -> bool {
     frame["jsonrpc"] == "2.0" && frame["id"] == 1 &&
@@ -387,7 +410,9 @@ pub async fn agy_initialize(guest: &IshInstance, env: &HashMap<String,String>) -
     // artifact. Never substitute a fixture or run a host binary.
     let mut opts = SpawnOpts::cmd(["/opt/nexus/agy", "acp", "--disable-telemetry"]);
     opts.cwd = Some(Path::new("/tmp").to_path_buf());
-    opts.envp = Some(env.iter().map(|(k,v)| (k.clone(),v.clone())).collect());
+    let mut agent_env = env.clone();
+    agent_env.insert("AGY_CLI_DISABLE_AUTO_UPDATE".into(), "true".into());
+    opts.envp = Some(agent_env.into_iter().collect());
     opts.pipe_stdin = true;
     let session = match guest.spawn(opts) {
         Ok(s) => s,
