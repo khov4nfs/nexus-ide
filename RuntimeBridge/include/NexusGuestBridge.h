@@ -20,6 +20,8 @@ char *nexus_acp_start(const char *rootfs_data_path, const char *expected_agy_sha
 // Explicit consent required; key is passed only to the agent process environment.
 char *nexus_acp_start_gemini(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request, const char *key);
 char *nexus_acp_new_session(const char *session_new_request);
+// Explicit model-network consent; one fixed prompt, no arbitrary content.
+char *nexus_acp_prompt_probe(void);
 char *nexus_acp_close(void);
 void nexus_guest_free(char *result);
 #ifdef __cplusplus

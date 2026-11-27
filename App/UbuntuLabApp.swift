@@ -15,6 +15,8 @@ private struct UbuntuLabView: View {
     @State private var agentStatus = "Not initialized"
     @State private var active = false
     @State private var created = false
+    @State private var prompted = false
+    @State private var confirmPrompt = false
     @State private var keyInput = ""
     @State private var keyStored = false
     @State private var keyStatus = ""
@@ -64,6 +66,9 @@ private struct UbuntuLabView: View {
                     if active {
                         Text("Connection closes after 60 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
                         Button("Create empty guest session") { act(close: false) }.disabled(running || created)
+                        if created && useGemini {
+                            Button("Test model response") { confirmPrompt = true }.disabled(running || prompted)
+                        }
                         Button("Close local connection", role: .destructive) { act(close: true) }.disabled(running)
                     }
                 }
@@ -73,6 +78,12 @@ private struct UbuntuLabView: View {
             }
             .navigationTitle("Ubuntu Lab")
             .onAppear { refreshKey() }
+            .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
+                Button("Send test prompt") { runPrompt() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("The agent may use model inference and incur API charges. Only a fixed test message is sent by Nexus; no user project is mounted. The agent may still perform internal actions; this is not a sandbox.")
+            }
             .confirmationDialog("Run original AGY in the local guest?", isPresented: $confirm) {
                 Button("Verify digest and connect") { if let sha = digest { run(sha: sha, gemini: useGemini) } }
                 Button("Cancel", role: .cancel) {}
@@ -95,6 +106,19 @@ private struct UbuntuLabView: View {
         running = true
         Task {
             let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini) }.value
+            report = result.report
+            agentStatus = result.status
+            active = result.active
+            running = false
+        }
+    }
+
+    private func runPrompt() {
+        guard active, created, useGemini, !running, !prompted else { return }
+        running = true
+        prompted = true
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true) }.value
             report = result.report
             agentStatus = result.status
             active = result.active
@@ -178,10 +202,11 @@ private enum UbuntuRunner {
         } catch { return failed("Keychain or guest preparation failed") }
     }
 
-    static func action(close: Bool) -> (report: String, status: String, active: Bool, ok: Bool) {
+    static func action(close: Bool, prompt: Bool = false) -> (report: String, status: String, active: Bool, ok: Bool) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
+            else if prompt { pointer = nexus_acp_prompt_probe() }
             else {
                 let request = String(decoding: try ACPRequest.newSession(id: 2, cwd: "/tmp"), as: UTF8.self)
                 pointer = request.withCString { nexus_acp_new_session($0) }
@@ -201,8 +226,10 @@ private enum UbuntuRunner {
             let status: String
             if close && ok && object["transportClosed"] as? Bool == true && object["shutdownClean"] as? Bool == true {
                 status = "Local connection closed; guest shutdown verified"
-            } else if !close && ok && active && object["sessionCreated"] as? Bool == true && object["responseId"] as? Int == 2 {
-                status = "Empty guest session created; prompt disabled"
+            } else if prompt && ok && active && object["promptVerified"] as? Bool == true && object["marker"] as? String == "NEXUS_ACP_OK" {
+                status = "Fixed model response verified; general chat disabled"
+            } else if !close && !prompt && ok && active && object["sessionCreated"] as? Bool == true && object["responseId"] as? Int == 2 {
+                status = "Empty guest session created; fixed test available with Gemini key"
             } else if object["authenticationRequired"] as? Bool == true {
                 status = "Authentication required; connection stopped"
             } else {

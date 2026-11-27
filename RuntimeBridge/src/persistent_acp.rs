@@ -16,7 +16,7 @@ const IDLE: Duration = Duration::from_secs(60);
 const REPLY: Duration = Duration::from_secs(300);
 const NEW_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\",\"mcpServers\":[]}}\n";
 type Reply = SyncSender<Value>;
-enum Command { New(Vec<u8>, Reply), Close(Reply) }
+enum Command { New(Vec<u8>, Reply), Prompt(Reply), Close(Reply) }
 static ACTIVE: Mutex<Option<SyncSender<Command>>> = Mutex::new(None);
 
 enum Mode { Agy(String), #[cfg(test)] Fixture }
@@ -46,6 +46,52 @@ fn auth_error(frame: &Value) -> bool {
 fn session_created(frame: &Value) -> bool {
     frame.get("error").is_none() && frame["result"]["sessionId"].as_str()
         .map(|s| !s.is_empty() && s.len() <= 256).unwrap_or(false)
+}
+
+const SMOKE_PROMPT: &str = "Reply with exactly NEXUS_ACP_OK. Do not use tools, read files, or perform actions.";
+const SMOKE_REPLY: &str = "NEXUS_ACP_OK";
+
+#[derive(Default)]
+struct PromptEvidence {
+    text: String,
+    chunks: usize,
+    message_id: Option<String>,
+}
+impl PromptEvidence {
+    fn update(&mut self, frame: &Value, session: &str) -> Result<(),String> {
+        if frame["method"] != "session/update" || frame["params"]["sessionId"] != session {
+            return Err("Unexpected prompt notification".into());
+        }
+        let u = &frame["params"]["update"];
+        match u["sessionUpdate"].as_str() {
+            Some("agent_message_chunk") => {
+                let content = &u["content"];
+                let text = content["text"].as_str().ok_or("Missing text chunk")?;
+                if content["type"] != "text" || self.chunks >= 128 ||
+                    self.text.len() + text.len() > 1024 { return Err("Unsupported or oversized text".into()); }
+                if let Some(id) = u.get("messageId") {
+                    let id = id.as_str().filter(|s| !s.is_empty() && s.len() <= 256)
+                        .ok_or("Invalid message id")?;
+                    if self.message_id.as_deref().is_some_and(|old| old != id) {
+                        return Err("Multiple agent messages not supported".into());
+                    }
+                    self.message_id = Some(id.to_owned());
+                }
+                self.text.push_str(text);
+                self.chunks += 1;
+                Ok(())
+            }
+            Some("agent_thought_chunk" | "user_message_chunk" | "available_commands_update" |
+                 "current_mode_update" | "config_option_update" | "session_info_update" | "usage_update") => Ok(()),
+            // Observing a tool notification is NOT a preventive sandbox.
+            _ => Err("Unsupported session update; stopping probe".into()),
+        }
+    }
+    fn complete(&self, frame: &Value) -> bool {
+        frame["jsonrpc"] == "2.0" && frame["id"] == 3 &&
+            frame.get("error").is_none() && frame["result"]["stopReason"] == "end_turn" &&
+            self.chunks > 0 && self.text.trim() == SMOKE_REPLY
+    }
 }
 
 fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, commands: Receiver<Command>, ready: Reply) {
@@ -127,11 +173,12 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
         let _ = rt.block_on(guest.shutdown());
         return;
     }
-    let mut created = false;
+    let mut session_id: Option<String> = None;
+    let mut prompted = false;
     let final_reply = loop {
         match commands.recv_timeout(IDLE) {
             Ok(Command::New(bytes, reply)) => {
-                if created || !valid_new(&bytes) {
+                if session_id.is_some() || !valid_new(&bytes) {
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Only one fixed session/new is allowed"}));
                     continue;
                 }
@@ -144,7 +191,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                             let _ = reply.send(failure("Fixture session ID mismatch"));
                             break None;
                         }
-                        created = true;
+                        session_id = frame["result"]["sessionId"].as_str().map(str::to_owned);
                         if reply.send(json!({"ok":true,"active":true,"sessionCreated":true,"responseId":2})).is_err() {
                             break None;
                         }
@@ -153,6 +200,34 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                         let auth = other.as_ref().ok().is_some_and(auth_error);
                         break Some((reply, json!({"ok":false,"active":false,"authenticationRequired":auth,"error":"Session creation rejected"})));
                     }
+                }
+            }
+            Ok(Command::Prompt(reply)) => {
+                let Some(id) = session_id.as_deref() else {
+                    let _ = reply.send(json!({"ok":false,"active":true,"error":"Create a session first"}));
+                    continue;
+                };
+                if !keyed || prompted {
+                    let _ = reply.send(json!({"ok":false,"active":true,"error":"One consented Gemini prompt per boot"}));
+                    continue;
+                }
+                prompted = true;
+                let request = json!({"jsonrpc":"2.0","id":3,"method":"session/prompt",
+                    "params":{"sessionId":id,"prompt":[{"type":"text","text":SMOKE_PROMPT}]}});
+                let wire = format!("{request}\n");
+                let mut evidence = PromptEvidence::default();
+                let result = rt.block_on(exchange.request_updates(wire.as_bytes(), 3,
+                    |frame| evidence.update(frame, id)));
+                let success = result.as_ref().is_ok_and(|frame| evidence.complete(frame));
+                if success {
+                    // Export a constant marker only, never model text, IDs or errors.
+                    if reply.send(json!({"ok":true,"active":true,"promptVerified":true,
+                        "responseId":3,"chunkCount":evidence.chunks,"stopReason":"end_turn",
+                        "marker":SMOKE_REPLY})).is_err() { break None; }
+                } else {
+                    let auth = result.as_ref().ok().is_some_and(auth_error);
+                    break Some((reply,json!({"ok":false,"active":false,"authenticationRequired":auth,
+                        "error":"Prompt probe rejected or incomplete"})));
                 }
             }
             Ok(Command::Close(reply)) => break Some((reply, json!({"ok":true,"active":false}))),
@@ -199,11 +274,13 @@ fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>) -> Va
     }
 }
 
-fn command(bytes: Option<Vec<u8>>) -> Value {
+enum Action { New(Vec<u8>), Prompt, Close }
+
+fn command(action: Action) -> Value {
     let Ok(mut slot) = ACTIVE.lock() else { return failure("Connection lock failed"); };
     let Some(tx) = slot.as_ref() else { return failure("No active connection"); };
     let (reply, wait) = mpsc::sync_channel(1);
-    let message = match bytes { Some(b) => Command::New(b, reply), None => Command::Close(reply) };
+    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(reply), Action::Close => Command::Close(reply) };
     if tx.send(message).is_err() {
         *slot = None; return failure("Connection stopped or idle timeout");
     }
@@ -254,14 +331,20 @@ pub unsafe extern "C" fn nexus_acp_start_gemini(path: *const c_char, digest: *co
 #[no_mangle]
 pub unsafe extern "C" fn nexus_acp_new_session(request: *const c_char) -> *mut c_char {
     ffi_result(|| match read_arg(request) {
-        Some(req) if valid_new(req.as_bytes()) => command(Some(req.into_bytes())),
+        Some(req) if valid_new(req.as_bytes()) => command(Action::New(req.into_bytes())),
         _ => failure("Invalid session/new request"),
     })
 }
 
+// Fixed prompt only; caller must obtain explicit model-network consent.
+#[no_mangle]
+pub extern "C" fn nexus_acp_prompt_probe() -> *mut c_char {
+    ffi_result(|| command(Action::Prompt))
+}
+
 #[no_mangle]
 pub extern "C" fn nexus_acp_close() -> *mut c_char {
-    ffi_result(|| command(None))
+    ffi_result(|| command(Action::Close))
 }
 
 #[cfg(test)]
@@ -281,22 +364,42 @@ mod tests {
     }
 
     #[test]
+    fn prompt_chunks_and_stop_reason_are_strict() {
+        let chunk = |session: &str, text: &str| json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":session,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}});
+        let mut e = PromptEvidence::default();
+        assert!(e.update(&chunk("wrong","NEXUS_"),"s").is_err());
+        e.update(&chunk("s","NEXUS_"),"s").unwrap();
+        e.update(&chunk("s","ACP_OK"),"s").unwrap();
+        assert!(e.complete(&json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}})));
+        assert!(!e.complete(&json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelled"}})));
+        assert!(e.update(&json!({"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call"}}}),"s").is_err());
+        assert!(e.update(&chunk("s",&"a".repeat(1025)),"s").is_err());
+    }
+
+    #[test]
     #[ignore = "requires a separate fresh Ubuntu fakefs"]
     fn real_persistent_acp_transport() {
         let path = std::env::var_os("NEXUS_ACP_ROOTFS").expect("set NEXUS_ACP_ROOTFS");
         let evidence = std::env::var_os("NEXUS_ACP_EVIDENCE").expect("set NEXUS_ACP_EVIDENCE");
         let first = start(PathBuf::from(path), Mode::Fixture, process_probe::AGY_INITIALIZE_REQUEST.to_vec(), Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()));
-        let second = command(Some(NEW_REQUEST.to_vec()));
-        let duplicate = command(Some(NEW_REQUEST.to_vec()));
-        let close = command(None);
-        let after_close = command(Some(NEW_REQUEST.to_vec()));
+        let before_session = command(Action::Prompt);
+        let second = command(Action::New(NEW_REQUEST.to_vec()));
+        let duplicate = command(Action::New(NEW_REQUEST.to_vec()));
+        let prompt = command(Action::Prompt);
+        let duplicate_prompt = command(Action::Prompt);
+        let close = command(Action::Close);
+        let after_close = command(Action::New(NEW_REQUEST.to_vec()));
         let ok = first["ok"] == true && first["active"] == true && first["credentialMode"] == "gemini-api-key" &&
             second["ok"] == true && second["sessionCreated"] == true &&
             duplicate["ok"] == false && duplicate["active"] == true &&
+            before_session["ok"] == false && before_session["active"] == true &&
+            prompt["ok"] == true && prompt["marker"] == SMOKE_REPLY && prompt["chunkCount"] == 2 &&
+            duplicate_prompt["ok"] == false && duplicate_prompt["active"] == true &&
             close["ok"] == true && close["transportClosed"] == true && close["shutdownClean"] == true &&
             after_close["ok"] == false && after_close["active"] == false;
         let report = json!({"ok":ok,"fixtureOnly":true,"initialize":first,"newSession":second,
-            "duplicate":duplicate,"close":close,"afterClose":after_close});
+            "duplicate":duplicate,"beforeSession":before_session,"prompt":prompt,"duplicatePrompt":duplicate_prompt,"close":close,"afterClose":after_close});
         std::fs::write(evidence, serde_json::to_vec_pretty(&report).unwrap()).expect("completed evidence");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         assert!(ok, "{report}");
