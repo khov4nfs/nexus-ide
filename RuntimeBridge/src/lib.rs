@@ -73,7 +73,10 @@ fn probe(path: &Path, packages: bool, toolchains: bool, workspace_text: &str) ->
 
 // A separate process is required for each guest boot. This never boots
 // Ubuntu after Alpine in the same process.
-fn compatibility_probe(path: &Path, agy_digest: Option<&str>) -> Value {
+fn compatibility_probe(path: &Path, agy_digest: Option<&str>, request: &[u8]) -> Value {
+    if !process_probe::valid_initialize_request(request) {
+        return json!({"ok":false,"stage":"compatibility","error":"Invalid initialize-only ACP request"});
+    }
     let agy = agy_digest.is_some();
     if agy_digest.is_some_and(|d| !process_probe::agy_digest_ok(d)) {
         return json!({"ok":false,"stage":"compatibility","error":"Invalid expected AGY SHA-256"});
@@ -98,7 +101,7 @@ fn compatibility_probe(path: &Path, agy_digest: Option<&str>) -> Value {
                 if rows[0]["passed"] == true {
                     rows.push(process_probe::agy_binary_digest(&guest, &env, digest).await);
                     if rows[1]["passed"] == true {
-                        rows.push(process_probe::agy_initialize(&guest, &env).await);
+                        rows.push(process_probe::agy_initialize(&guest, &env, request).await);
                     }
                 }
             }
@@ -116,6 +119,21 @@ fn compatibility_probe(path: &Path, agy_digest: Option<&str>) -> Value {
 /// otherwise it must point to a valid expected lowercase SHA-256 string.
 #[no_mangle]
 pub unsafe extern "C" fn nexus_guest_probe_glibc(path: *const c_char, digest: *const c_char) -> *mut c_char {
+    run_glibc_bridge(path, digest, process_probe::AGY_INITIALIZE_REQUEST)
+}
+
+/// # Safety
+/// All pointers must reference valid NUL-terminated strings.
+/// Only the exact initialize request shape is accepted; no arbitrary ACP methods.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_guest_probe_glibc_acp(path: *const c_char, digest: *const c_char, request: *const c_char) -> *mut c_char {
+    if request.is_null() || digest.is_null() {
+        return CString::new(r#"{"ok":false,"error":"Missing ACP request or digest"}"#).unwrap().into_raw();
+    }
+    run_glibc_bridge(path, digest, CStr::from_ptr(request).to_bytes())
+}
+
+unsafe fn run_glibc_bridge(path: *const c_char, digest: *const c_char, request: &[u8]) -> *mut c_char {
     let report = std::panic::catch_unwind(|| {
         if path.is_null() { return json!({"ok":false,"error":"Missing rootfs"}); }
         let Ok(path) = CStr::from_ptr(path).to_str() else { return json!({"ok":false,"error":"Invalid rootfs path"}); };
@@ -125,7 +143,7 @@ pub unsafe extern "C" fn nexus_guest_probe_glibc(path: *const c_char, digest: *c
                 Err(_) => return json!({"ok":false,"error":"Invalid digest"}),
             }
         };
-        compatibility_probe(Path::new(path), sha)
+        compatibility_probe(Path::new(path), sha, request)
     }).unwrap_or_else(|_| json!({"ok":false,"error":"Runtime panic; restart app"}));
     CString::new(report.to_string()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
 }
@@ -197,7 +215,7 @@ mod tests {
         let evidence = std::env::var_os("NEXUS_GLIBC_EVIDENCE").expect("set NEXUS_GLIBC_EVIDENCE");
         let agy = std::env::var("NEXUS_TEST_AGY").as_deref() == Ok("1");
         let digest = if agy { Some(std::env::var("NEXUS_AGY_SHA256").expect("set reviewed AGY SHA-256")) } else { None };
-        let report = compatibility_probe(Path::new(&path), digest.as_deref());
+        let report = compatibility_probe(Path::new(&path), digest.as_deref(), process_probe::AGY_INITIALIZE_REQUEST);
         std::fs::write(evidence, serde_json::to_vec_pretty(&report).unwrap()).expect("write completed evidence");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         assert_eq!(report["ok"].as_bool(), Some(true), "{report}");

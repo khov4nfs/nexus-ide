@@ -396,6 +396,43 @@ pub async fn agy_binary_digest(guest: &IshInstance, env: &HashMap<String,String>
            "error":if passed { None } else { Some("Guest executable digest check failed") }})
 }
 
+pub const AGY_INITIALIZE_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{},\"clientInfo\":{\"name\":\"nexus-ios\",\"version\":\"0.3.2\"}}}\n";
+
+pub fn valid_initialize_request(bytes: &[u8]) -> bool {
+    if bytes.len() > 4096 || bytes.last() != Some(&b'\n') ||
+        bytes[..bytes.len()-1].contains(&b'\n') { return false; }
+    let Ok(frame) = serde_json::from_slice::<Value>(bytes) else { return false; };
+    let expected: Value = serde_json::from_slice(AGY_INITIALIZE_REQUEST).expect("fixed request");
+    frame == expected
+}
+
+// Project only the bounded protocol fields Swift needs. Never expose raw agent
+// notifications, authentication data, stderr or arbitrary error messages.
+fn initialize_projection(frame: &Value) -> Option<Value> {
+    if frame["jsonrpc"] != "2.0" || frame["id"] != 1 || frame.get("method").is_some() {
+        return None;
+    }
+    match (frame.get("result"), frame.get("error")) {
+        (Some(_), None) if agy_initialize_ok(frame) => {
+            let info = &frame["result"]["agentInfo"];
+            let name = info["name"].as_str()?;
+            let version = info["version"].as_str().unwrap_or("unknown");
+            if name.len() > 256 || version.len() > 256 { return None; }
+            Some(json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,
+                "agentInfo":{"name":name,"version":version}}}))
+        }
+        (None, Some(error)) => {
+            let code = error["code"].as_i64()?;
+            if !(i32::MIN as i64..=i32::MAX as i64).contains(&code) { return None; }
+            let auth = code == -32000 && error["message"].as_str()
+                .map(|s| s.eq_ignore_ascii_case("Authentication required")).unwrap_or(false);
+            Some(json!({"jsonrpc":"2.0","id":1,"error":{"code":code,
+                "message":if auth {"Authentication required"} else {"Agent rejected initialize"}}}))
+        }
+        _ => None,
+    }
+}
+
 // Do not treat arbitrary JSON or a JSON-RPC error as a successful initialize.
 fn agy_initialize_ok(frame: &Value) -> bool {
     frame["jsonrpc"] == "2.0" && frame["id"] == 1 &&
@@ -404,7 +441,7 @@ fn agy_initialize_ok(frame: &Value) -> bool {
             .map(|s| s.to_ascii_lowercase().contains("antigravity")).unwrap_or(false)
 }
 
-pub async fn agy_initialize(guest: &IshInstance, env: &HashMap<String,String>) -> Value {
+pub async fn agy_initialize(guest: &IshInstance, env: &HashMap<String,String>, request: &[u8]) -> Value {
     let name = "agy_acp_initialize";
     // Fixed guest-only path; prepared by the developer from the official
     // artifact. Never substitute a fixture or run a host binary.
@@ -421,7 +458,6 @@ pub async fn agy_initialize(guest: &IshInstance, env: &HashMap<String,String>) -
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut capture = Capture::default();
     let result: Result<Value,String> = async {
-        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{},\"clientInfo\":{\"name\":\"nexus-ios\",\"version\":\"0.3.0\"}}}\n";
         write_ready(&session, request, deadline).await?;
         let mut cursor = 0;
         loop {
@@ -432,13 +468,8 @@ pub async fn agy_initialize(guest: &IshInstance, env: &HashMap<String,String>) -
                     .map_err(|_| "non-JSON ACP stdout".to_owned())?;
                 cursor = end + 1;
                 if frame.get("id").is_some() {
-                    if !agy_initialize_ok(&frame) {
-                        return Err("AGY initialize rejected or unexpected request; no authentication or permissions granted".into());
-                    }
-                    // Keep only non-secret identity and protocol evidence.
-                    return Ok(json!({"protocolVersion":frame["result"]["protocolVersion"],
-                        "agentName":frame["result"]["agentInfo"]["name"],
-                        "agentVersion":frame["result"]["agentInfo"]["version"]}));
+                    return initialize_projection(&frame)
+                        .ok_or_else(|| "Unexpected initialize response or server request".to_owned());
                 }
                 if frame["jsonrpc"] != "2.0" || !frame["method"].is_string() {
                     return Err("Unexpected ACP notification".into());
@@ -451,8 +482,15 @@ pub async fn agy_initialize(guest: &IshInstance, env: &HashMap<String,String>) -
     let terminated = session.terminate().await.is_ok();
     let drained = drain(&session, &mut capture, Instant::now() + TIMEOUT).await.is_ok();
     match result {
-        Ok(evidence) => json!({"name":name,"passed":terminated && drained && capture.closed && capture.pty.is_empty(),
-                              "evidence":evidence,"closed":capture.closed}),
+        Ok(response) => {
+            let clean = terminated && drained && capture.closed && capture.pty.is_empty();
+            let success = response.get("result").is_some();
+            let evidence = if success { json!({"protocolVersion":response["result"]["protocolVersion"],
+                "agentName":response["result"]["agentInfo"]["name"],
+                "agentVersion":response["result"]["agentInfo"]["version"]}) } else { Value::Null };
+            json!({"name":name,"passed":clean && success,"evidence":evidence,
+                "response":response,"closed":capture.closed,"transportClean":clean})
+        },
         Err(error) => json!({"name":name,"passed":false,"error":error,"closed":capture.closed}),
     }
 }
@@ -460,6 +498,21 @@ pub async fn agy_initialize(guest: &IshInstance, env: &HashMap<String,String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_initialize_request_and_projection_fail_closed() {
+        assert!(valid_initialize_request(AGY_INITIALIZE_REQUEST));
+        assert!(!valid_initialize_request(b""));
+        assert!(!valid_initialize_request(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\"}\n"));
+        let mut two = AGY_INITIALIZE_REQUEST.to_vec();
+        two.extend_from_slice(AGY_INITIALIZE_REQUEST);
+        assert!(!valid_initialize_request(&two));
+        let error = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Authentication required","data":{"secret":"discard"}}});
+        let projected = initialize_projection(&error).unwrap();
+        assert_eq!(projected["error"]["message"], "Authentication required");
+        assert!(projected["error"].get("data").is_none());
+        assert!(initialize_projection(&json!({"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{}})).is_none());
+        assert!(initialize_projection(&json!({"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required"}})).is_none());
+    }
     #[test]
     fn compatibility_requires_glibc_and_real_agent_identity() {
         assert!(glibc_output_ok(b"aarch64\nglibc 2.39\nNEXUS_GLIBCXX_OK\n"));

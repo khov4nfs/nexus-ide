@@ -6,6 +6,7 @@ public enum ACPError: Error, Equatable { case oversizedFrame, invalidFrame, unex
 public struct ACPFramer: Sendable {
     private var pending = Data()
     private let limit: Int
+    public var hasPendingBytes: Bool { !pending.isEmpty }
     public init(maxFrameBytes: Int = 1_048_576) { limit = maxFrameBytes }
     public mutating func feed(_ chunk: Data) throws -> [Data] {
         var frames: [Data] = []
@@ -28,7 +29,7 @@ public struct ACPFramer: Sendable {
 /// Typed JSON-RPC request encoder; transport and response dispatch are separate work.
 public enum ACPRequest {
     public static func initialize(id: Int) throws -> Data {
-        try encode(id: id, method: "initialize", params: ["protocolVersion": 1, "clientCapabilities": [:], "clientInfo": ["name": "nexus-ios", "version": "0.1.0"]])
+        try encode(id: id, method: "initialize", params: ["protocolVersion": 1, "clientCapabilities": [:], "clientInfo": ["name": "nexus-ios", "version": "0.3.2"]])
     }
     public static func newSession(id: Int, cwd: String) throws -> Data {
         try encode(id: id, method: "session/new", params: ["cwd": cwd, "mcpServers": []])
