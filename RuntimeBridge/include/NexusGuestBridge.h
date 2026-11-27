@@ -40,6 +40,9 @@ char *nexus_acp_close(void);
 char *nexus_local_run(const char *rootfs_data_path, uint8_t mode, const char *input);
 char *nexus_local_progress(void);
 char *nexus_local_input(const char *input);
+// Bounded raw bytes, monotonic absolute cursor, explicit gap on truncation.
+char *nexus_local_terminal_delta(uint64_t cursor);
+char *nexus_local_terminal_input(const char *base64_bytes);
 char *nexus_local_resize(uint16_t cols, uint16_t rows);
 char *nexus_local_stop(void);
 void nexus_guest_free(char *result);

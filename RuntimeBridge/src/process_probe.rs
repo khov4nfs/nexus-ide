@@ -17,6 +17,7 @@ struct Capture {
     pty: Vec<u8>,
     rolling_pty: bool,
     truncated_pty: bool,
+    pty_total: u64,
     closed: bool,
     exited: bool,
     code: Option<i32>,
@@ -34,6 +35,7 @@ impl Capture {
             if skip > 0 || remove > 0 { self.truncated_pty = true; }
             self.pty.drain(..remove);
             self.pty.extend_from_slice(tail);
+            self.pty_total = self.pty_total.checked_add(data.len() as u64).ok_or("PTY cursor overflow")?;
             self.cursor = seq;
             return Ok(());
         }
@@ -733,13 +735,13 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
             capture.poll(&session, deadline).await?;
             // A stopped or failed process may have descendants. Only a clean
             // guest shutdown is final evidence of cleanup.
-            if !workbench { publish_output(&capture.pty, !capture.exited && !capture.closed, capture.truncated_pty); }
+            if !workbench { publish_output(&capture.pty, !capture.exited && !capture.closed, capture.truncated_pty, capture.pty_total); }
             else {
                 // Do not expose the server URL/token. Only a matching bind log
                 // from the reviewed process permits the native loopback view.
                 let bound = contains(&capture.stdout,b"Server bound to 127.0.0.1:18765") ||
                     contains(&capture.stderr,b"Server bound to 127.0.0.1:18765");
-                publish_output(&[], bound && !capture.exited && !capture.closed, false);
+                publish_output(&[], bound && !capture.exited && !capture.closed, false, 0);
             }
             if capture.closed { break; }
         }
@@ -749,6 +751,7 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
         let _ = session.terminate().await;
         let _ = drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
     }
+    if !workbench { publish_output(&capture.pty,false,capture.truncated_pty,capture.pty_total); }
     json!({"ok":result.is_ok() && capture.closed && capture.exited,
         "stopped":stopped,"exitCode":capture.code,"termSignal":capture.signal,"outputTruncated":capture.truncated_pty,
         "closed":capture.closed,"error":if result.is_err() { Some("Local process deadline, output limit or transport failure") } else { None }})

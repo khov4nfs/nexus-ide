@@ -97,6 +97,8 @@ def verify(path, variant):
         if has_guest != (variant != "native"):
             raise ValueError("Incorrect embedded guest assets")
         if has_guest:
+            if not z.read(prefix+'SwiftTerm-LICENSE.txt').strip(): raise ValueError('Missing SwiftTerm license')
+            if b'version=v1.19.0\ncommit=464df52' not in z.read(prefix+'SwiftTerm-provenance.txt'): raise ValueError('Missing SwiftTerm provenance')
             if slot not in names:
                 raise ValueError("Missing AGY import slot")
             with z.open(guest+"meta.db") as db:

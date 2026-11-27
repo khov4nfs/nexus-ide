@@ -5,18 +5,26 @@ options:
 packages:
   NexusCore:
     path: .
+  SwiftTerm:
+    path: Vendor/SwiftTerm
 targets:
   NexusIDEUbuntuLab:
     type: application
     platform: iOS
     sources:
       - App
+      - path: RuntimeAssets/SwiftTerm-LICENSE.txt
+        buildPhase: resources
+      - path: RuntimeAssets/SwiftTerm-provenance.txt
+        buildPhase: resources
       - path: RuntimeAssets/ubuntu-fs
         type: folder
         buildPhase: resources
     dependencies:
       - package: NexusCore
         product: NexusCore
+      - package: SwiftTerm
+        product: SwiftTerm
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.nexuside.ubuntu.lab

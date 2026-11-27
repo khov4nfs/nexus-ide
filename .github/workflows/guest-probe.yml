@@ -33,6 +33,8 @@ on:
       - 'scripts/test-workbench-import.py'
       - 'scripts/test-agy-import.py'
       - 'scripts/stage-ubuntu-device.sh'
+      - 'scripts/prepare-swiftterm.sh'
+      - 'App/LiveTerminal.swift'
       - 'project-glibc.yml'
       - 'App/UbuntuLabApp.swift'
       - 'App/NexusApp.swift'
@@ -205,7 +207,7 @@ jobs:
             if [ "$mode" = mcp ]; then export NEXUS_LOCAL_MCP=1; fi
             if [ "$mode" = call ]; then export NEXUS_LOCAL_CALL=1; fi
             cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_local_job -- --ignored --nocapture --test-threads=1
-            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["shutdownClean"] is True; assert (r["ptyVerified"] is True and r["exitCode"] == 0) if sys.argv[2]=="pty" else (r["tools"]==["fixture_echo"] and r["transportClosed"] is True and ((r["discoveryOnly"] is True) if sys.argv[2]=="mcp" else (r["discoveryOnly"] is False and r["calledTool"]=="fixture_echo" and r["text"]=="NEXUS_MCP_42")))' "$NEXUS_LOCAL_EVIDENCE" "$mode"
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["shutdownClean"] is True; assert (r["ptyVerified"] is True and r["rawPtyVerified"] is True and r["exitCode"] == 0) if sys.argv[2]=="pty" else (r["tools"]==["fixture_echo"] and r["transportClosed"] is True and ((r["discoveryOnly"] is True) if sys.argv[2]=="mcp" else (r["discoveryOnly"] is False and r["calledTool"]=="fixture_echo" and r["text"]=="NEXUS_MCP_42")))' "$NEXUS_LOCAL_EVIDENCE" "$mode"
           done
       - name: Upload local job evidence
         if: always()
