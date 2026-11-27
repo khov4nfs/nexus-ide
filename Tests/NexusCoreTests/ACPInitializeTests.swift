@@ -40,6 +40,16 @@ final class ACPInitializeTests: XCTestCase {
         XCTAssertNil(caps["terminal"])
     }
 
+    func testTerminalCapabilityIsOptIn() throws {
+        var client = ACPInitializeClient()
+        let request = try client.request(terminal: true)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: request) as? [String: Any])
+        let params = try XCTUnwrap(object["params"] as? [String: Any])
+        let caps = try XCTUnwrap(params["clientCapabilities"] as? [String: Any])
+        XCTAssertEqual(caps["terminal"] as? Bool, true)
+        XCTAssertNil(caps["fs"])
+    }
+
     func testAuthenticationIsNotSuccess() throws {
         var client = ACPInitializeClient()
         _ = try client.request()

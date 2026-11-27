@@ -28,8 +28,9 @@ public struct ACPFramer: Sendable {
 
 /// Typed JSON-RPC request encoder; transport and response dispatch are separate work.
 public enum ACPRequest {
-    public static func initialize(id: Int, readSnapshot: Bool = false, writeSnapshot: Bool = false) throws -> Data {
-        let capabilities: [String: Any] = (readSnapshot || writeSnapshot) ? ["fs": ["readTextFile": true, "writeTextFile": writeSnapshot]] : [:]
+    public static func initialize(id: Int, readSnapshot: Bool = false, writeSnapshot: Bool = false, terminal: Bool = false) throws -> Data {
+        var capabilities: [String: Any] = (readSnapshot || writeSnapshot) ? ["fs": ["readTextFile": true, "writeTextFile": writeSnapshot]] : [:]
+        if terminal { capabilities["terminal"] = true }
         return try encode(id: id, method: "initialize", params: ["protocolVersion": 1, "clientCapabilities": capabilities, "clientInfo": ["name": "nexus-ios", "version": "0.3.2"]])
     }
     public static func newSession(id: Int, cwd: String) throws -> Data {

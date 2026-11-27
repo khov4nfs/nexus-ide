@@ -19,6 +19,40 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture-%s"}}\n' "$$"
 IFS= read -r third
 case "$third" in *'"method":"session/prompt"'*) ;; *) exit 54 ;; esac
 case "$third" in *'"sessionId":"fixture-'$$'"'*) ;; *) exit 55 ;; esac
+if [ "${NEXUS_FIXTURE_TERMINAL:-0}" = 1 ]; then
+    case "$first" in *'"terminal":true'*) ;; *) exit 101 ;; esac
+    printf '{"jsonrpc":"2.0","id":80,"method":"terminal/create","params":{"sessionId":"fixture-%s","command":"uname","args":["-m"]}}\n' "$$"
+    IFS= read -r got
+    case "$got" in *'"error":'*'"id":80'*) ;; *) exit 102 ;; esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"DENIED"}}}}\n' "$$"
+    printf '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}\n'
+    IFS= read -r fourth
+    case "$fourth" in *'"id":4'*'Run uname -m'*) ;; *) exit 103 ;; esac
+    printf '{"jsonrpc":"2.0","id":81,"method":"terminal/create","params":{"sessionId":"fixture-%s","command":"uname","args":["-a"]}}\n' "$$"
+    IFS= read -r got
+    case "$got" in *'"error":'*'"id":81'*) ;; *) exit 104 ;; esac
+    printf '{"jsonrpc":"2.0","id":82,"method":"terminal/create","params":{"sessionId":"fixture-%s","command":"uname","args":["-m"]}}\n' "$$"
+    IFS= read -r got
+    case "$got" in *'"id":82'*'"terminalId":"nexus-term-4"'*) ;; *) exit 105 ;; esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"tool_call","toolCallId":"term-call","status":"in_progress"}}}\n' "$$"
+    printf '{"jsonrpc":"2.0","id":83,"method":"terminal/wait_for_exit","params":{"sessionId":"fixture-%s","terminalId":"nexus-term-4"}}\n' "$$"
+    IFS= read -r got
+    case "$got" in *'"id":83'*'"exitCode":0'*) ;; *) exit 106 ;; esac
+    printf '{"jsonrpc":"2.0","id":84,"method":"terminal/output","params":{"sessionId":"fixture-%s","terminalId":"nexus-term-4"}}\n' "$$"
+    IFS= read -r got
+    case "$got" in *'"id":84'*'"output":"aarch64'*) ;; *) exit 107 ;; esac
+    printf '{"jsonrpc":"2.0","id":85,"method":"terminal/release","params":{"sessionId":"fixture-%s","terminalId":"nexus-term-4"}}\n' "$$"
+    IFS= read -r got
+    case "$got" in *'"id":85'*'"result":{}'*) ;; *) exit 108 ;; esac
+    printf '{"jsonrpc":"2.0","id":86,"method":"terminal/output","params":{"sessionId":"fixture-%s","terminalId":"nexus-term-4"}}\n' "$$"
+    IFS= read -r got
+    case "$got" in *'"error":'*'"id":86'*) ;; *) exit 109 ;; esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"tool_call_update","toolCallId":"term-call","status":"completed"}}}\n' "$$"
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"NEXUS_TERMINAL_OK"}}}}\n' "$$"
+    printf '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}\n'
+    IFS= read -r unexpected
+    exit 110
+fi
 if [ "${NEXUS_FIXTURE_SNAPSHOT:-0}" = 1 ]; then
     case "$first" in *'"readTextFile":true'*) ;; *) exit 91 ;; esac
     printf '{"jsonrpc":"2.0","id":90,"method":"fs/read_text_file","params":{"sessionId":"fixture-%s","path":"/etc/passwd"}}\n' "$$"
@@ -27,17 +61,17 @@ if [ "${NEXUS_FIXTURE_SNAPSHOT:-0}" = 1 ]; then
     printf '{"jsonrpc":"2.0","id":91,"method":"fs/read_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt","line":2,"limit":1}}\n' "$$"
     IFS= read -r got
     case "$got" in *'"id":91'*'"content":"forty-two"'*) ;; *) exit 93 ;; esac
-    printf '{"jsonrpc":"2.0","id":92,"method":"fs/write_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt","content":"denied"}}\n' "$"
+    printf '{"jsonrpc":"2.0","id":92,"method":"fs/write_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt","content":"denied"}}\n' "$$"
     IFS= read -r denied
     case "$denied" in *'"error":'*'"id":92'*) ;; *) exit 95 ;; esac
-    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"NEXUS_SNAPSHOT_OK"}}}}\n' "$"
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"NEXUS_SNAPSHOT_OK"}}}}\n' "$$"
     printf '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}\n'
     IFS= read -r edit
     case "$edit" in *'"id":4'*'Stage replacement'*) ;; *) exit 96 ;; esac
-    printf '{"jsonrpc":"2.0","id":93,"method":"fs/write_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt","content":"updated"}}\n' "$"
+    printf '{"jsonrpc":"2.0","id":93,"method":"fs/write_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt","content":"updated"}}\n' "$$"
     IFS= read -r got
     case "$got" in *'"id":93'*'"result":{}'*) ;; *) exit 97 ;; esac
-    printf '{"jsonrpc":"2.0","id":94,"method":"fs/read_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt"}}\n' "$"
+    printf '{"jsonrpc":"2.0","id":94,"method":"fs/read_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt"}}\n' "$$"
     IFS= read -r got
     case "$got" in *'"id":94'*'"content":"updated"'*) ;; *) exit 98 ;; esac
     printf '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}\n'
