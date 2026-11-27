@@ -34,5 +34,15 @@ jobs:
           retention-days: 7
       - name: Unsigned ARM64 device build
         run: xcodebuild -project NexusIDEGuest.xcodeproj -scheme NexusIDEGuest -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
+      - name: Real guest process tests on macOS build host
+        env:
+          NEXUS_TEST_ROOTFS: ${{ github.workspace }}/Vendor/litter-ish/build/fs/data
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_guest_process_probe -- --ignored --nocapture --test-threads=1
       - name: Record scope
-        run: echo "Cross-build only; no guest boot or physical-device validation. No linked binary distributed."
+        run: echo "Unsigned iOS cross-build and separate macOS guest execution test; physical iPhone validation still required. No linked binary distributed."

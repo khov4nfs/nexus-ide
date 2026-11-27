@@ -15,8 +15,8 @@ struct GuestProbeView: View {
                     Text("Runtime linked into this app. Device execution is not verified until the checks below pass.")
                     Button("Run trusted guest smoke test") { confirm = true }
                         .disabled(attempted || running)
-                    if running { ProgressView("Booting guest… keep the app open") }
-                    Text("One attempt per app process. No custom commands, secrets, or untrusted packages.")
+                    if running { ProgressView("Running guest process checks… keep the app open") }
+                    Text("Checks: ARM64, stdout, exit status, separate streams, stdin, PTY resize and cancellation. One attempt per app process. No custom commands or secrets.")
 #else
                     Text("Guest runtime is not linked in this build.")
                     Text("Build the separate NexusIDEGuest device target using the pinned upstream build script. No remote fallback.")

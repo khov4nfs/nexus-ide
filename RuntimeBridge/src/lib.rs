@@ -1,5 +1,6 @@
 //! Experimental in-process guest smoke probe, not an isolation boundary.
 use ish_embed_host::IshInstance;
+mod process_probe;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
@@ -42,7 +43,12 @@ fn probe(path: &Path) -> Value {
         rows.push(json!({"name":name,"exitCode":code,"output":text.chars().take(4096).collect::<String>(),"passed":passed}));
     }
     let shutdown = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-        Ok(rt) => rt.block_on(guest.shutdown()).map_err(|e| e.to_string()),
+        Ok(rt) => rt.block_on(async {
+            let process_rows = process_probe::run(&guest, &env).await;
+            ok &= process_rows.iter().all(|row| row["passed"].as_bool() == Some(true));
+            rows.extend(process_rows);
+            guest.shutdown().await.map_err(|e| e.to_string())
+        }),
         Err(e) => Err(e.to_string()),
     };
     ok &= shutdown.is_ok();
@@ -71,4 +77,20 @@ pub unsafe extern "C" fn nexus_guest_probe(path: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn nexus_guest_free(result: *mut c_char) {
     if !result.is_null() { drop(CString::from_raw(result)); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Explicit opt-in host execution gate, never a silent pass without rootfs.
+    #[test]
+    #[ignore = "requires freshly generated trusted ARM64 fakefs"]
+    fn real_guest_process_probe() {
+        let path = std::env::var_os("NEXUS_TEST_ROOTFS").expect("set NEXUS_TEST_ROOTFS to fakefs/data");
+        let report = probe(Path::new(&path));
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        assert_eq!(report["ok"].as_bool(), Some(true), "{report}");
+        assert_eq!(report["checks"].as_array().map(Vec::len), Some(6));
+    }
 }
