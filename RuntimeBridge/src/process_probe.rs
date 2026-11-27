@@ -474,9 +474,27 @@ pub(crate) async fn prepare_gemini_provider(guest: &IshInstance, env: &HashMap<S
     let script = r#"
 set -eu
 umask 077
-test ! -e /root/.gemini
-mkdir -p /root/.gemini/antigravity-cli
-printf '%s\n' '{"modelProvider":"gemini"}' > /root/.gemini/antigravity-cli/settings.json
+# Fresh guest: create only the known provider config. Reopened guest:
+# accept identical config, never overwrite changed files or follow symlinks.
+base=/root/.gemini
+dir="$base/antigravity-cli"
+settings="$dir/settings.json"
+test ! -L /root
+test ! -L "$base"
+test ! -L "$dir"
+test ! -L "$settings"
+if [ -e "$base" ]; then
+    test -d "$base"
+    test -d "$dir"
+    test -f "$settings"
+    test "$(wc -c < "$settings")" -le 8192
+    expected=$(printf '%s\n' '{"modelProvider":"gemini"}' | /usr/bin/sha256sum)
+    actual=$(/usr/bin/sha256sum "$settings")
+    test "${expected%% *}" = "${actual%% *}"
+else
+    mkdir -p "$dir"
+    (set -C; printf '%s\n' '{"modelProvider":"gemini"}' > "$settings")
+fi
 "#;
     let mut opts = shell(script, env);
     opts.pipe_stdin = false;

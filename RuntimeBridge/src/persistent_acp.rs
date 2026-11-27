@@ -1016,7 +1016,8 @@ mod tests {
         let evidence=std::env::var_os("NEXUS_ACP_EVIDENCE").expect("evidence");
         let phase=std::env::var("NEXUS_ACP_RESUME_PHASE").expect("phase");
         let init=start(PathBuf::from(path),Mode::Fixture,process_probe::AGY_INITIALIZE_REQUEST.to_vec(),Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()),false);
-        assert_eq!(init["supportsLoad"],true);
+        assert_eq!(init["ok"],true,"fixture startup failed in {phase}: {init}");
+        assert_eq!(init["supportsLoad"],true,"fixture load capability missing in {phase}");
         let r=if phase=="create"{command(Action::New(NEW_REQUEST.to_vec()))}else{command(Action::Load("fixture-resume".into()))};
         let no_replay=prompt_progress()["text"]=="";
         let prompt=command(Action::Chat("Continue fixture".into()));
