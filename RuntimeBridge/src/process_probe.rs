@@ -121,7 +121,7 @@ async fn streams(guest: &IshInstance, env: &HashMap<String,String>) -> Result<Va
     result
 }
 async fn terminal(guest: &IshInstance, env: &HashMap<String,String>) -> Result<Value,String> {
-    let mut opts = shell("printf 'NEXUS_PTY_READY\\n'; IFS= read -r line || exit 8; stty size",env);
+    let mut opts = shell("printf 'NEXUS_PTY_READY\\n'; IFS= read -r line || exit 8; stty size && printf 'NEXUS_PTY_TAIL\\n'",env);
     opts.tty = true;
     opts.pipe_stdin = false;
     opts.size = Some(PtySize{cols:80,rows:24});
@@ -134,7 +134,8 @@ async fn terminal(guest: &IshInstance, env: &HashMap<String,String>) -> Result<V
         write_ready(&session,b"go\n",deadline).await?;
         drain(&session,&mut capture,deadline).await?;
         if capture.code != Some(0) || capture.signal.unwrap_or(0) != 0 ||
-            !String::from_utf8_lossy(&capture.pty).lines().any(|line| line.trim()=="33 111") {
+            !String::from_utf8_lossy(&capture.pty).lines().any(|line| line.trim()=="33 111") ||
+            !contains(&capture.pty,b"NEXUS_PTY_TAIL") {
             return Err(format!("PTY resize mismatch: {}",capture.evidence()));
         }
         Ok(capture.evidence())

@@ -80,6 +80,16 @@
         ".filter(|(_, s)| s.eof && s.exited_announced)",
         ".filter(|(_, s)| s.eof && s.stderr_eof && s.exited_announced)"
       ]
+    ],
+    "fs/tty.c": [
+      [
+        "    if (tty->hung_up || pty_is_half_closed_master(tty)) {\n        unlock(&pids_lock);\n        goto error;\n    }",
+        "    // Linux PTY masters may still have unread output after slave close.\n    // Drain it before EIO; returning zero here loses the final command output.\n    if ((tty->hung_up || pty_is_half_closed_master(tty)) &&\n            !(tty->driver == &pty_master && tty->bufsize > 0)) {\n        unlock(&pids_lock);\n        err = _EIO;\n        goto error;\n    }"
+      ],
+      [
+        "        while (tty->bufsize < min) {\n            err = _EIO;\n            if (pty_is_half_closed_master(tty))\n                goto error;",
+        "        while (tty->bufsize < min) {\n            err = _EIO;\n            if (tty->hung_up || pty_is_half_closed_master(tty)) {\n                // The master is noncanonical; preserve even a short tail.\n                if (tty->driver == &pty_master && tty->bufsize > 0)\n                    break;\n                goto error;\n            }"
+      ]
     ]
   }
 }

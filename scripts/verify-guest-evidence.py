@@ -19,6 +19,6 @@ for row, code, marker in zip(rows[:3], [0,0,7], ["aarch64","NEXUS_GUEST_OK","NEX
 stdio, pty, cancel = [row["evidence"] for row in rows[3:]]
 require(all(e.get("closed") is True for e in (stdio,pty,cancel)), "Process not closed")
 require(stdio.get("exitCode") == 0 and "reply:nexus-ping" in stdio.get("stdout","") and "NEXUS_OUT_READY" in stdio.get("stdout","") and "NEXUS_ERR_READY" in stdio.get("stderr","") and "NEXUS_ERR_READY" not in stdio.get("stdout","") and "NEXUS_OUT_READY" not in stdio.get("stderr",""), "Invalid stdio evidence")
-require(pty.get("exitCode") == 0 and any(line.strip()=="33 111" for line in pty.get("pty","").splitlines()), "Invalid PTY evidence")
+require(pty.get("exitCode") == 0 and any(line.strip()=="33 111" for line in pty.get("pty","").splitlines()) and "NEXUS_PTY_TAIL" in pty.get("pty",""), "Invalid PTY evidence")
 require(cancel.get("termSignal") == 9, "Invalid cancellation evidence")
 print("All six guest checks and shutdown verified from completed evidence")
