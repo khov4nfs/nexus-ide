@@ -755,13 +755,17 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
 }
 
 pub(crate) async fn mcp_discover(guest: &IshInstance, env: &HashMap<String,String>, command: &str) -> Value {
+    mcp_job(guest,env,command,None).await
+}
+
+pub(crate) async fn mcp_job(guest: &IshInstance, env: &HashMap<String,String>, command: &str, call: Option<(&str,&Value)>) -> Value {
     let mut opts = shell(command, env);
     opts.cwd = Some(Path::new("/tmp").to_path_buf());
     let session = match guest.spawn(opts) {
         Ok(s) => s, Err(_) => return json!({"ok":false,"error":"MCP process spawn failed"}),
     };
     let mut exchange = ACPExchange::new(session);
-    let result: Result<Vec<String>,String> = async {
+    let result: Result<Value,String> = async {
         let init = exchange.request(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"nexus-ios\",\"version\":\"0.4.1\"}}}\n",1).await?;
         if init.get("error").is_some() || init["result"]["protocolVersion"] != "2025-11-25" ||
             !init["result"]["capabilities"]["tools"].is_object() {
@@ -782,12 +786,39 @@ pub(crate) async fn mcp_discover(guest: &IshInstance, env: &HashMap<String,Strin
             }
             names.push(name.to_owned());
         }
-        Ok(names)
+        if let Some((name,args)) = call {
+            if !names.iter().any(|n| n == name) { return Err("Tool not advertised".into()); }
+            let request=json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":name,"arguments":args}});
+            let frame=exchange.request(format!("{request}\n").as_bytes(),3).await?;
+            let r=&frame["result"];
+            if frame.get("error").is_some() || !r.is_object() ||
+                r.get("isError").is_some_and(|v| !v.is_boolean()) {
+                return Err("Tool call rejected".into());
+            }
+            let blocks=r["content"].as_array().filter(|a| a.len()<=16).ok_or("Invalid content")?;
+            let mut text=String::new();
+            for block in blocks {
+                if block["type"]!="text" { return Err("Unsupported tool content".into()); }
+                let value=block["text"].as_str().ok_or("Invalid text content")?;
+                if text.len()+value.len()+1>8192 || value.chars().any(|c| c.is_control() && c!='\n' && c!='\t') {
+                    return Err("Tool output limit or control characters".into());
+                }
+                if !text.is_empty() {text.push('\n');}
+                text.push_str(value);
+            }
+            let is_error=r["isError"]==true;
+            Ok(json!({"ok":!is_error,"tools":names,"discoveryOnly":false,"calledTool":name,"toolError":is_error,"text":text}))
+        } else { Ok(json!({"ok":true,"tools":names,"discoveryOnly":true})) }
     }.await;
     let closed = exchange.close().await;
     match result {
-        Ok(names) => json!({"ok":closed,"transportClosed":closed,"protocolVersion":"2025-11-25","tools":names,"discoveryOnly":true}),
-        Err(_) => json!({"ok":false,"transportClosed":closed,"error":"MCP discovery rejected or incomplete"}),
+        Ok(mut report) => {
+            report["ok"]=json!(report["ok"]==true && closed);
+            report["transportClosed"]=json!(closed);
+            report["protocolVersion"]=json!("2025-11-25");
+            report
+        },
+        Err(_) => json!({"ok":false,"transportClosed":closed,"error":"MCP request rejected or incomplete; tool may already have executed"}),
     }
 }
 

@@ -16,6 +16,16 @@ static STATE: Mutex<State> = Mutex::new(State {
 const WORKBENCH: &str = "umask 077; mkdir -p /tmp/nexus-workbench /tmp/nexus-vscode-data /tmp/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /tmp/nexus-vscode-data --extensions-dir /tmp/nexus-vscode-extensions /tmp/nexus-workbench";
 fn fail(message: &str) -> Value { json!({"ok":false,"error":message}) }
 fn valid_command(s: &str) -> bool { !s.trim().is_empty() && s.len() <= 2048 && !s.contains('\0') }
+fn parse_call(input:&str)->Option<Value> {
+    if input.len()>8192 {return None;}
+    let value:Value=serde_json::from_str(input).ok()?;
+    let obj=value.as_object()?;
+    if obj.len()!=3 || !valid_command(obj.get("command")?.as_str()?) {return None;}
+    let name=obj.get("name")?.as_str()?;
+    if name.is_empty() || name.len()>128 || !name.bytes().all(|b|b.is_ascii_alphanumeric()||b"_.-".contains(&b)) {return None;}
+    if !obj.get("arguments")?.is_object() || obj["arguments"].to_string().len()>4096 {return None;}
+    Some(value)
+}
 fn valid_token(s: &str) -> bool { s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) }
 fn progress() -> Value {
     STATE.lock().map(|s| json!({"ok":true,"running":s.running,"ready":s.ready,"output":s.output,"stopRequested":s.stop}))
@@ -37,7 +47,7 @@ pub(crate) fn take_control() -> Vec<Control> {
 }
 fn enqueue(control: Control) -> Value {
     let Ok(mut s) = STATE.lock() else { return fail("Local control unavailable"); };
-    if !s.running || s.stop || s.mode == 2 { return fail("No controllable local process"); }
+    if !s.running || s.stop || matches!(s.mode,2|4) { return fail("No controllable local process"); }
     match control {
         Control::Stop => { s.stop = true; s.controls.clear(); s.controls.push_back(Control::Stop); }
         c if s.mode == 1 && s.ready && s.controls.len() < 8 => s.controls.push_back(c),
@@ -52,8 +62,9 @@ impl Drop for Guard {
     }
 }
 fn run(path: &Path, mode: u8, input: &str) -> Value {
-    if !matches!(mode,1..=3) || (mode == 3 && !valid_token(input)) ||
-        (mode != 3 && !valid_command(input)) { return fail("Invalid local job"); }
+    let call=if mode==4 {match parse_call(input) {Some(v)=>Some(v),None=>return fail("Invalid MCP call")}} else {None};
+    if !matches!(mode,1..=4) || (mode == 3 && !valid_token(input)) ||
+        (matches!(mode,1|2) && !valid_command(input)) { return fail("Invalid local job"); }
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
     }
@@ -78,6 +89,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         ("TERM".into(),"dumb".into()),("NODE_OPTIONS".into(),"--jitless".into())]);
     let libc = rt.block_on(process_probe::glibc_compat(&guest,&env));
     let mut result = if libc["passed"] != true { fail("Ubuntu compatibility failed") }
+        else if let Some(call)=call.as_ref() {rt.block_on(process_probe::mcp_job(&guest,&env,call["command"].as_str().unwrap(),Some((call["name"].as_str().unwrap(),&call["arguments"]))))}
         else if mode == 2 { rt.block_on(process_probe::mcp_discover(&guest,&env,input)) }
         else {
             if mode == 3 { env.insert("NEXUS_WORKBENCH_TOKEN".into(),input.into()); }
@@ -132,6 +144,9 @@ mod tests {
         assert!(!valid_command(&"x".repeat(2049)));
         assert!(valid_token(&"a".repeat(64)));
         assert!(!valid_token("token"));
+        assert!(parse_call(r#"{"command":"exec server","name":"echo","arguments":{}}"#).is_some());
+        assert!(parse_call(r#"{"command":"exec server","name":"echo","arguments":[]}"#).is_none());
+        assert!(parse_call(r#"{"command":"exec server","name":"echo","arguments":{},"extra":true}"#).is_none());
     }
     #[test]
     #[ignore = "requires separate process per persisted guest boot"]
@@ -159,7 +174,12 @@ mod tests {
         let path = std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("local rootfs");
         let report = std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("local evidence");
         let mcp = std::env::var("NEXUS_LOCAL_MCP").as_deref() == Ok("1");
-        let result = if mcp {
+        let call = std::env::var("NEXUS_LOCAL_CALL").as_deref() == Ok("1");
+        let result = if call {
+            let cmd=format!("NEXUS_FIXTURE_CALL=1; export NEXUS_FIXTURE_CALL\n{}",include_str!("../fixtures/mcp-discovery.sh"));
+            let wire=json!({"command":cmd,"name":"fixture_echo","arguments":{"value":42}}).to_string();
+            run(Path::new(&path),4,&wire)
+        } else if mcp {
             run(Path::new(&path),2,include_str!("../fixtures/mcp-discovery.sh"))
         } else {
             let worker = std::thread::spawn(move || run(Path::new(&path),1,
@@ -184,6 +204,7 @@ mod tests {
         println!("{result}");
         assert_eq!(result["ok"],true);
         assert_eq!(result["shutdownClean"],true);
-        if mcp { assert_eq!(result["tools"],json!(["fixture_echo"])); }
+        if mcp || call { assert_eq!(result["tools"],json!(["fixture_echo"])); }
+        if call { assert_eq!(result["calledTool"],"fixture_echo"); assert_eq!(result["text"],"NEXUS_MCP_42"); assert_eq!(result["discoveryOnly"],false); }
     }
 }

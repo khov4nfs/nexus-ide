@@ -9,5 +9,10 @@ case "$ack" in *'"method":"notifications/initialized"'*) ;; *) exit 82 ;; esac
 IFS= read -r list
 case "$list" in *'"method":"tools/list"'*) ;; *) exit 83 ;; esac
 printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"fixture_echo","inputSchema":{"type":"object"}}]}}\n'
+if [ "${NEXUS_FIXTURE_CALL:-0}" = 1 ]; then
+    IFS= read -r call
+    case "$call" in *'"method":"tools/call"'*'"arguments":{"value":42}'*'"name":"fixture_echo"'*) ;; *) exit 85 ;; esac
+    printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"NEXUS_MCP_42"}],"isError":false}}\n'
+fi
 IFS= read -r unexpected
 exit 84

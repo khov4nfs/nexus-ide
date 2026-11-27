@@ -14,6 +14,8 @@ struct LocalToolsView: View {
     @State private var frozenKeep = false
     @State private var confirmReset = false
     @State private var command = "exec /bin/sh -i"
+    @State private var toolName = ""
+    @State private var toolArguments = "{}"
     @State private var line = ""
     @State private var running = false
     @State private var ready = false
@@ -38,6 +40,7 @@ struct LocalToolsView: View {
                     Picker("Mode", selection: $mode) {
                         Text("PTY terminal").tag(UInt8(1))
                         Text("MCP discovery").tag(UInt8(2))
+                        Text("MCP manual call").tag(UInt8(4))
                         Text("OpenVSCode").tag(UInt8(3))
                     }.disabled(model.guestClaimed)
                     if mode != 3 {
@@ -46,6 +49,12 @@ struct LocalToolsView: View {
                             .textInputAutocapitalization(.never).disabled(model.guestClaimed)
                         Button("Import manual tool profile") { manifestPicker = true }.disabled(model.guestClaimed)
                         if !manifestName.isEmpty { Text(manifestName).font(.caption) }
+                        if mode == 4 {
+                            TextField("Exact advertised tool name", text: $toolName).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
+                            Text("JSON arguments (object only)").font(.caption)
+                            TerminalInput(text: $toolArguments).frame(minHeight: 84, maxHeight: 140).disabled(model.guestClaimed)
+                            Text("One explicitly reviewed call. Server may perform side effects; do not enter secrets. No automatic agent grants.").font(.caption)
+                        }
                     } else {
                         Text(stagedWorkbench ? "Pinned workbench archive staged; runtime unverified." : "No workbench staged. See build instructions.")
                         Text("Separate guest workspace, not native Files. Token-protected loopback only.").font(.caption)
@@ -58,12 +67,21 @@ struct LocalToolsView: View {
                     Button("Review and start local job") {
                         frozenKeep = keepGuest && mode != 3
                         frozenMode = mode
-                        frozenInput = command
+                        if mode == 4 {
+                            guard let args = try? JSONSerialization.jsonObject(with: Data(toolArguments.utf8)) as? [String: Any],
+                                  let wire = try? JSONSerialization.data(withJSONObject: ["command":command,"name":toolName,"arguments":args],options:[.sortedKeys]),
+                                  wire.count <= 8192, toolArguments.utf8.count <= 4096,
+                                  !toolName.isEmpty, toolName.utf8.count <= 128,
+                                  toolName.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45,46,95].contains($0) }) else {
+                                report = "Invalid tool name or JSON object"; return
+                            }
+                            frozenInput = String(decoding: wire,as: UTF8.self)
+                        } else { frozenInput = command }
                         confirm = true
                     }.disabled(model.guestClaimed || (mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
                     Text("No provider key or native workspace injected. Commands and extensions may use the network and are not sandboxed. Restart app for another boot.").font(.caption)
                 }
-                if running && frozenMode != 2 {
+                if running && frozenMode != 2 && frozenMode != 4 {
                     Section("Process controls") {
                         if frozenMode == 1 {
                             Text("Paste commands on separate lines. Smart quotes and dashes are disabled.").font(.caption)
@@ -97,7 +115,7 @@ struct LocalToolsView: View {
                     Text(verbatim: report).font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
                 }
                 Section("Unavailable until verified") {
-                    Text("ACP native tool grants, automatic hooks, extension compatibility, additional agent harnesses and Docker VM remain disabled.")
+                    Text("Manual MCP calls are separate from the agent. ACP native tool grants, automatic hooks, extension compatibility, additional agent harnesses and Docker VM remain disabled.")
                 }
             }
             .navigationTitle("Local tools")
@@ -124,7 +142,7 @@ struct LocalToolsView: View {
                 Button("Start") { start() }
                 Button("Cancel", role: .cancel) { frozenInput = "" }
             } message: {
-                Text(frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
             .task(id: running) {
                 while running && !Task.isCancelled {
