@@ -6,6 +6,7 @@ public enum ACPError: Error, Equatable { case oversizedFrame, invalidFrame, unex
 public struct ACPFramer: Sendable {
     private var pending = Data()
     private let limit: Int
+    public var hasPendingBytes: Bool { !pending.isEmpty }
     public init(maxFrameBytes: Int = 1_048_576) { limit = maxFrameBytes }
     public mutating func feed(_ chunk: Data) throws -> [Data] {
         var frames: [Data] = []

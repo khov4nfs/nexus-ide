@@ -40,6 +40,11 @@ final class ACPInitializeTests: XCTestCase {
             XCTAssertThrowsError(try client.receive(Data(response.utf8) + Data([10])))
             XCTAssertEqual(client.state, .failed)
         }
+        var trailing = ACPInitializeClient()
+        _ = try trailing.request()
+        let complete = Data(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"Antigravity"}}}"#.utf8) + Data([10, 123])
+        XCTAssertThrowsError(try trailing.receive(complete))
+        XCTAssertEqual(trailing.state, .failed)
         var truncated = ACPInitializeClient()
         _ = try truncated.request()
         try truncated.receive(Data("{".utf8))

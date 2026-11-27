@@ -39,6 +39,7 @@ public struct ACPInitializeClient: Sendable {
             let frames = try framer.feed(chunk)
             guard frames.count <= 1 else { throw ACPError.unexpectedResponse }
             guard let frame = frames.first else { return }
+            guard !framer.hasPendingBytes else { throw ACPError.unexpectedResponse }
             let response = try JSONDecoder().decode(Response.self, from: frame)
             guard response.jsonrpc == "2.0", response.id == 1,
                   (response.result == nil) != (response.error == nil) else {
@@ -66,11 +67,11 @@ public struct ACPInitializeClient: Sendable {
     }
 
     public mutating func finish() throws {
-        guard state != .waiting else {
+        switch state {
+        case .initialized, .authenticationRequired: return
+        default:
             state = .failed
             throw ACPError.unexpectedResponse
         }
-        // No response is also a failure.
-        if state == .idle || state == .failed { throw ACPError.unexpectedResponse }
     }
 }
