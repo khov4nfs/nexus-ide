@@ -18,25 +18,69 @@ struct LocalAGYImport: Sendable {
             (try? Data(contentsOf: slot)) == AGYImportFormat.slot
     }
 
+    private static func storage() throws -> URL {
+        let fm = FileManager.default
+        let support = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        var root = support.appendingPathComponent("NexusReviewedAGY", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try root.setResourceValues(values)
+        return root
+    }
+    private static func savedDirectory() throws -> URL { try storage().appendingPathComponent("current", isDirectory: true) }
+
+    static func loadSaved() throws -> Self? {
+        let root = try savedDirectory()
+        guard FileManager.default.fileExists(atPath: root.path) else { return nil }
+        let attributes = try root.resourceValues(forKeys: [.isDirectoryKey,.isSymbolicLinkKey])
+        guard attributes.isDirectory == true, attributes.isSymbolicLink != true else { throw Failure.invalid }
+        let manifest = root.appendingPathComponent("sha256")
+        let mv = try manifest.resourceValues(forKeys: [.isRegularFileKey,.isSymbolicLinkKey,.fileSizeKey])
+        guard mv.isRegularFile == true, mv.isSymbolicLink != true, mv.fileSize == 65 else { throw Failure.invalid }
+        let digest = try String(contentsOf: manifest, encoding: .utf8).trimmingCharacters(in: .newlines)
+        guard AGYImportFormat.validDigest(digest) else { throw Failure.invalid }
+        let file = root.appendingPathComponent("reviewed.elf")
+        let fv = try file.resourceValues(forKeys: [.isRegularFileKey,.isSymbolicLinkKey,.fileSizeKey])
+        guard fv.isRegularFile == true, fv.isSymbolicLink != true, let size = fv.fileSize,
+              size >= 64, UInt64(size) <= AGYImportFormat.maxBytes else { throw Failure.invalid }
+        // Full digest is verified again when installed in a fresh guest.
+        return Self(file: file, digest: digest)
+    }
+
+    static func removeSaved() throws {
+        let root = try savedDirectory()
+        if FileManager.default.fileExists(atPath: root.path) {
+            let v = try root.resourceValues(forKeys: [.isDirectoryKey,.isSymbolicLinkKey])
+            guard v.isDirectory == true, v.isSymbolicLink != true else { throw Failure.invalid }
+            try FileManager.default.removeItem(at: root)
+        }
+    }
+
     static func select(_ url: URL, expected: String) throws -> Self {
         guard AGYImportFormat.validDigest(expected), url.isFileURL else { throw Failure.invalid }
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("NexusAGYImport-\(UUID().uuidString)", isDirectory: true)
+        let destination = try savedDirectory()
+        guard !FileManager.default.fileExists(atPath: destination.path) else { throw Failure.invalid }
+        let root = try storage().appendingPathComponent("stage-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
                                                 attributes: [.posixPermissions: 0o700])
         let file = root.appendingPathComponent("reviewed.elf")
         do {
             guard FileManager.default.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600]) else { throw Failure.invalid }
             try transfer(from: url, to: file, expected: expected)
-            return Self(file: file, digest: expected)
+            try Data((expected + "\n").utf8).write(to: root.appendingPathComponent("sha256"), options: .atomic)
+            try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: file.path)
+            try FileManager.default.moveItem(at: root, to: destination)
+            return Self(file: destination.appendingPathComponent("reviewed.elf"), digest: expected)
         } catch {
             try? FileManager.default.removeItem(at: root)
             throw error
         }
     }
 
-    func discard() { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+
 
     func install(in trial: URL) throws {
         guard Self.available(in: trial) else { throw Failure.invalid }

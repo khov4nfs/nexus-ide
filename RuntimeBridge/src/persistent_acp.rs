@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     ffi::{c_char, CStr, CString},
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, mpsc::{self, Receiver, SyncSender}, Mutex},
+    sync::{atomic::{AtomicBool,Ordering}, mpsc::{self, Receiver, SyncSender}, Mutex},
     thread,
     time::Duration,
 };
@@ -18,6 +18,9 @@ const NEW_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/
 type Reply = SyncSender<Value>;
 enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Reply), Close(Reply) }
 static ACTIVE: Mutex<Option<SyncSender<Command>>> = Mutex::new(None);
+static WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
+struct ActiveGuard;
+impl Drop for ActiveGuard { fn drop(&mut self) { WORKER_ACTIVE.store(false,Ordering::Release); } }
 
 enum Mode { Agy(String), #[cfg(test)] Fixture }
 pub(crate) enum LoginControl { None, Code(String), Cancel }
@@ -385,6 +388,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     }
     // The worker retains exclusive ownership across the native FFI calls.
     // If the caller disappears, a bounded idle wait closes the process.
+    WORKER_ACTIVE.store(true,Ordering::Release);
+    let _active_guard = ActiveGuard;
     if ready.send(json!({"ok":true,"active":true,"response":response,"credentialMode":if google {"google-terminal-login"} else if keyed {"gemini-api-key"} else {"none"}})).is_err() {
         let _ = rt.block_on(exchange.close());
         let _ = rt.block_on(guest.shutdown());
@@ -638,6 +643,10 @@ pub unsafe extern "C" fn nexus_google_login_code(code:*const c_char)->*mut c_cha
 }
 #[no_mangle]
 pub extern "C" fn nexus_google_login_cancel()->*mut c_char {ffi_result(cancel_login)}
+#[no_mangle]
+pub extern "C" fn nexus_acp_connection_status()->*mut c_char {
+    ffi_result(||json!({"active":WORKER_ACTIVE.load(Ordering::Acquire)}))
+}
 
 /// # Safety
 /// request must be a valid NUL-terminated UTF-8 string.
