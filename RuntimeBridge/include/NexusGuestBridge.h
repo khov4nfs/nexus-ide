@@ -26,6 +26,7 @@ char *nexus_google_login_code(const char *code);
 char *nexus_google_login_cancel(void);
 char *nexus_acp_connection_status(void);
 char *nexus_acp_new_session(const char *session_new_request);
+char *nexus_acp_load_session(const char *handle);
 // Explicit model-network consent; one fixed prompt, no arbitrary content.
 char *nexus_acp_prompt_probe(void);
 // Up to twenty consented text turns (max 1024 UTF-8 bytes each); no project mount.

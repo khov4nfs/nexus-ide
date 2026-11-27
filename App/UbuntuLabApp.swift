@@ -55,6 +55,13 @@ struct UbuntuLabView: View {
     @State private var keyStatus = ""
     @State private var useGemini = false
     @State private var useGoogle = false
+    @State private var keepAgentGuest = false
+    @State private var persistentActive = false
+    @State private var supportsLoad = false
+    @State private var sessionHandle = ""
+    @State private var resumeHandle = ""
+    @State private var confirmResume = false
+    @State private var confirmResetAgent = false
     @State private var enableSnapshotRead = false
     @State private var enableSnapshotWrite = false
     @State private var enableTerminal = false
@@ -120,6 +127,9 @@ struct UbuntuLabView: View {
                         }
                         Text(importStatus).font(.caption)
                     }
+                    Toggle("Keep separate AGY guest (Gemini key only)", isOn: $keepAgentGuest).disabled(attempted || model.guestClaimed)
+                    Text("Optional: retains guest files and agent history, which may contain secrets. Only clean explicit close allows reuse; Google sign-in stays disposable. Never shared with other tools.").font(.caption)
+                    Button("Reset saved AGY guest", role: .destructive) { confirmResetAgent = true }.disabled(attempted || model.guestClaimed || digest == nil)
                     Toggle("Enable read-only ACP attachment tool", isOn: $enableSnapshotRead)
                         .disabled(attempted || model.guestClaimed)
                     Toggle("Enable staged ACP editor edits", isOn: $enableSnapshotWrite)
@@ -188,6 +198,15 @@ struct UbuntuLabView: View {
                                     .font(.system(.body, design: .monospaced)).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(running)
                                 Text("The executable must already exist in the agent guest. Registration may start it immediately. AGY controls its lifecycle and may pass guest credentials; do not register untrusted servers. No HTTP transport or automatic install.").font(.caption)
                             }
+                        }
+                        if persistentActive && supportsLoad && !created && !enableSessionMCP {
+                            TextField("Previously saved session handle", text: $resumeHandle).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(running)
+                            Button("Review and resume saved session") { confirmResume = true }.disabled(running || !Self.validHandle(resumeHandle))
+                        }
+                        if persistentActive && !sessionHandle.isEmpty {
+                            Text("Save this session handle before closing:").font(.caption)
+                            Text(verbatim: sessionHandle).font(.system(.caption,design:.monospaced)).textSelection(.enabled)
+                            Text("Resume restores agent-side context, not native edit grants or chat display.").font(.caption)
                         }
                         Button(enableSessionMCP && useGemini ? "Review MCP session" : "Create empty guest session") {
                             if enableSessionMCP && useGemini { prepareMCP() }
@@ -343,6 +362,20 @@ struct UbuntuLabView: View {
                     } catch { importedAGY = nil; savedImportInvalid = true; importStatus = "Saved import invalid; remove it explicitly" }
                 }
             }
+            .alert("Delete saved AGY guest?", isPresented: $confirmResetAgent) {
+                Button("Delete guest files", role: .destructive) {
+                    guard !attempted, !model.guestClaimed, let sha = digest else { return }
+                    report = UbuntuRunner.resetAgentGuest(sha)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { Text("Deletes the separate saved guest for this binary digest, including its conversation data. Native files and Keychain are not affected.") }
+            .confirmationDialog("Resume this saved AGY session?", isPresented: $confirmResume) {
+                Button("Resume") {
+                    guard persistentActive, supportsLoad, Self.validHandle(resumeHandle) else { return }
+                    act(close: false, resume: resumeHandle)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { Text("AGY will load the selected session in its saved guest. No old native grants or MCP registration restored. Replay text is not exposed to the native UI.") }
             .alert("Remove saved AGY executable?", isPresented: $confirmRemoveAGY) {
                 Button("Remove executable", role: .destructive) {
                     guard !model.guestClaimed, !importingAGY else { return }
@@ -467,18 +500,25 @@ struct UbuntuLabView: View {
         let writeSnapshot = enableSnapshotWrite && (gemini || google)
         let readSnapshot = enableSnapshotRead || writeSnapshot
         let terminal = enableTerminal && gemini
+        let persistent = keepAgentGuest && gemini && !google && sha != nil
+        persistentActive = persistent
         attempted = true
         running = true
         loginURL = ""; loginCode = ""; loginSubmitted = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected, readSnapshot: readSnapshot, writeSnapshot: writeSnapshot, terminal: terminal) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected, readSnapshot: readSnapshot, writeSnapshot: writeSnapshot, terminal: terminal, persistent: persistent) }.value
             loginURL = ""; loginCode = ""; loginRunning = false
             // Keep the separately reviewed binary; never persist OAuth tokens with it.
             report = result.report
             agentStatus = result.status
             active = result.active
+            if let obj = try? JSONSerialization.jsonObject(with: Data(result.report.utf8)) as? [String: Any] { supportsLoad = obj["supportsLoad"] as? Bool == true }
             running = false
         }
+    }
+
+    private static func validHandle(_ s: String) -> Bool {
+        !s.isEmpty && s.utf8.count <= 256 && s.utf8.allSatisfy { (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45,46,95].contains($0) }
     }
 
     private func attachEditor() {
@@ -684,15 +724,18 @@ struct UbuntuLabView: View {
         } catch { agentStatus = "Invalid MCP name or JSON argv" }
     }
 
-    private func act(close: Bool, mcp: ACPStdioServer? = nil) {
+    private func act(close: Bool, mcp: ACPStdioServer? = nil, resume: String? = nil) {
         guard active, !running else { return }
         running = true
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: close, mcp: mcp) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: close, mcp: mcp, resume: resume) }.value
             report = result.report
             agentStatus = result.status
             active = result.active
-            if !close && result.ok { created = true }
+            if !close && result.ok {
+                created = true
+                if persistentActive, let obj = try? JSONSerialization.jsonObject(with: Data(result.report.utf8)) as? [String: Any], let handle = obj["sessionHandle"] as? String, Self.validHandle(handle) { sessionHandle = handle }
+            }
             if !active { fileContext = nil; editSnapshot = nil; pendingEdit = nil; pendingChat = ""; pendingDisplay = ""; pendingReadContent = nil; pendingTerminal = nil; terminalChoice = ""; contextStatus = "" }
             running = false
         }
@@ -704,17 +747,33 @@ private struct ACPReviewRequest { let ticket: Int64; let title: String; let deta
 private enum UbuntuRunner {
     private static let trialLock = NSLock()
     private static var activeTrial: URL?
+    private static var activeSaved: LocalGuestStore?
+    private static func agentStore(_ sha: String) throws -> LocalGuestStore {
+        guard AGYImportFormat.validDigest(sha) else { throw LocalGuestStore.Failure.invalid }
+        let parent = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        var root = parent.appendingPathComponent("NexusAgentGuest", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700, .protectionKey: FileProtectionType.complete])
+        var v = URLResourceValues(); v.isExcludedFromBackup = true; try root.setResourceValues(v)
+        return LocalGuestStore(directory: root.appendingPathComponent("guest-" + sha, isDirectory: true))
+    }
+    static func resetAgentGuest(_ sha: String) -> String {
+        do { try agentStore(sha).reset(); return "Saved AGY guest deleted" } catch { return "Saved AGY guest reset failed" }
+    }
     private static func rememberTrial(_ url: URL) {
         trialLock.lock(); defer { trialLock.unlock() }; activeTrial = url
     }
     private static func cleanTrialIfShutdown(_ object: [String: Any]) {
         guard object["shutdownClean"] as? Bool == true else { return }
         trialLock.lock(); defer { trialLock.unlock() }
+        if let saved = activeSaved {
+            if object["ok"] as? Bool == true && object["transportClosed"] as? Bool == true { try? saved.markClean() }
+            activeSaved = nil
+        }
         if let trial = activeTrial {
             do { try FileManager.default.removeItem(at: trial); activeTrial = nil } catch { /* leave for next launch */ }
         }
     }
-    static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?, readSnapshot: Bool, writeSnapshot: Bool, terminal: Bool) -> (report: String, status: String, active: Bool) {
+    static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?, readSnapshot: Bool, writeSnapshot: Bool, terminal: Bool, persistent: Bool = false) -> (report: String, status: String, active: Bool) {
         var client = ACPInitializeClient()
         func failed(_ reason: String) -> (String, String, Bool) { (reason, "Not initialized", false) }
         do {
@@ -727,7 +786,7 @@ private enum UbuntuRunner {
             guard let bundled = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else {
                 return failed("Missing Ubuntu fakefs.")
             }
-            let trial = fm.temporaryDirectory.appendingPathComponent("NexusUbuntu-\(UUID().uuidString)", isDirectory: true)
+            var trial = fm.temporaryDirectory.appendingPathComponent("NexusUbuntu-\(UUID().uuidString)", isDirectory: true)
             // Only one boot per app process. Clear stale trials from prior launches.
             if let old = try? fm.contentsOfDirectory(at: fm.temporaryDirectory, includingPropertiesForKeys: [.isDirectoryKey,.isSymbolicLinkKey]) {
                 for url in old where url.lastPathComponent.hasPrefix("NexusUbuntu-") {
@@ -735,14 +794,21 @@ private enum UbuntuRunner {
                     if UUID(uuidString: suffix) != nil, let v = try? url.resourceValues(forKeys: [.isDirectoryKey,.isSymbolicLinkKey]), v.isDirectory == true, v.isSymbolicLink != true { try? fm.removeItem(at: url) }
                 }
             }
-            try fm.copyItem(at: bundled, to: trial)
-            rememberTrial(trial)
-            if let imported {
+            if persistent, gemini, !google, let sha {
+                let store = try agentStore(sha)
+                _ = try store.prepare(from: bundled)
+                trial = store.directory
+                trialLock.lock(); activeSaved = store; trialLock.unlock()
+            } else {
+                try fm.copyItem(at: bundled, to: trial)
+                rememberTrial(trial)
+            }
+            if let imported, !persistent || LocalAGYImport.available(in: trial) {
                 do {
                     guard sha == imported.digest else { throw LocalAGYImport.Failure.invalid }
                     try imported.install(in: trial)
                 } catch {
-                    try? fm.removeItem(at: trial)
+                    if !persistent { try? fm.removeItem(at: trial) }
                     return failed("Reviewed binary could not be staged")
                 }
             }
@@ -791,7 +857,9 @@ private enum UbuntuRunner {
             } catch {}
             nexus_guest_free(nexus_acp_close())
             return (pretty, "Invalid ACP response; connection closed", false)
-        } catch { return failed("Keychain or guest preparation failed") }
+        } catch LocalGuestStore.Failure.dirty { return failed("Saved AGY guest dirty; reset explicitly or use disposable mode") }
+        catch LocalGuestStore.Failure.incompatible { return failed("Saved AGY guest incompatible with current rootfs; reset explicitly or use disposable mode") }
+        catch { return failed("Keychain or guest preparation failed") }
     }
 
     // Small, bounded native mailbox reads; never wait on the command worker.
@@ -838,7 +906,7 @@ private enum UbuntuRunner {
         controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
     }
 
-    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false, terminal: String? = nil, mcp: ACPStdioServer? = nil, review: Bool = false) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
+    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false, terminal: String? = nil, mcp: ACPStdioServer? = nil, review: Bool = false, resume: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
@@ -846,6 +914,7 @@ private enum UbuntuRunner {
             else if let chat, let terminal { pointer = chat.withCString { t in terminal.withCString { nexus_acp_chat_terminal(t,$0) } } }
             else if let chat { pointer = chat.withCString { review ? nexus_acp_chat_reviewed($0) : nexus_acp_chat($0) } }
             else if prompt { pointer = nexus_acp_prompt_probe() }
+            else if let resume { pointer = resume.withCString { nexus_acp_load_session($0) } }
             else {
                 let request = String(decoding: try ACPRequest.newSession(id: 2, cwd: "/tmp", mcp: mcp), as: UTF8.self)
                 pointer = request.withCString { nexus_acp_new_session($0) }
@@ -873,7 +942,7 @@ private enum UbuntuRunner {
             } else if prompt && ok && active && object["promptVerified"] as? Bool == true && object["marker"] as? String == "NEXUS_ACP_OK" {
                 status = "Fixed model response verified"
             } else if !close && !prompt && ok && active && object["sessionCreated"] as? Bool == true && object["responseId"] as? Int == 2 {
-                status = object["mcpConfigured"] as? Bool == true ? "Session accepted with MCP descriptor; server operation not verified" : "Empty guest session created; fixed test available in credential mode"
+                status = object["sessionLoaded"] as? Bool == true ? "Saved session loaded; prior transcript not displayed" : object["mcpConfigured"] as? Bool == true ? "Session accepted with MCP descriptor; server operation not verified" : "Empty guest session created; fixed test available in credential mode"
             } else if object["authenticationRequired"] as? Bool == true {
                 status = "Authentication required; connection stopped"
             } else {

@@ -16,7 +16,7 @@ const IDLE: Duration = Duration::from_secs(180);
 const REPLY: Duration = Duration::from_secs(300);
 const NEW_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\",\"mcpServers\":[]}}\n";
 type Reply = SyncSender<Value>;
-enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Option<String>, bool, Option<String>, bool, Reply), Close(Reply) }
+enum Command { New(Vec<u8>, Reply), Load(String, Reply), Prompt(Option<String>, Option<String>, bool, Option<String>, bool, Reply), Close(Reply) }
 static ACTIVE: Mutex<Option<SyncSender<Command>>> = Mutex::new(None);
 static WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct ActiveGuard;
@@ -115,6 +115,9 @@ fn auth_error(frame: &Value) -> bool {
         .map(|s| s.eq_ignore_ascii_case("Authentication required")).unwrap_or(false)
 }
 
+fn valid_session_handle(s:&str)->bool {
+    !s.is_empty() && s.len()<=256 && s.bytes().all(|b|b.is_ascii_alphanumeric()||b"_.-".contains(&b))
+}
 fn session_created(frame: &Value) -> bool {
     frame.get("error").is_none() && frame["result"]["sessionId"].as_str()
         .map(|s| !s.is_empty() && s.len() <= 256).unwrap_or(false)
@@ -513,6 +516,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     let edit_capability=process_probe::edit_initialize_request(&request);
     let snapshot_capability=edit_capability || process_probe::snapshot_initialize_request(&request);
     let init = rt.block_on(exchange.request(&request, 1));
+    let supports_load=init.as_ref().is_ok_and(|f|f["result"]["agentCapabilities"]["loadSession"]==true);
     let response = match init {
         Ok(frame) => match &mode {
             Mode::Agy(_) => process_probe::initialize_projection(&frame).map(|mut response| {
@@ -544,7 +548,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     // If the caller disappears, a bounded idle wait closes the process.
     WORKER_ACTIVE.store(true,Ordering::Release);
     let _active_guard = ActiveGuard;
-    if ready.send(json!({"ok":true,"active":true,"response":response,"credentialMode":if google {"google-terminal-login"} else if keyed {"gemini-api-key"} else {"none"}})).is_err() {
+    if ready.send(json!({"ok":true,"active":true,"response":response,"supportsLoad":supports_load&&keyed&&!google,"credentialMode":if google {"google-terminal-login"} else if keyed {"gemini-api-key"} else {"none"}})).is_err() {
         let _ = rt.block_on(exchange.close());
         let _ = rt.block_on(guest.shutdown());
         return;
@@ -576,7 +580,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         }
                         session_id = frame["result"]["sessionId"].as_str().map(str::to_owned);
                         mcp_configured=mcp.is_some();
-                        if reply.send(json!({"ok":true,"active":true,"sessionCreated":true,"responseId":2,"mcpConfigured":mcp_configured})).is_err() {
+                        let handle=session_id.as_deref().filter(|s|supports_load&&keyed&&!google&&!mcp_configured&&valid_session_handle(s)&&credential_filter.as_deref().is_some_and(|k|!s.contains(k)));
+                        if reply.send(json!({"ok":true,"active":true,"sessionCreated":true,"responseId":2,"mcpConfigured":mcp_configured,"sessionHandle":handle})).is_err() {
                             break None;
                         }
                     }
@@ -584,6 +589,25 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         let auth = other.as_ref().ok().is_some_and(auth_error);
                         break Some((reply, json!({"ok":false,"active":false,"authenticationRequired":auth,"error":"Session creation rejected"})));
                     }
+                }
+            }
+            Ok(Command::Load(handle,reply))=>{
+                if session_id.is_some()||!supports_load||!keyed||google||!valid_session_handle(&handle)||
+                    credential_filter.as_deref().is_none_or(|k|handle.contains(k)){
+                    let _=reply.send(json!({"ok":false,"active":true,"error":"Session load unavailable or invalid"}));continue;
+                }
+                let wire=format!("{}\n",json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":handle,"cwd":"/tmp","mcpServers":[]}}));
+                let mut replay=0usize;
+                let loaded=rt.block_on(exchange.request_updates(wire.as_bytes(),2,|frame|{
+                    if frame["method"]!="session/update"||frame["params"]["sessionId"]!=handle||!frame["params"]["update"].is_object()||replay>=128{return Err("Invalid or excessive session replay".into());}
+                    replay+=1;
+                    Ok(())
+                }));
+                if loaded.as_ref().is_ok_and(|f|f["result"].is_object()&&f.get("error").is_none()){
+                    session_id=Some(handle.clone());
+                    if reply.send(json!({"ok":true,"active":true,"sessionCreated":true,"sessionLoaded":true,"responseId":2,"sessionHandle":handle,"replayUpdates":replay})).is_err(){break None;}
+                }else{
+                    break Some((reply,json!({"ok":false,"active":false,"error":"Session load rejected or replay limit exceeded"})));
                 }
             }
             Ok(Command::Prompt(chat, snapshot, edit, terminal_choice, review, reply)) => {
@@ -765,13 +789,13 @@ fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, googl
     }
 }
 
-enum Action { New(Vec<u8>), Prompt, Chat(String), Reviewed(String), Snapshot(String,String), Edit(String,String), Terminal(String,String), Close }
+enum Action { New(Vec<u8>), Load(String), Prompt, Chat(String), Reviewed(String), Snapshot(String,String), Edit(String,String), Terminal(String,String), Close }
 
 fn command(action: Action) -> Value {
     let Ok(mut slot) = ACTIVE.lock() else { return failure("Connection lock failed"); };
     let Some(tx) = slot.as_ref() else { return failure("No active connection"); };
     let (reply, wait) = mpsc::sync_channel(1);
-    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(None, None, false, None, false, reply), Action::Chat(text) => Command::Prompt(Some(text), None, false, None, false, reply), Action::Reviewed(text)=>Command::Prompt(Some(text),None,false,None,true,reply), Action::Snapshot(text,content) => Command::Prompt(Some(text),Some(content),false,None,false,reply), Action::Edit(text,content) => Command::Prompt(Some(text),Some(content),true,None,false,reply), Action::Terminal(text,choice)=>Command::Prompt(Some(text),None,false,Some(choice),false,reply), Action::Close => Command::Close(reply) };
+    let message = match action { Action::New(b) => Command::New(b, reply), Action::Load(s)=>Command::Load(s,reply), Action::Prompt => Command::Prompt(None, None, false, None, false, reply), Action::Chat(text) => Command::Prompt(Some(text), None, false, None, false, reply), Action::Reviewed(text)=>Command::Prompt(Some(text),None,false,None,true,reply), Action::Snapshot(text,content) => Command::Prompt(Some(text),Some(content),false,None,false,reply), Action::Edit(text,content) => Command::Prompt(Some(text),Some(content),true,None,false,reply), Action::Terminal(text,choice)=>Command::Prompt(Some(text),None,false,Some(choice),false,reply), Action::Close => Command::Close(reply) };
     if tx.send(message).is_err() {
         *slot = None; return failure("Connection stopped or idle timeout");
     }
@@ -850,6 +874,11 @@ pub unsafe extern "C" fn nexus_acp_new_session(request: *const c_char) -> *mut c
         Some(req) if valid_new(req.as_bytes()) => command(Action::New(req.into_bytes())),
         _ => failure("Invalid session/new request"),
     })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nexus_acp_load_session(handle:*const c_char)->*mut c_char{
+    ffi_result(||match read_arg(handle){Some(s) if valid_session_handle(&s)=>command(Action::Load(s)),_=>failure("Invalid session handle")})
 }
 
 // Fixed prompt only; caller must obtain explicit model-network consent.
@@ -969,6 +998,12 @@ mod tests {
         assert!(read_snapshot_reply(&f,"s",Some("one")).unwrap().get("error").is_some());
         f["method"]=json!("fs/write_text_file");
         assert!(read_snapshot_reply(&f,"s",Some("one")).is_err());
+    }
+    #[test]
+    fn session_handle_bounds(){
+        assert!(valid_session_handle("fixture-resume_1"));
+        for s in ["","../bad","a/b","a b","a\n"]{assert!(!valid_session_handle(s));}
+        assert!(!valid_session_handle(&"a".repeat(257)));
     }
     #[test]
     fn restricted_request_and_session_shape() {
