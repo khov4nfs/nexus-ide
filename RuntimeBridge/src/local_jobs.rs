@@ -60,8 +60,8 @@ fn parse_cli(input:&str)->Option<(String,String,String,Option<String>)> {
     let kind=v["kind"].as_str()?;
     let digest=v["sha256"].as_str()?;
     let action=v["action"].as_str()?;
-    if !matches!(kind,"codex"|"claude") || !process_probe::agy_digest_ok(digest) || !matches!(action,"shell"|"version"|"appServer"|"appServerChat") || (matches!(action,"appServer"|"appServerChat") && kind!="codex") {return None;}
-    let prompt=if action=="appServerChat" {
+    if !matches!(kind,"codex"|"claude") || !process_probe::agy_digest_ok(digest) || !matches!(action,"shell"|"version"|"appServer"|"appServerChat"|"claudeAuth"|"claudeChat") || (matches!(action,"appServer"|"appServerChat") && kind!="codex") || (matches!(action,"claudeAuth"|"claudeChat")&&kind!="claude") {return None;}
+    let prompt=if matches!(action,"appServerChat"|"claudeChat") {
         let p=v["prompt"].as_str()?;
         if fields!=4||!valid_command(p)||p.chars().any(|c|c.is_control()&&c!='\n'&&c!='\t'){return None;}
         Some(p.to_owned())
@@ -161,7 +161,10 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
                 // Only fixed paths/actions; no user-provided shell interpolation,
                 // no CLI flags that disable the original harness safeguards.
                 env.insert("PATH".into(),"/opt/nexus:/usr/bin:/bin:/usr/sbin:/sbin".into());
-                if matches!(action.as_str(),"appServer"|"appServerChat") {rt.block_on(process_probe::codex_app_server_probe(&guest,&env,false,prompt.as_deref()))} else {
+                if matches!(action.as_str(),"appServer"|"appServerChat") {rt.block_on(process_probe::codex_app_server_probe(&guest,&env,false,prompt.as_deref()))}
+                else if action=="claudeAuth"{rt.block_on(process_probe::claude_auth_probe(&guest,&env,false))}
+                else if action=="claudeChat"{rt.block_on(process_probe::claude_text_turn(&guest,&env,prompt.as_deref().unwrap_or(""),false))}
+                else {
                 let script=match (kind.as_str(),action.as_str()) {
                     ("codex","version")=>"exec /opt/nexus/codex --version",
                     ("claude","version")=>"exec /opt/nexus/claude --version",
@@ -303,6 +306,27 @@ mod tests {
         let r=rt.block_on(process_probe::codex_app_server_probe(&guest,&env,true,Some("Hello fixture")));
         let clean=rt.block_on(guest.shutdown()).is_ok();
         let ok=if phase=="success"{r["ok"]==true&&r["turnCompleted"]==true&&r["response"]=="Hello native"}else{r["ok"]==false&&r.get("response").is_none()};
+        let evidence=json!({"ok":ok&&clean,"fixtureOnly":true,"phase":phase,"shutdownClean":clean});
+        std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        assert!(ok&&clean);
+    }
+    #[test]
+    #[ignore = "requires fresh Ubuntu fakefs; synthetic Claude JSON peer"]
+    fn real_claude_native_fixture(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_CLAUDE_FIXTURE_PHASE").expect("phase");
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin".into()),("HOME".into(),"/root".into()),("NEXUS_CLAUDE_FIXTURE_PHASE".into(),phase.clone())]);
+        let r=if phase=="signedIn"||phase=="signedOut"{rt.block_on(process_probe::claude_auth_probe(&guest,&env,true))}else{rt.block_on(process_probe::claude_text_turn(&guest,&env,"Hello fixture",true))};
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        let ok=match phase.as_str(){
+            "signedIn"=>r["ok"]==true&&r["accountPresent"]==true&&!r.to_string().contains("fixture-private"),
+            "signedOut"=>r["ok"]==true&&r["accountPresent"]==false,
+            "success"=>r["ok"]==true&&r["turnCompleted"]==true&&r["response"]=="Hello Claude",
+            _=>r["ok"]==false&&r.get("response").is_none(),
+        };
         let evidence=json!({"ok":ok&&clean,"fixtureOnly":true,"phase":phase,"shutdownClean":clean});
         std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
         assert!(ok&&clean);

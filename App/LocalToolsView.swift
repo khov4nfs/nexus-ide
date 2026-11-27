@@ -86,16 +86,19 @@ struct LocalToolsView: View {
                             if cliKind == "codex" {
                                 Text("Native app-server account probe").tag("appServer")
                                 Text("Native Codex text turn").tag("appServerChat")
+                            } else {
+                                Text("Native Claude account probe").tag("claudeAuth")
+                                Text("Native Claude text turn").tag("claudeChat")
                             }
                         }.disabled(model.guestClaimed)
-                        if cliAction == "appServerChat" {
-                            TextField("Message to Codex (max 2048 bytes)", text: $cliPrompt, axis: .vertical).disabled(model.guestClaimed)
-                            Text("One ephemeral text turn; requires CLI-owned sign-in. Model request may incur charges. Read-only policy requested and checked; no native permissions granted. Output is untrusted and may contain guest secrets.").font(.caption)
+                        if ["appServerChat","claudeChat"].contains(cliAction) {
+                            TextField("Message to agent (max 2048 bytes)", text: $cliPrompt, axis: .vertical).disabled(model.guestClaimed)
+                            Text("One text turn; requires CLI-owned sign-in. Model request may incur charges. Codex requests read-only policy; Claude disables customizations and tools. No native grants. Output is untrusted and may contain guest secrets.").font(.caption)
                         }
                         Toggle("Keep separate agent guest and CLI login", isOn: $keepCLIGuest).disabled(model.guestClaimed || importingCLI)
                         Text("Optional: persists CLI-owned login state and project files for this exact binary digest. May retain secrets. Exit the shell cleanly before restarting. No backup, no sharing with other guests, no native token collection.").font(.caption)
                         Button("Reset saved CLI guest", role: .destructive) { confirmResetCLI = true }.disabled(model.guestClaimed || importingCLI || !AGYImportFormat.validDigest(cliDigest))
-                        Text("App-server probe reads account status only. Use the original CLI login inside the terminal. Linux sandbox/syscall compatibility remains unverified; do not disable agent safeguards.").font(.caption)
+                        Text("Account probes read status only. Use the original CLI login inside the terminal. Linux sandbox/syscall compatibility remains unverified; do not disable agent safeguards.").font(.caption)
                     } else if mode != 3 {
                         TextField("Reviewed guest shell command", text: $command, axis: .vertical)
                             .font(.system(.body, design: .monospaced)).autocorrectionDisabled()
@@ -145,7 +148,7 @@ struct LocalToolsView: View {
                         if mode == 6 {
                             guard let frozenCLI else { report = "Select reviewed executable"; return }
                             var request = ["kind":frozenCLI.kind,"sha256":frozenCLI.digest,"action":cliAction]
-                            if cliAction == "appServerChat" {
+                            if ["appServerChat","claudeChat"].contains(cliAction) {
                                 guard !cliPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, cliPrompt.utf8.count <= 2048, !cliPrompt.utf8.contains(0) else { report = "Invalid message"; return }
                                 request["prompt"] = cliPrompt
                             }

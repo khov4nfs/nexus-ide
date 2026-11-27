@@ -1012,6 +1012,59 @@ pub(crate) async fn codex_app_server_probe(guest:&IshInstance,env:&HashMap<Strin
     }
 }
 
+// Official Claude CLI JSON mode. Never parse or export account identity,
+// arbitrary stderr or auth tokens; the harness owns its authentication.
+async fn claude_json(guest:&IshInstance,env:&HashMap<String,String>,argv:Vec<&str>,fixture:bool,seconds:u64)->Result<(Value,i32),String>{
+    let mut opts=SpawnOpts::cmd(argv);
+    #[cfg(test)]
+    if fixture{opts=shell(include_str!("../fixtures/claude-json.sh"),env);}
+    #[cfg(not(test))]
+    if fixture{return Err("Fixture unavailable".into());}
+    opts.cwd=Some(Path::new("/tmp").to_path_buf());
+    opts.envp=Some(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect());
+    opts.pipe_stdin=false;
+    let session=guest.spawn(opts).map_err(|_|"Claude spawn failed")?;
+    let mut capture=Capture::default();
+    let deadline=Instant::now()+Duration::from_secs(seconds);
+    let result:Result<(),String>=async{
+        while !capture.closed {
+            if crate::local_jobs::stop_requested(){return Err("Cancelled".into());}
+            capture.poll(&session,deadline).await?;
+        }
+        Ok(())
+    }.await;
+    if result.is_err(){let _=session.terminate().await;let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;return Err("Claude operation cancelled or timed out".into());}
+    if !capture.exited||capture.signal.unwrap_or(0)!=0||!capture.pty.is_empty(){return Err("Claude process did not exit normally".into());}
+    let frame:Value=serde_json::from_slice(&capture.stdout).map_err(|_|"Invalid Claude JSON")?;
+    if !frame.is_object(){return Err("Invalid Claude result".into());}
+    Ok((frame,capture.code.ok_or("No exit code")?))
+}
+pub(crate) async fn claude_auth_probe(guest:&IshInstance,env:&HashMap<String,String>,fixture:bool)->Value{
+    match claude_json(guest,env,vec!["/opt/nexus/claude","auth","status"],fixture,30).await{
+        Ok((frame,code)) if matches!(code,0|1)=>{
+            let auth=frame["authMethod"].as_str().unwrap_or("");
+            let valid=matches!(auth,"none"|"claude.ai"|"oauth_token"|"api_key"|"api_key_helper"|"third_party");
+            let logged=code==0;
+            if valid && (logged==(auth!="none")) && frame.get("loggedIn").is_none_or(|v|v.as_bool()==Some(logged)){
+                json!({"ok":true,"accountReadVerified":true,"accountPresent":logged})
+            }else{json!({"ok":false,"error":"Unsupported Claude authentication response"})}
+        },
+        _=>json!({"ok":false,"error":"Claude authentication status unavailable"}),
+    }
+}
+pub(crate) async fn claude_text_turn(guest:&IshInstance,env:&HashMap<String,String>,prompt:&str,fixture:bool)->Value{
+    if !fixture && claude_auth_probe(guest,env,false).await["accountPresent"]!=true{return json!({"ok":false,"error":"Use official CLI sign-in first"});}
+    // No shell interpolation, no custom hooks/plugins, no bypass permissions.
+    let argv=vec!["/opt/nexus/claude","--safe-mode","--print","--output-format","json","--tools","","--disallowedTools","mcp__*","--strict-mcp-config","--mcp-config","{\"mcpServers\":{}}","--permission-mode","dontAsk","--no-session-persistence","--",prompt];
+    match claude_json(guest,env,argv,fixture,120).await{
+        Ok((frame,0)) if frame["type"]=="result"&&frame["subtype"]=="success"&&frame["is_error"]==false=>{
+            let Some(text)=frame["result"].as_str().filter(|s|!s.trim().is_empty()&&s.len()<=8192&&s.chars().all(|c|!c.is_control()||c=='\n'||c=='\t')) else{return json!({"ok":false,"error":"Invalid Claude text result"});};
+            json!({"ok":true,"turnCompleted":true,"response":text})
+        },
+        _=>json!({"ok":false,"error":"Claude text turn rejected, timed out or failed"}),
+    }
+}
+
 // User-initiated local jobs in a separate disposable Ubuntu boot. No host
 // workspace, native tool callbacks, provider credential or remote executor.
 pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,String>, command: &str, workbench: bool) -> Value {
