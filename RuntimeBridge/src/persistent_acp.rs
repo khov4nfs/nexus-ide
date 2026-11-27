@@ -56,18 +56,19 @@ const SMOKE_REPLY: &str = "NEXUS_ACP_OK";
 #[derive(Default)]
 struct PromptProgress {
     running: bool,
+    response_id: i64,
     chunks: usize,
     cancel_requested: bool,
     cancel_taken: bool,
     visible: String,
 }
 static PROGRESS: Mutex<PromptProgress> = Mutex::new(PromptProgress {
-    running: false, chunks: 0, cancel_requested: false, cancel_taken: false, visible: String::new(),
+    running: false, response_id: 0, chunks: 0, cancel_requested: false, cancel_taken: false, visible: String::new(),
 });
 
 fn prompt_progress() -> Value {
     match PROGRESS.lock() {
-        Ok(p) => json!({"ok":true,"running":p.running,"chunkCount":p.chunks,
+        Ok(p) => json!({"ok":true,"running":p.running,"responseId":p.response_id,"chunkCount":p.chunks,
             "cancelRequested":p.cancel_requested,"text":p.visible}),
         Err(_) => json!({"ok":false,"running":false,"error":"Progress unavailable"}),
     }
@@ -85,9 +86,9 @@ fn request_cancel() -> Value {
 
 struct ProgressGuard;
 impl ProgressGuard {
-    fn begin() -> Self {
+    fn begin(response_id: i64) -> Self {
         let mut p = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
-        *p = PromptProgress { running: true, ..Default::default() };
+        *p = PromptProgress { running: true, response_id, ..Default::default() };
         Self
     }
 }
@@ -105,6 +106,7 @@ fn take_cancel(session: &str) -> Option<Vec<u8>> {
     Some(format!("{frame}\n").into_bytes())
 }
 
+const MAX_CHAT_TURNS: i64 = 3;
 const CHAT_INPUT_LIMIT: usize = 1024;
 const CHAT_OUTPUT_LIMIT: usize = 8192;
 
@@ -260,7 +262,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
         return;
     }
     let mut session_id: Option<String> = None;
-    let mut prompted = false;
+    let mut turns: i64 = 0;
+    let mut smoke_used = false;
     let final_reply = loop {
         match commands.recv_timeout(IDLE) {
             Ok(Command::New(bytes, reply)) => {
@@ -293,8 +296,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Create a session first"}));
                     continue;
                 };
-                if !keyed || prompted {
-                    let _ = reply.send(json!({"ok":false,"active":true,"error":"One consented Gemini prompt per boot"}));
+                if !keyed || smoke_used || turns >= MAX_CHAT_TURNS || (chat.is_none() && turns != 0) {
+                    let _ = reply.send(json!({"ok":false,"active":true,"error":"Chat limit reached or smoke test is exclusive"}));
                     continue;
                 }
                 let Some(key) = credential_filter.as_deref() else {
@@ -307,14 +310,16 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                 }
                 let is_chat = chat.is_some();
                 let text = chat.as_deref().unwrap_or(SMOKE_PROMPT);
-                prompted = true;
-                let request = json!({"jsonrpc":"2.0","id":3,"method":"session/prompt",
+                turns += 1;
+                smoke_used = !is_chat;
+                let response_id = turns + 2;
+                let request = json!({"jsonrpc":"2.0","id":response_id,"method":"session/prompt",
                     "params":{"sessionId":id,"prompt":[{"type":"text","text":text}]}});
                 let wire = format!("{request}\n");
                 let mut evidence = PromptEvidence::default();
-                let progress = ProgressGuard::begin();
+                let progress = ProgressGuard::begin(response_id);
                 let mut cancel_taken = false;
-                let result = rt.block_on(exchange.request_controlled(wire.as_bytes(), 3,
+                let result = rt.block_on(exchange.request_controlled(wire.as_bytes(), response_id,
                     |frame| {
                         evidence.update(frame, id)?;
                         // Check the assembled text, not each chunk independently.
@@ -342,7 +347,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                 if cancelled {
                     // Confirm only the response to the original prompt. No raw text.
                     if reply.send(json!({"ok":true,"active":true,"cancelled":true,
-                        "responseId":3,"stopReason":"cancelled","chunkCount":evidence.chunks})).is_err() {
+                        "responseId":response_id,"stopReason":"cancelled","chunkCount":evidence.chunks})).is_err() {
                         break None;
                     }
                     continue;
@@ -353,7 +358,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                         .is_ok_and(|s| !s.trim().is_empty()));
                 if chat_success {
                     if reply.send(json!({"ok":true,"active":true,"chatCompleted":true,
-                        "responseId":3,"chunkCount":evidence.chunks,"stopReason":"end_turn"})).is_err() {
+                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn"})).is_err() {
                         break None;
                     }
                     continue;
@@ -362,7 +367,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                 if success {
                     // Export a constant marker only, never model text, IDs or errors.
                     if reply.send(json!({"ok":true,"active":true,"promptVerified":true,
-                        "responseId":3,"chunkCount":evidence.chunks,"stopReason":"end_turn",
+                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn",
                         "marker":SMOKE_REPLY})).is_err() { break None; }
                 } else {
                     if let Ok(mut p) = PROGRESS.lock() { p.visible.clear(); }
@@ -593,6 +598,16 @@ mod tests {
         };
         let finished = prompt_progress();
         let duplicate_prompt = command(Action::Prompt);
+        let (followup, followup_progress, third, third_progress, over_limit) = if chat_mode {
+            let second = command(Action::Chat("Bạn nhớ lời chào không?".into()));
+            let second_progress = prompt_progress();
+            let third = command(Action::Chat("Cảm ơn".into()));
+            let third_progress = prompt_progress();
+            let over_limit = command(Action::Chat("Fourth turn must be rejected".into()));
+            (second, second_progress, third, third_progress, over_limit)
+        } else {
+            (Value::Null, Value::Null, Value::Null, Value::Null, Value::Null)
+        };
         let close = command(Action::Close);
         let after_close = command(Action::New(NEW_REQUEST.to_vec()));
         let ok = first["ok"] == true && first["active"] == true && first["credentialMode"] == "gemini-api-key" &&
@@ -601,7 +616,13 @@ mod tests {
             before_session["ok"] == false && before_session["active"] == true &&
             idle_cancel["ok"] == false && finished["running"] == false &&
             prompt["ok"] == true && (if chat_mode {
-                progress_seen && prompt["chatCompleted"] == true && prompt["chunkCount"] == 2 && finished["text"] == "Xin chào Nexus!"
+                progress_seen && prompt["chatCompleted"] == true && prompt["chunkCount"] == 2 &&
+                finished["text"] == "Xin chào Nexus!" && finished["responseId"] == 3 &&
+                followup["ok"] == true && followup["chatCompleted"] == true && followup["responseId"] == 4 &&
+                followup_progress["responseId"] == 4 && followup_progress["text"] == "Nhớ lời chào Nexus." &&
+                third["ok"] == true && third["chatCompleted"] == true && third["responseId"] == 5 &&
+                third_progress["responseId"] == 5 && third_progress["text"] == "Không có gì." &&
+                over_limit["ok"] == false && over_limit["active"] == true
             } else if cancel_mode {
                 progress_seen && cancel_reply["ok"] == true && duplicate_cancel["ok"] == false &&
                 prompt["cancelled"] == true && prompt["stopReason"] == "cancelled" && prompt["chunkCount"] == 1
@@ -612,7 +633,8 @@ mod tests {
         let report = json!({"ok":ok,"fixtureOnly":true,"initialize":first,"newSession":second,
             "duplicate":duplicate,"beforeSession":before_session,"prompt":prompt,"duplicatePrompt":duplicate_prompt,"close":close,"afterClose":after_close,
             "cancelMode":cancel_mode,"chatMode":chat_mode,"progressSeen":progress_seen,"cancelRequest":cancel_reply,
-            "duplicateCancel":duplicate_cancel,"idleCancel":idle_cancel,"finishedProgress":finished});
+            "duplicateCancel":duplicate_cancel,"idleCancel":idle_cancel,"finishedProgress":finished,
+            "followup":followup,"followupProgress":followup_progress,"third":third,"thirdProgress":third_progress,"overLimit":over_limit});
         std::fs::write(evidence, serde_json::to_vec_pretty(&report).unwrap()).expect("completed evidence");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         assert!(ok, "{report}");

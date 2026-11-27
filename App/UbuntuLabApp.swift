@@ -7,6 +7,13 @@ import NexusCore
     var body: some Scene { WindowGroup { UbuntuLabView() } }
 }
 
+private struct ChatTurn: Identifiable {
+    let id: Int
+    let user: String
+    let response: String
+    let status: String
+}
+
 private struct UbuntuLabView: View {
     @State private var attempted = false
     @State private var running = false
@@ -15,7 +22,10 @@ private struct UbuntuLabView: View {
     @State private var agentStatus = "Not initialized"
     @State private var active = false
     @State private var created = false
-    @State private var prompted = false
+    @State private var turnCount = 0
+    @State private var smokeUsed = false
+    @State private var transcript: [ChatTurn] = []
+    private let maxTurns = 3
     @State private var confirmPrompt = false
     @State private var confirmChat = false
     @State private var chatInput = ""
@@ -74,11 +84,12 @@ private struct UbuntuLabView: View {
                         Text("Connection closes after 60 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
                         Button("Create empty guest session") { act(close: false) }.disabled(running || created)
                         if created && useGemini {
-                            Button("Test model response") { confirmPrompt = true }.disabled(running || prompted)
+                            Button("Test model response") { confirmPrompt = true }.disabled(running || turnCount != 0)
                             TextField("Ask the agent", text: $chatInput, axis: .vertical)
-                                .lineLimit(2...6).disabled(running || prompted)
+                                .lineLimit(2...6).disabled(running || smokeUsed || turnCount >= maxTurns)
                             Button("Send chat") { confirmChat = true }
-                                .disabled(running || prompted || !UbuntuRunner.validChat(chatInput))
+                                .disabled(running || smokeUsed || turnCount >= maxTurns || !UbuntuRunner.validChat(chatInput))
+                            Text("Chat turns: \(turnCount)/\(maxTurns)").font(.caption)
                         }
                         if promptRunning {
                             Text("Received text chunks: \(receivedChunks)").font(.caption)
@@ -90,12 +101,23 @@ private struct UbuntuLabView: View {
                         Button("Close local connection", role: .destructive) { act(close: true) }.disabled(running)
                     }
                 }
-                if !sentChat.isEmpty {
+                if !transcript.isEmpty || !sentChat.isEmpty {
                     Section("Chat · temporary") {
-                        Text("You").font(.caption)
-                        Text(sentChat)
-                        Text("Agent").font(.caption)
-                        Text(chatResponse.isEmpty ? (promptRunning ? "Waiting for text…" : "No response available") : chatResponse)
+                        ForEach(transcript) { turn in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("You").font(.caption)
+                                Text(turn.user)
+                                Text("Agent").font(.caption)
+                                Text(turn.response.isEmpty ? "No response available" : turn.response)
+                                Text(turn.status).font(.caption)
+                            }
+                        }
+                        if !sentChat.isEmpty {
+                            Text("You").font(.caption)
+                            Text(sentChat)
+                            Text("Agent").font(.caption)
+                            Text(chatResponse.isEmpty ? "Waiting for text…" : chatResponse)
+                        }
                         Text("Untrusted response · literal key filter only").font(.caption)
                     }
                 }
@@ -109,9 +131,11 @@ private struct UbuntuLabView: View {
                 guard promptRunning else { return }
                 while !Task.isCancelled && promptRunning {
                     let progress = UbuntuRunner.progress()
-                    receivedChunks = progress.chunks
-                    if !sentChat.isEmpty { chatResponse = progress.text }
-                    if progress.cancelRequested { cancelRequested = true }
+                    if progress.responseID == turnCount + 2 {
+                        receivedChunks = progress.chunks
+                        if !sentChat.isEmpty { chatResponse = progress.text }
+                        if progress.cancelRequested { cancelRequested = true }
+                    }
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
             }
@@ -119,7 +143,7 @@ private struct UbuntuLabView: View {
                 Button("Send message") { runPrompt(chat: chatInput) }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Your message may be sent to Google and incur charges. Do not include passwords, keys or private data. One text turn per boot. No project mounted. Agent actions are not sandboxed.")
+                Text("Your message may be sent to Google and incur charges. Do not include passwords, keys or private data. Up to three text turns per boot, each with consent. No project mounted. Agent actions are not sandboxed.")
             }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
@@ -157,7 +181,8 @@ private struct UbuntuLabView: View {
     }
 
     private func runPrompt(chat: String? = nil) {
-        guard active, created, useGemini, !running, !prompted else { return }
+        guard active, created, useGemini, !running, !smokeUsed, turnCount < maxTurns,
+              chat != nil || turnCount == 0 else { return }
         if let chat {
             guard UbuntuRunner.validChat(chat) else { return }
             // Do not display or send a prompt containing the stored literal key.
@@ -171,17 +196,33 @@ private struct UbuntuLabView: View {
         }
         chatResponse = ""
         running = true
-        prompted = true
+        turnCount += 1
+        smokeUsed = chat == nil
+        let expectedID = turnCount + 2
         promptRunning = true
         receivedChunks = 0
         cancelRequested = false
         Task {
             let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat) }.value
-            if chat != nil { chatResponse = result.ok ? UbuntuRunner.progress().text : "" }
+            let snapshot = UbuntuRunner.progress()
+            let matches = result.responseID == expectedID && snapshot.responseID == expectedID && !snapshot.running
+            if let chat {
+                let text = result.ok && matches ? snapshot.text : ""
+                transcript.append(ChatTurn(id: expectedID, user: chat, response: text,
+                    status: matches ? result.status : "Turn failed or response mismatch"))
+                sentChat = ""
+                chatResponse = ""
+            }
             promptRunning = false
             report = result.report
             agentStatus = result.status
             active = result.active
+            // Never continue with mismatched local/worker turn counters.
+            if result.active && (!result.ok || !matches) {
+                let closed = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: true) }.value
+                active = false
+                agentStatus = "Turn failed; restart app. " + closed.status
+            }
             running = false
         }
     }
@@ -274,16 +315,16 @@ private enum UbuntuRunner {
             text.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) || $0.value == 10 || $0.value == 9 }
     }
 
-    static func progress() -> (chunks: Int, cancelRequested: Bool, text: String) {
+    static func progress() -> (chunks: Int, cancelRequested: Bool, text: String, responseID: Int, running: Bool) {
         let obj = controlReport(nexus_acp_prompt_progress())
-        return (obj["chunkCount"] as? Int ?? 0, obj["cancelRequested"] as? Bool == true, obj["text"] as? String ?? "")
+        return (obj["chunkCount"] as? Int ?? 0, obj["cancelRequested"] as? Bool == true, obj["text"] as? String ?? "", obj["responseId"] as? Int ?? 0, obj["running"] as? Bool == true)
     }
 
     static func cancelPrompt() -> Bool {
         controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
     }
 
-    static func action(close: Bool, prompt: Bool = false, chat: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool) {
+    static func action(close: Bool, prompt: Bool = false, chat: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
@@ -295,13 +336,13 @@ private enum UbuntuRunner {
             }
             guard let pointer else {
                 nexus_guest_free(nexus_acp_close())
-                return ("No report", "Connection unavailable", false, false)
+                return ("No report", "Connection unavailable", false, false, 0)
             }
             defer { nexus_guest_free(pointer) }
             let raw = String(cString: pointer)
             guard let object = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] else {
                 nexus_guest_free(nexus_acp_close())
-                return ("Invalid report", "Connection unavailable", false, false)
+                return ("Invalid report", "Connection unavailable", false, false, 0)
             }
             let active = object["active"] as? Bool == true
             let ok = object["ok"] as? Bool == true
@@ -321,10 +362,10 @@ private enum UbuntuRunner {
             } else {
                 status = "Request failed or connection expired; restart app"
             }
-            return (raw, status, active, ok)
+            return (raw, status, active, ok, object["responseId"] as? Int ?? 0)
         } catch {
             nexus_guest_free(nexus_acp_close())
-            return ("Request encoding failed", "Connection stopped", false, false)
+            return ("Request encoding failed", "Connection stopped", false, false, 0)
         }
     }
 }
