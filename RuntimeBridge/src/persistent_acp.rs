@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-const IDLE: Duration = Duration::from_secs(60);
+const IDLE: Duration = Duration::from_secs(180);
 const REPLY: Duration = Duration::from_secs(300);
 const NEW_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\",\"mcpServers\":[]}}\n";
 type Reply = SyncSender<Value>;
@@ -20,6 +20,53 @@ enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Reply), Close(Reply) 
 static ACTIVE: Mutex<Option<SyncSender<Command>>> = Mutex::new(None);
 
 enum Mode { Agy(String), #[cfg(test)] Fixture }
+pub(crate) enum LoginControl { None, Code(String), Cancel }
+struct LoginState { running: bool, url: String, submitted: bool, cancelled: bool, code: Option<String> }
+static LOGIN: Mutex<LoginState> = Mutex::new(LoginState { running:false,url:String::new(),submitted:false,cancelled:false,code:None });
+struct LoginGuard;
+impl LoginGuard {
+    fn begin() -> Result<Self,String> {
+        let mut s=LOGIN.lock().map_err(|_| "Login lock failed")?;
+        *s=LoginState {running:true,url:String::new(),submitted:false,cancelled:false,code:None};
+        Ok(Self)
+    }
+}
+impl Drop for LoginGuard {
+    fn drop(&mut self) {
+        if let Ok(mut s)=LOGIN.lock() { s.running=false;s.url.clear();s.code=None; }
+    }
+}
+pub(crate) fn login_publish(url:String)->Result<(),String> {
+    let mut s=LOGIN.lock().map_err(|_| "Login lock failed")?;
+    if !s.running || s.cancelled || s.submitted { return Err("Login not awaiting browser".into()); }
+    s.url=url;
+    Ok(())
+}
+pub(crate) fn login_take()->Result<LoginControl,String> {
+    let mut s=LOGIN.lock().map_err(|_| "Login lock failed")?;
+    if s.cancelled { return Ok(LoginControl::Cancel); }
+    Ok(s.code.take().map(LoginControl::Code).unwrap_or(LoginControl::None))
+}
+fn login_progress()->Value {
+    LOGIN.lock().map(|s|json!({"running":s.running,"url":s.url,"submitted":s.submitted,"cancelled":s.cancelled}))
+        .unwrap_or_else(|_|failure("Login status unavailable"))
+}
+fn valid_login_code(code:&str)->bool {
+    (8..=2048).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_-.".contains(&b))
+}
+fn submit_login_code(code:String)->Value {
+    if !valid_login_code(&code) {return failure("Invalid authorization code shape");}
+    let Ok(mut s)=LOGIN.lock() else {return failure("Login lock failed");};
+    if !s.running || s.url.is_empty() || s.submitted || s.cancelled {return failure("Login not awaiting code");}
+    s.submitted=true;s.url.clear();s.code=Some(code);
+    json!({"ok":true})
+}
+fn cancel_login()->Value {
+    let Ok(mut s)=LOGIN.lock() else {return failure("Login lock failed");};
+    if !s.running || s.cancelled {return failure("No pending login");}
+    s.cancelled=true;s.url.clear();s.code=None;
+    json!({"ok":true})
+}
 
 // Input shape only, not authentication or validation against Google.
 fn valid_key(s: &str) -> bool {
@@ -234,7 +281,7 @@ impl PromptEvidence {
     }
 }
 
-fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, commands: Receiver<Command>, ready: Reply) {
+fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, google: bool, commands: Receiver<Command>, ready: Reply) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt, Err(_) => { let _ = ready.send(failure("Runtime creation failed")); return; }
     };
@@ -263,13 +310,34 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
     };
     opts.cwd = Some(PathBuf::from("/tmp"));
     let keyed = key.is_some();
-    let credential_filter = key.clone();
+    let mut credential_filter = key.clone();
+    if google {
+        let fixture = match &mode { Mode::Agy(_) => false, #[cfg(test)] Mode::Fixture => true };
+        let login = match LoginGuard::begin() {
+            Ok(guard) => {
+                let result=rt.block_on(process_probe::google_login(&guest,&env,fixture));
+                drop(guard);
+                result
+            }
+            Err(e)=>Err(e),
+        };
+        match login {
+            Ok(code)=>credential_filter=Some(code),
+            Err(_)=>{
+                let shutdown=rt.block_on(guest.shutdown()).is_ok();
+                let _=ready.send(json!({"ok":false,"active":false,"shutdownClean":shutdown,"error":"Google terminal login failed or cancelled; restart app"}));
+                return;
+            }
+        }
+    }
     if keyed && !rt.block_on(process_probe::prepare_gemini_provider(&guest, &env)) {
         let _ = rt.block_on(guest.shutdown());
         let _ = ready.send(failure("Gemini provider preparation failed")); return;
     }
     let mut agent_env = env;
     if let Some(key) = key { agent_env.insert("GEMINI_API_KEY".into(), key); }
+    #[cfg(test)]
+    if google && matches!(&mode,Mode::Fixture) {agent_env.insert("NEXUS_FIXTURE_GOOGLE".into(),"1".into());}
     #[cfg(test)]
     if matches!(&mode, Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_CANCEL").as_deref() == Ok("1") {
         agent_env.insert("NEXUS_FIXTURE_CANCEL".into(), "1".into());
@@ -292,7 +360,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
         Ok(frame) => match &mode {
             Mode::Agy(_) => process_probe::initialize_projection(&frame).map(|mut response| {
                 // In credential mode never export agent-supplied free text.
-                if keyed && response.get("result").is_some() {
+                if (keyed || google) && response.get("result").is_some() {
                     response["result"]["agentInfo"] = json!({"name":"Antigravity","version":"withheld"});
                 }
                 response
@@ -317,7 +385,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
     }
     // The worker retains exclusive ownership across the native FFI calls.
     // If the caller disappears, a bounded idle wait closes the process.
-    if ready.send(json!({"ok":true,"active":true,"response":response,"credentialMode":if keyed {"gemini-api-key"} else {"none"}})).is_err() {
+    if ready.send(json!({"ok":true,"active":true,"response":response,"credentialMode":if google {"google-terminal-login"} else if keyed {"gemini-api-key"} else {"none"}})).is_err() {
         let _ = rt.block_on(exchange.close());
         let _ = rt.block_on(guest.shutdown());
         return;
@@ -357,7 +425,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Create a session first"}));
                     continue;
                 };
-                if !keyed || smoke_used || turns >= MAX_CHAT_TURNS || (chat.is_none() && turns != 0) {
+                if !(keyed || google) || smoke_used || turns >= MAX_CHAT_TURNS || (chat.is_none() && turns != 0) {
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Chat limit reached or smoke test is exclusive"}));
                     continue;
                 }
@@ -467,7 +535,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
     }
 }
 
-fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>) -> Value {
+fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, google: bool) -> Value {
+    if google && key.is_some() { return failure("Choose one authentication method"); }
     if key.as_deref().is_some_and(|s| !valid_key(s)) { return failure("Invalid credential shape"); }
     if !process_probe::valid_initialize_request(&request) {
         return failure("Invalid initialize request");
@@ -485,7 +554,7 @@ fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>) -> Va
     let (tx, rx) = mpsc::sync_channel(1);
     let (reply, wait) = mpsc::sync_channel(1);
     if thread::Builder::new().name("nexus-acp-owner".into())
-        .spawn(move || worker(path, mode, request, key, rx, reply)).is_err() {
+        .spawn(move || worker(path, mode, request, key, google, rx, reply)).is_err() {
         return failure("Worker creation failed");
     }
     match wait.recv_timeout(REPLY) {
@@ -532,7 +601,7 @@ unsafe fn read_arg(p: *const c_char) -> Option<String> {
 pub unsafe extern "C" fn nexus_acp_start(path: *const c_char, digest: *const c_char, request: *const c_char) -> *mut c_char {
     ffi_result(|| {
         match (read_arg(path), read_arg(digest), read_arg(request)) {
-            (Some(path), Some(sha), Some(req)) => start(PathBuf::from(path), Mode::Agy(sha), req.into_bytes(), None),
+            (Some(path), Some(sha), Some(req)) => start(PathBuf::from(path), Mode::Agy(sha), req.into_bytes(), None, false),
             _ => failure("Missing connection arguments"),
         }
     })
@@ -544,10 +613,31 @@ pub unsafe extern "C" fn nexus_acp_start(path: *const c_char, digest: *const c_c
 #[no_mangle]
 pub unsafe extern "C" fn nexus_acp_start_gemini(path: *const c_char, digest: *const c_char, request: *const c_char, key: *const c_char) -> *mut c_char {
     ffi_result(|| match (read_arg(path), read_arg(digest), read_arg(request), read_arg(key)) {
-        (Some(path), Some(sha), Some(req), Some(key)) => start(PathBuf::from(path), Mode::Agy(sha), req.into_bytes(), Some(key)),
+        (Some(path), Some(sha), Some(req), Some(key)) => start(PathBuf::from(path), Mode::Agy(sha), req.into_bytes(), Some(key), false),
         _ => failure("Missing connection arguments"),
     })
 }
+
+/// # Safety
+/// Pointers reference NUL-terminated UTF-8. Explicit consent required.
+/// Login process and ACP share one guest; never return raw login output.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_acp_start_google(path:*const c_char,digest:*const c_char,request:*const c_char)->*mut c_char {
+    ffi_result(||match (read_arg(path),read_arg(digest),read_arg(request)) {
+        (Some(p),Some(sha),Some(req))=>start(PathBuf::from(p),Mode::Agy(sha),req.into_bytes(),None,true),
+        _=>failure("Missing connection arguments"),
+    })
+}
+#[no_mangle]
+pub extern "C" fn nexus_google_login_progress()->*mut c_char {ffi_result(login_progress)}
+/// # Safety
+/// Code pointer must reference a NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_google_login_code(code:*const c_char)->*mut c_char {
+    ffi_result(||read_arg(code).map(submit_login_code).unwrap_or_else(||failure("Missing code")))
+}
+#[no_mangle]
+pub extern "C" fn nexus_google_login_cancel()->*mut c_char {ffi_result(cancel_login)}
 
 /// # Safety
 /// request must be a valid NUL-terminated UTF-8 string.
@@ -665,11 +755,48 @@ mod tests {
     }
 
     #[test]
+    fn google_code_validation() {
+        assert!(valid_login_code("4/fixture-code_123"));
+        assert!(!valid_login_code("abc"));
+        assert!(!valid_login_code("4/code\nextra"));
+        assert!(!valid_login_code(&"a".repeat(2049)));
+    }
+
+    #[test]
+    #[ignore = "requires separate fresh Ubuntu fakefs; synthetic Google login only"]
+    fn real_google_login_transport() {
+        let path=std::env::var_os("NEXUS_GOOGLE_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_GOOGLE_EVIDENCE").expect("evidence");
+        let worker=thread::spawn(move||start(PathBuf::from(path),Mode::Fixture,process_probe::AGY_INITIALIZE_REQUEST.to_vec(),None,true));
+        let deadline=std::time::Instant::now()+Duration::from_secs(15);
+        let offered=loop {
+            if login_progress()["url"].as_str().is_some_and(|s| s.starts_with("https://accounts.google.com/o/oauth2/")) {break true;}
+            if worker.is_finished() || std::time::Instant::now()>=deadline {break false;}
+            thread::sleep(Duration::from_millis(20));
+        };
+        let submitted=submit_login_code("NEXUS_FIXTURE_AUTH_CODE".into());
+        let duplicate=submit_login_code("NEXUS_FIXTURE_AUTH_CODE".into());
+        if !offered || submitted["ok"]!=true {let _=cancel_login();}
+        let first=worker.join().expect("worker");
+        let new=command(Action::New(NEW_REQUEST.to_vec()));
+        let prompt=command(Action::Prompt);
+        let close=command(Action::Close);
+        let evidence=json!({"ok":offered && submitted["ok"]==true && duplicate["ok"]==false &&
+            first["ok"]==true && first["credentialMode"]=="google-terminal-login" &&
+            new["sessionCreated"]==true && prompt["promptVerified"]==true && close["shutdownClean"]==true &&
+            login_progress()["running"]==false && login_progress()["url"]=="",
+            "fixtureOnly":true,"browserOffer":offered,"sameGuestSession":new["sessionCreated"],"promptVerified":prompt["promptVerified"],"shutdownClean":close["shutdownClean"]});
+        std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        println!("{evidence}");
+        assert_eq!(evidence["ok"],true);
+    }
+
+    #[test]
     #[ignore = "requires a separate fresh Ubuntu fakefs"]
     fn real_persistent_acp_transport() {
         let path = std::env::var_os("NEXUS_ACP_ROOTFS").expect("set NEXUS_ACP_ROOTFS");
         let evidence = std::env::var_os("NEXUS_ACP_EVIDENCE").expect("set NEXUS_ACP_EVIDENCE");
-        let first = start(PathBuf::from(path), Mode::Fixture, process_probe::AGY_INITIALIZE_REQUEST.to_vec(), Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()));
+        let first = start(PathBuf::from(path), Mode::Fixture, process_probe::AGY_INITIALIZE_REQUEST.to_vec(), Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()), false);
         let before_session = command(Action::Prompt);
         let second = command(Action::New(NEW_REQUEST.to_vec()));
         let duplicate = command(Action::New(NEW_REQUEST.to_vec()));

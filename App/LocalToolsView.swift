@@ -1,5 +1,6 @@
 #if NEXUS_UBUNTU_LAB && os(iOS) && !targetEnvironment(simulator)
 import SwiftUI
+import UIKit
 import Foundation
 import WebKit
 import Security
@@ -14,7 +15,7 @@ struct LocalToolsView: View {
     @State private var running = false
     @State private var ready = false
     @State private var output = ""
-    @State private var report = ""
+    @State private var report = "Select a mode and start a local job."
     @State private var confirm = false
     @State private var frozenMode: UInt8 = 1
     @State private var frozenInput = ""
@@ -56,13 +57,17 @@ struct LocalToolsView: View {
                 if running && frozenMode != 2 {
                     Section("Process controls") {
                         if frozenMode == 1 {
-                            TextField("Input line", text: $line).autocorrectionDisabled().textInputAutocapitalization(.never)
-                            Button("Send line") {
-                                if LocalRunner.input(line + "\n") { line = "" }
+                            Text("Paste commands on separate lines. Smart quotes and dashes are disabled.").font(.caption)
+                            TerminalInput(text: $line)
+                                .frame(minHeight: 84, maxHeight: 140)
+                            Button("Send command(s)") {
+                                let normalized = line.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+                                let wire = normalized.hasSuffix("\n") ? normalized : normalized + "\n"
+                                if LocalRunner.input(wire) { line = "" }
                                 else { report = "Input not accepted" }
-                            }.disabled(!ready || line.utf8.count > 1023 || line.utf8.contains(0))
+                            }.disabled(!ready || line.isEmpty || line.utf8.count > 1023 || line.utf8.contains(0))
                             Button("Send Ctrl-C") { _ = LocalRunner.input("\u{3}") }.disabled(!ready)
-                            Button("Resize to 111 × 33") { _ = LocalRunner.resize() }.disabled(!ready)
+                            Button("Resize to 111 × 33") { if !LocalRunner.resize() { report = "Resize not accepted" } }.disabled(!ready)
                         } else {
                             Button("Open local workbench") { webStatus = "Opening verified bind endpoint…"; workbenchShown = true }.disabled(!ready || token.isEmpty)
                             Text("Server launch requested; web view may fail until ready.").font(.caption)
@@ -147,6 +152,36 @@ struct LocalToolsView: View {
             token = ""
             workbenchShown = false
         }
+    }
+}
+
+/// UITextView preserves pasted newlines and explicitly disables iOS smart punctuation.
+private struct TerminalInput: UIViewRepresentable {
+    @Binding var text: String
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+    func makeUIView(context: Context) -> UITextView {
+        let v = UITextView()
+        v.font = .monospacedSystemFont(ofSize: 15, weight: .regular)
+        v.backgroundColor = .secondarySystemBackground
+        v.textColor = .label
+        v.smartQuotesType = .no
+        v.smartDashesType = .no
+        v.smartInsertDeleteType = .no
+        v.autocorrectionType = .no
+        v.autocapitalizationType = .none
+        v.spellCheckingType = .no
+        v.accessibilityLabel = "Terminal command input"
+        v.delegate = context.coordinator
+        v.text = text
+        return v
+    }
+    func updateUIView(_ view: UITextView, context: Context) {
+        if view.text != text { view.text = text }
+    }
+    final class Coordinator: NSObject, UITextViewDelegate {
+        @Binding var text: String
+        init(text: Binding<String>) { _text = text }
+        func textViewDidChange(_ textView: UITextView) { text = textView.text ?? "" }
     }
 }
 

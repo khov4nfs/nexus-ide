@@ -17,6 +17,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.nexuside.local
         GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
         SWIFT_VERSION: '5.0'
         INFOPLIST_KEY_CFBundleDisplayName: Nexus IDE
     scheme: {}

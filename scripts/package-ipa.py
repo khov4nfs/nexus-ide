@@ -66,6 +66,8 @@ def verify(path, variant):
         info = plistlib.loads(z.read(prefix+"Info.plist"))
         if info.get("CFBundleIdentifier") != VARIANTS[variant] or info.get("CFBundleSupportedPlatforms") != ["iPhoneOS"]:
             raise ValueError("Wrong bundle or platform")
+        if not isinstance(info.get("UILaunchScreen"), dict):
+            raise ValueError("Missing generated UILaunchScreen; reject legacy letterboxed IPA")
         if info.get("MinimumOSVersion") != "17.0":
             raise ValueError("Unexpected minimum OS")
         exe = info.get("CFBundleExecutable", "")

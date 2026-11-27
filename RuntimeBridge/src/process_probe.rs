@@ -99,6 +99,88 @@ fn shell(script: &str, env: &HashMap<String,String>) -> SpawnOpts {
     opts.pipe_stdin = true;
     opts
 }
+// Official AGY terminal sign-in, in the same disposable guest as ACP.
+// Never return raw PTY output, authorization code, stderr or token files.
+pub(crate) async fn google_login(guest: &IshInstance, env: &HashMap<String,String>, fixture: bool) -> Result<String,String> {
+    use crate::persistent_acp::{login_publish, login_take, LoginControl};
+    let mut opts = SpawnOpts::cmd(["/opt/nexus/agy","acp","--login","--disable-telemetry"]);
+    #[cfg(test)]
+    if fixture { opts = shell(include_str!("../fixtures/google-login.sh"),env); }
+    #[cfg(not(test))]
+    if fixture { return Err("Fixture unavailable".into()); }
+    opts.cwd = Some(Path::new("/tmp").to_path_buf());
+    opts.envp = Some(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect());
+    opts.tty = true;
+    opts.pipe_stdin = false;
+    opts.size = Some(PtySize{cols:240,rows:40});
+    let session = guest.spawn(opts).map_err(|_| "Login process spawn failed")?;
+    let deadline = Instant::now()+Duration::from_secs(180);
+    let mut capture = Capture::default();
+    let result = async {
+        let mut offered = false;
+        let mut submitted: Option<String> = None;
+        loop {
+            capture.poll(&session,deadline).await?;
+            if capture.closed {
+                return if capture.exited && capture.code == Some(0) && capture.signal.unwrap_or(0)==0 {
+                    submitted.ok_or("Login exited without code".into())
+                } else { Err("Login process failed".into()) };
+            }
+            if !offered && !capture.exited {
+                // Accept only complete, whitespace-terminated official Google
+                // OAuth URLs; do not export arbitrary agent-provided output.
+                if let Some(url) = google_oauth_url(&capture.pty) {
+                    login_publish(url)?;
+                    offered = true;
+                }
+            }
+            match login_take()? {
+                LoginControl::Cancel => return Err("Login cancelled".into()),
+                LoginControl::Code(code) if offered && submitted.is_none() && !capture.exited => {
+                    write_ready(&session,format!("{code}\n").as_bytes(),deadline).await?;
+                    submitted = Some(code);
+                }
+                LoginControl::None => {}
+                _ => return Err("Unexpected login input".into()),
+            }
+        }
+    }.await;
+    if result.is_err() {
+        let _ = session.terminate().await;
+        let _ = drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
+    }
+    result
+}
+
+fn google_oauth_url(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut start = 0;
+    // A word must end in whitespace; partial final frames are never offered.
+    for (end, ch) in text.char_indices() {
+        if !ch.is_ascii_whitespace() { continue; }
+        let word = &text[start..end];
+        start = end + ch.len_utf8();
+        if word.len() > 4096 || !word.bytes().all(|b| b.is_ascii_graphic()) ||
+            word.bytes().any(|b| matches!(b,b'\\'|b'<'|b'>'|b'"'|b'\''|b'\x60'|b'#')) { continue; }
+        if (word.starts_with("https://accounts.google.com/o/oauth2/v2/auth?") ||
+            word.starts_with("https://accounts.google.com/o/oauth2/auth?")) &&
+            word.contains("client_id=") && word.contains("state=") {
+            return Some(word.to_owned());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+#[test]
+fn google_oauth_url_only_complete_official_endpoint() {
+    let url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=fixture&state=fixture";
+    assert_eq!(google_oauth_url(format!("{url}\r\n").as_bytes()).as_deref(),Some(url));
+    assert!(google_oauth_url(url.as_bytes()).is_none());
+    assert!(google_oauth_url(b"https://accounts.google.com.evil/o/oauth2/v2/auth?client_id=x&state=x\n").is_none());
+    assert!(google_oauth_url(b"https://accounts.google.com@evil/o/oauth2/v2/auth?client_id=x&state=x\n").is_none());
+}
+
 async fn streams(guest: &IshInstance, env: &HashMap<String,String>) -> Result<Value,String> {
     let session = guest.spawn(shell("printf 'NEXUS_OUT_READY\\n'; printf 'NEXUS_ERR_READY\\n' >&2; IFS= read -r line || exit 8; printf 'reply:%s\\n' \"$line\"",env))
         .map_err(|e| e.to_string())?;
