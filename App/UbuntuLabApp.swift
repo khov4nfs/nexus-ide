@@ -61,10 +61,10 @@ struct UbuntuLabView: View {
             List {
                 Section("Ubuntu ARM64 · glibc lab") {
                     Text("One boot per app process. No remote backend.")
-                    Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted)
-                    Button("Initialize imported AGY (no key)") { useGemini = false; confirm = true }.disabled(attempted || digest == nil)
+                    Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed)
+                    Button("Initialize imported AGY (no key)") { useGemini = false; confirm = true }.disabled(attempted || model.guestClaimed || digest == nil)
                     Button("Connect with saved Gemini API key") { useGemini = true; confirm = true }
-                        .disabled(attempted || digest == nil || !keyStored)
+                        .disabled(attempted || model.guestClaimed || digest == nil || !keyStored)
                     Text(digest == nil ? "No reviewed AGY binary imported." : "Local AGY digest manifest present. Execution not verified.")
                     if running { ProgressView("Keep this app open") }
                 }
@@ -257,7 +257,7 @@ struct UbuntuLabView: View {
     }
 
     private func run(sha: String?, gemini: Bool = false) {
-        guard !attempted else { return }
+        guard !attempted, model.claimGuest() else { return }
         attempted = true
         running = true
         Task {
@@ -331,7 +331,7 @@ struct UbuntuLabView: View {
                 contextStatus = "Question and snapshot must fit 1024 UTF-8 bytes"; return
             }
             guard let key = try GeminiKeychain.load(), !wire.contains(key) else {
-                fileContext = nil; chatInput = ""; contextStatus = "Credential unavailable or detected"; return
+                fileContext = nil; editSnapshot = nil; chatInput = ""; contextStatus = "Credential unavailable or detected"; return
             }
             pendingChat = wire
             pendingEdit = editSnapshot

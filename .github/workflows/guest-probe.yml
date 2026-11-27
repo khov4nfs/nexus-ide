@@ -18,6 +18,7 @@ on:
       - 'project-glibc.yml'
       - 'App/UbuntuLabApp.swift'
       - 'App/NexusApp.swift'
+      - 'App/LocalToolsView.swift'
       - 'App/GeminiKeychain.swift'
       - 'project-guest.yml'
       - 'App/GuestProbeView.swift'
@@ -166,6 +167,31 @@ jobs:
             ${{ runner.temp }}/nexus-acp-evidence.json
             ${{ runner.temp }}/nexus-acp-cancel-evidence.json
             ${{ runner.temp }}/nexus-acp-chat-evidence.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Real local PTY and MCP discovery fixture
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for mode in pty mcp; do
+            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-local-$mode-fs"
+            export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-local-$mode-fs/data"
+            export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-local-$mode.json"
+            rm -f "$NEXUS_LOCAL_EVIDENCE"
+            if [ "$mode" = mcp ]; then export NEXUS_LOCAL_MCP=1; else export NEXUS_LOCAL_MCP=0; fi
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_local_job -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["shutdownClean"] is True; assert (r["ptyVerified"] is True and r["exitCode"] == 0) if sys.argv[2]=="pty" else (r["tools"]==["fixture_echo"] and r["discoveryOnly"] is True and r["transportClosed"] is True)' "$NEXUS_LOCAL_EVIDENCE" "$mode"
+          done
+      - name: Upload local job evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-job-evidence
+          path: |
+            ${{ runner.temp }}/nexus-local-pty.json
+            ${{ runner.temp }}/nexus-local-mcp.json
           if-no-files-found: warn
           retention-days: 7
       - name: Record scope

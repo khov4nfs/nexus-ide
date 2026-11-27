@@ -28,6 +28,12 @@ struct GuestEditPreview: Identifiable {
     @Published var guestBusy = false
 #endif
     @Published var reviewBusy = false
+    @Published private(set) var guestClaimed = false
+    func claimGuest() -> Bool {
+        guard !guestClaimed else { return false }
+        guestClaimed = true
+        return true
+    }
     private var workspace: Workspace?
     private var runtime: NativeRuntime?
 
@@ -172,6 +178,7 @@ struct IDEView: View {
             }.tabItem { Label("Console", systemImage: "terminal") }
 #if NEXUS_UBUNTU_LAB && os(iOS) && !targetEnvironment(simulator)
             UbuntuLabView(model: model).tabItem { Label("Agent", systemImage: "cpu") }
+            LocalToolsView(model: model).tabItem { Label("Local tools", systemImage: "terminal.fill") }
 #else
             NavigationStack {
                 List {

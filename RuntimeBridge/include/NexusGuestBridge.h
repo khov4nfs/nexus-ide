@@ -29,6 +29,13 @@ char *nexus_acp_chat(const char *text);
 char *nexus_acp_prompt_progress(void);
 char *nexus_acp_cancel_prompt(void);
 char *nexus_acp_close(void);
+// Separate local boot: 1 PTY, 2 MCP discovery, 3 token-protected workbench.
+#include <stdint.h>
+char *nexus_local_run(const char *rootfs_data_path, uint8_t mode, const char *input);
+char *nexus_local_progress(void);
+char *nexus_local_input(const char *input);
+char *nexus_local_resize(uint16_t cols, uint16_t rows);
+char *nexus_local_stop(void);
 void nexus_guest_free(char *result);
 #ifdef __cplusplus
 }

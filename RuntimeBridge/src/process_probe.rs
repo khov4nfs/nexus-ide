@@ -528,6 +528,10 @@ impl ACPExchange {
         Self { session, capture: Capture::default(), offset: 0 }
     }
 
+    pub(crate) async fn notify(&self, bytes: &[u8]) -> Result<(),String> {
+        write_ready(&self.session, bytes, Instant::now() + TIMEOUT).await
+    }
+
     pub(crate) async fn request(&mut self, bytes: &[u8], id: i64) -> Result<Value,String> {
         self.request_updates(bytes, id, |_| Ok(())).await
     }
@@ -591,6 +595,98 @@ impl ACPExchange {
         let sent = self.session.terminate().await.is_ok();
         let drained = drain(&self.session, &mut self.capture, Instant::now() + TIMEOUT).await.is_ok();
         sent && drained && self.capture.closed && self.capture.pty.is_empty()
+    }
+}
+
+
+// User-initiated local jobs in a separate disposable Ubuntu boot. No host
+// workspace, native tool callbacks, provider credential or remote executor.
+pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,String>, command: &str, workbench: bool) -> Value {
+    use crate::local_jobs::{take_control, publish_output, Control};
+    let mut opts = shell(command, env);
+    opts.cwd = Some(Path::new("/tmp").to_path_buf());
+    if !workbench {
+        opts.tty = true;
+        opts.pipe_stdin = false;
+        opts.size = Some(PtySize{cols:80,rows:24});
+    } else {
+        opts.pipe_stdin = false;
+    }
+    let session = match guest.spawn(opts) {
+        Ok(s) => s, Err(_) => return json!({"ok":false,"error":"Local process spawn failed"}),
+    };
+    let mut capture = Capture::default();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut stopped = false;
+    let result: Result<(),String> = async {
+        loop {
+            for control in take_control() {
+                match control {
+                    Control::Stop => {
+                        if !stopped && !capture.exited {
+                            session.terminate().await.map_err(|_| "Stop failed".to_owned())?;
+                            stopped = true;
+                        }
+                    }
+                    Control::Input(bytes) if !workbench && !stopped && !capture.exited =>
+                        write_ready(&session,&bytes,deadline).await?,
+                    Control::Resize(cols,rows) if !workbench && !stopped && !capture.exited =>
+                        session.resize(cols,rows).await.map_err(|_| "Resize failed".to_owned())?,
+                    _ => {}
+                }
+            }
+            capture.poll(&session, deadline).await?;
+            // A stopped or failed process may have descendants. Only a clean
+            // guest shutdown is final evidence of cleanup.
+            if !workbench { publish_output(&capture.pty, !capture.exited && !capture.closed); }
+            else { publish_output(&[], !capture.exited && !capture.closed); }
+            if capture.closed { break; }
+        }
+        Ok(())
+    }.await;
+    if result.is_err() {
+        let _ = session.terminate().await;
+        let _ = drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
+    }
+    json!({"ok":result.is_ok() && capture.closed && capture.exited,
+        "stopped":stopped,"exitCode":capture.code,"termSignal":capture.signal,
+        "closed":capture.closed,"error":if result.is_err() { Some("Local process deadline, output limit or transport failure") } else { None }})
+}
+
+pub(crate) async fn mcp_discover(guest: &IshInstance, env: &HashMap<String,String>, command: &str) -> Value {
+    let mut opts = shell(command, env);
+    opts.cwd = Some(Path::new("/tmp").to_path_buf());
+    let session = match guest.spawn(opts) {
+        Ok(s) => s, Err(_) => return json!({"ok":false,"error":"MCP process spawn failed"}),
+    };
+    let mut exchange = ACPExchange::new(session);
+    let result: Result<Vec<String>,String> = async {
+        let init = exchange.request(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"nexus-ios\",\"version\":\"0.4.1\"}}}\n",1).await?;
+        if init.get("error").is_some() || init["result"]["protocolVersion"] != "2025-11-25" ||
+            !init["result"]["capabilities"]["tools"].is_object() {
+            return Err("MCP protocol/tools capability not supported".into());
+        }
+        exchange.notify(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n").await?;
+        let list = exchange.request(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n",2).await?;
+        if list.get("error").is_some() || list["result"].get("nextCursor").is_some() {
+            return Err("MCP error or unsupported pagination".into());
+        }
+        let tools = list["result"]["tools"].as_array().filter(|a| a.len() <= 32).ok_or("Invalid tool list")?;
+        let mut names = Vec::new();
+        for tool in tools {
+            let name = tool["name"].as_str().filter(|s| !s.is_empty() && s.len() <= 128 &&
+                s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))).ok_or("Invalid tool name")?;
+            if !tool["inputSchema"].is_object() || names.iter().any(|n| n == name) {
+                return Err("Invalid or duplicate MCP tool".into());
+            }
+            names.push(name.to_owned());
+        }
+        Ok(names)
+    }.await;
+    let closed = exchange.close().await;
+    match result {
+        Ok(names) => json!({"ok":closed,"transportClosed":closed,"protocolVersion":"2025-11-25","tools":names,"discoveryOnly":true}),
+        Err(_) => json!({"ok":false,"transportClosed":closed,"error":"MCP discovery rejected or incomplete"}),
     }
 }
 

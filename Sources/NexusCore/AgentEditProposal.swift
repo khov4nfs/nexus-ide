@@ -42,6 +42,7 @@ public struct AgentEditProposal: Identifiable, Sendable {
     }
 
     public static func prompt(snapshot: WorkspaceSnapshot, question: String) throws -> String {
+        guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw AgentFileContext.Failure.emptyQuestion }
         let context = try AgentFileContext(data: Data(snapshot.text.utf8))
         return try context.prompt(question: question + "\nReturn only JSON with one string field replacement containing the complete revised file. No markdown or tool calls.")
     }
