@@ -10,7 +10,7 @@ fi
 test "$(git -C "$target" remote get-url origin)" = https://github.com/migueldeicaza/SwiftTerm.git
 test -z "$(git -C "$target" status --porcelain)"
 revision=$(git -C "$target" rev-parse HEAD)
-[[ "$revision" == 464df52* ]]
+test "$revision" = 464df5207fc2432e16c9a23abe538187196daf5f
 test "$(git -C "$target" rev-parse 'refs/tags/v1.19.0^{commit}')" = "$revision"
 license="$target/LICENSE"
 if [[ ! -f "$license" ]]; then license="$target/LICENSE.txt"; fi

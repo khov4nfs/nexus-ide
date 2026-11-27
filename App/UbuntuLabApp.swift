@@ -51,6 +51,7 @@ struct UbuntuLabView: View {
     @State private var useGemini = false
     @State private var useGoogle = false
     @State private var enableSnapshotRead = false
+    @State private var enableSnapshotWrite = false
     @State private var snapshotReadThisTurn = false
     @State private var pendingReadContent: String?
     @State private var loginURL = ""
@@ -107,7 +108,9 @@ struct UbuntuLabView: View {
                     }
                     Toggle("Enable read-only ACP attachment tool", isOn: $enableSnapshotRead)
                         .disabled(attempted || model.guestClaimed)
-                    Text("Optional: only a selected immutable text snapshot can be read, for one confirmed turn. No iOS path or write access.").font(.caption)
+                    Toggle("Enable staged ACP editor edits", isOn: $enableSnapshotWrite)
+                        .disabled(attempted || model.guestClaimed)
+                    Text("Optional: selected text only, for one confirmed turn. Staged edits require separate editor selection and native diff review; no direct iOS file write.").font(.caption)
                     Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed || importingAGY)
                     Button("Initialize imported AGY (no key)") { useGemini = false; useGoogle = false; confirm = true }.disabled(attempted || model.guestClaimed || importingAGY || digest == nil)
                     Button("Connect with saved Gemini API key") { useGemini = true; useGoogle = false; confirm = true }
@@ -158,7 +161,7 @@ struct UbuntuLabView: View {
                 }
                 Section("Native ACP client") {
                     Text(agentStatus)
-                    Text("ACP permissions deny by default. Optional selected snapshot is read-only. Agent internal actions are not sandboxed.").font(.caption)
+                    Text("ACP permissions deny by default. Selected virtual file edits require native review. Agent internal actions are not sandboxed.").font(.caption)
                     if active {
                         Text("Connection closes after 180 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
                         Button("Create empty guest session") { act(close: false) }.disabled(running || created)
@@ -344,7 +347,7 @@ struct UbuntuLabView: View {
                 }
                 Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil }
             } message: {
-                Text("Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
+                Text(pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Do not share secrets." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
             }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
@@ -388,12 +391,13 @@ struct UbuntuLabView: View {
     private func run(sha: String?, gemini: Bool = false, google: Bool = false) {
         guard !attempted, !importingAGY, model.claimGuest() else { return }
         let selected = sha == nil ? nil : importedAGY
-        let readSnapshot = enableSnapshotRead
+        let writeSnapshot = enableSnapshotWrite && gemini
+        let readSnapshot = enableSnapshotRead || writeSnapshot
         attempted = true
         running = true
         loginURL = ""; loginCode = ""; loginSubmitted = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected, readSnapshot: readSnapshot) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected, readSnapshot: readSnapshot, writeSnapshot: writeSnapshot) }.value
             loginURL = ""; loginCode = ""; loginRunning = false
             // Keep the separately reviewed binary; never persist OAuth tokens with it.
             report = result.report
@@ -465,7 +469,11 @@ struct UbuntuLabView: View {
             pendingReadContent = nil
             if let editSnapshot {
                 guard proposal == nil else { contextStatus = "Review or discard the previous proposal"; return }
-                wire = try AgentEditProposal.prompt(snapshot: editSnapshot, question: chatInput)
+                if enableSnapshotWrite {
+                    guard useGemini, !chatInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, try credentialAllows(editSnapshot.text) else { contextStatus = "Credential detected"; return }
+                    wire = chatInput + "\nRead /nexus-selected.txt and stage one complete replacement via fs/write_text_file. Native user will review before applying."
+                    pendingReadContent = editSnapshot.text
+                } else { wire = try AgentEditProposal.prompt(snapshot: editSnapshot, question: chatInput) }
             } else if enableSnapshotRead, snapshotReadThisTurn, let context = fileContext {
                 guard try credentialAllows(context.text) else { contextStatus = "Credential detected"; return }
                 wire = chatInput + "\nRead the selected text via fs/read_text_file at /nexus-selected.txt if needed."
@@ -514,7 +522,7 @@ struct UbuntuLabView: View {
         toolUpdates = 0
         cancelRequested = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent, stageEdit: edit != nil && readContent != nil) }.value
             let snapshot = UbuntuRunner.progress()
             if snapshot.responseID == expectedID {
                 permissionDenials = snapshot.permissionDenials
@@ -527,7 +535,9 @@ struct UbuntuLabView: View {
                     status: matches ? result.status : "Turn failed or response mismatch"))
                 if let edit {
                     if result.ok && matches && result.status == "Chat turn completed", let key = try? GeminiKeychain.load(),
-                       let candidate = try? AgentEditProposal(snapshot: edit, response: text, credential: key) {
+                       let candidate = try? (readContent != nil
+                           ? AgentEditProposal(snapshot: edit, stagedReplacement: result.stagedResponse, credential: key)
+                           : AgentEditProposal(snapshot: edit, response: text, credential: key)) {
                         proposal = candidate
                         editStatus = "Untrusted proposal ready for explicit review"
                     } else { editStatus = "No valid complete replacement returned; nothing written" }
@@ -577,7 +587,7 @@ private enum UbuntuRunner {
             do { try FileManager.default.removeItem(at: trial); activeTrial = nil } catch { /* leave for next launch */ }
         }
     }
-    static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?, readSnapshot: Bool) -> (report: String, status: String, active: Bool) {
+    static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?, readSnapshot: Bool, writeSnapshot: Bool) -> (report: String, status: String, active: Bool) {
         var client = ACPInitializeClient()
         func failed(_ reason: String) -> (String, String, Bool) { (reason, "Not initialized", false) }
         do {
@@ -610,7 +620,7 @@ private enum UbuntuRunner {
                 }
             }
             let data = trial.appendingPathComponent("data", isDirectory: true)
-            let request = sha == nil ? nil : String(decoding: try client.request(readSnapshot: readSnapshot), as: UTF8.self)
+            let request = sha == nil ? nil : String(decoding: try client.request(readSnapshot: readSnapshot, writeSnapshot: writeSnapshot), as: UTF8.self)
             let pointer = data.path.withCString { path in
                 if let sha, let request {
                     return sha.withCString { digest in
@@ -695,11 +705,11 @@ private enum UbuntuRunner {
         controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
     }
 
-    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int) {
+    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
-            else if let chat, let readContent { pointer = chat.withCString { t in readContent.withCString { nexus_acp_chat_snapshot(t,$0) } } }
+            else if let chat, let readContent { pointer = chat.withCString { t in readContent.withCString { stageEdit ? nexus_acp_chat_edit(t,$0) : nexus_acp_chat_snapshot(t,$0) } } }
             else if let chat { pointer = chat.withCString { nexus_acp_chat($0) } }
             else if prompt { pointer = nexus_acp_prompt_probe() }
             else {
@@ -708,13 +718,13 @@ private enum UbuntuRunner {
             }
             guard let pointer else {
                 nexus_guest_free(nexus_acp_close())
-                return ("No report", "Connection unavailable", false, false, 0)
+                return ("No report", "Connection unavailable", false, false, 0, nil)
             }
             defer { nexus_guest_free(pointer) }
             let raw = String(cString: pointer)
             guard let object = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] else {
                 nexus_guest_free(nexus_acp_close())
-                return ("Invalid report", "Connection unavailable", false, false, 0)
+                return ("Invalid report", "Connection unavailable", false, false, 0, nil)
             }
             cleanTrialIfShutdown(object)
             let active = object["active"] as? Bool == true
@@ -735,10 +745,16 @@ private enum UbuntuRunner {
             } else {
                 status = "Request failed or connection expired; restart app"
             }
-            return (raw, status, active, ok, object["responseId"] as? Int ?? 0)
+            var reportObject = object
+            let replacement = reportObject.removeValue(forKey: "stagedReplacement") as? String
+            let stagedResponse: String?
+            if stageEdit, ok, status == "Chat turn completed" { stagedResponse = replacement }
+            else { stagedResponse = nil }
+            let report = (try? JSONSerialization.data(withJSONObject: reportObject, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) } ?? "Report unavailable"
+            return (report, status, active, ok, object["responseId"] as? Int ?? 0, stagedResponse)
         } catch {
             nexus_guest_free(nexus_acp_close())
-            return ("Request encoding failed", "Connection stopped", false, false, 0)
+            return ("Request encoding failed", "Connection stopped", false, false, 0, nil)
         }
     }
 }

@@ -16,7 +16,7 @@ const IDLE: Duration = Duration::from_secs(180);
 const REPLY: Duration = Duration::from_secs(300);
 const NEW_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\",\"mcpServers\":[]}}\n";
 type Reply = SyncSender<Value>;
-enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Option<String>, Reply), Close(Reply) }
+enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Option<String>, bool, Reply), Close(Reply) }
 static ACTIVE: Mutex<Option<SyncSender<Command>>> = Mutex::new(None);
 static WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct ActiveGuard;
@@ -229,8 +229,8 @@ const SNAPSHOT_PATH:&str="/nexus-selected.txt";
 fn valid_snapshot(s:&str)->bool {
     !s.trim().is_empty() && s.len()<=768 && s.chars().all(|c| !c.is_control() || c=='\n' || c=='\t')
 }
-// Never opens a filesystem path. Only serves immutable bytes explicitly
-// provided by the user for the current turn, and only for one virtual path.
+// Never opens a filesystem path. Only serves consented bytes or the validated
+// staged replacement for the current turn and one virtual path.
 fn read_snapshot_reply(frame:&Value,session:&str,snapshot:Option<&str>)->Result<Value,String> {
     if frame["jsonrpc"]!="2.0" || frame["method"]!="fs/read_text_file" ||
         frame.get("result").is_some() || frame.get("error").is_some() {return Err("Invalid read request".into());}
@@ -238,13 +238,26 @@ fn read_snapshot_reply(frame:&Value,session:&str,snapshot:Option<&str>)->Result<
     let deny=||json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"No matching snapshot grant"}});
     let params=&frame["params"];
     if params["sessionId"]!=session || params["path"]!=SNAPSHOT_PATH {return Ok(deny());}
-    let Some(text)=snapshot.filter(|s|valid_snapshot(s)) else {return Ok(deny());};
-    let line=match params.get("line") {None|Some(Value::Null)=>1,Some(v)=>match v.as_u64(){Some(n) if n>=1 && n<=769=>n as usize,_=>return Ok(deny())}};
-    let limit=match params.get("limit") {None|Some(Value::Null)=>769,Some(v)=>match v.as_u64(){Some(n) if n>=1 && n<=769=>n as usize,_=>return Ok(deny())}};
-    let content=if line==1 && params.get("limit").is_none() {text.to_owned()} else {
+    let Some(text)=snapshot.filter(|s|s.len()<=4096 && s.chars().all(|c|!c.is_control() || c=='\n' || c=='\t')) else {return Ok(deny());};
+    let line=match params.get("line") {None|Some(Value::Null)=>1,Some(v)=>match v.as_u64(){Some(n) if n>=1 && n<=4097=>n as usize,_=>return Ok(deny())}};
+    let limit=match params.get("limit") {None|Some(Value::Null)=>4097,Some(v)=>match v.as_u64(){Some(n) if n>=1 && n<=4097=>n as usize,_=>return Ok(deny())}};
+    let content=if line==1 && params.get("limit").is_none_or(Value::is_null) {text.to_owned()} else {
         text.split('\n').skip(line-1).take(limit).collect::<Vec<_>>().join("\n")
     };
     Ok(json!({"jsonrpc":"2.0","id":id,"result":{"content":content}}))
+}
+// ACP write is virtual: stage a replacement, never touch a native path.
+fn stage_write_reply(frame:&Value,session:&str,allowed:bool,key:&str,staged:&mut Option<String>)->Result<Value,String> {
+    if frame["jsonrpc"]!="2.0" || frame["method"]!="fs/write_text_file" ||
+        frame.get("result").is_some() || frame.get("error").is_some() {return Err("Invalid write request".into());}
+    let id=frame.get("id").filter(|v|v.as_i64().is_some() || v.as_str().is_some_and(|s|!s.is_empty()&&s.len()<=256)).ok_or("Invalid write ID")?;
+    let deny=||json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"No matching staged write grant"}});
+    let params=&frame["params"];
+    if !allowed || staged.is_some() || params["sessionId"]!=session || params["path"]!=SNAPSHOT_PATH {return Ok(deny());}
+    let Some(text)=params["content"].as_str().filter(|s|s.len()<=4096 && !key.is_empty() && !s.contains(key) &&
+        s.chars().all(|c|!c.is_control() || c=='\n' || c=='\t')) else {return Ok(deny());};
+    *staged=Some(text.to_owned());
+    Ok(json!({"jsonrpc":"2.0","id":id,"result":{}}))
 }
 #[derive(Default)]
 struct PromptEvidence {
@@ -381,7 +394,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
         }
     };
     let mut exchange = ACPExchange::new(session);
-    let snapshot_capability=process_probe::snapshot_initialize_request(&request);
+    let edit_capability=process_probe::edit_initialize_request(&request);
+    let snapshot_capability=edit_capability || process_probe::snapshot_initialize_request(&request);
     let init = rt.block_on(exchange.request(&request, 1));
     let response = match init {
         Ok(frame) => match &mode {
@@ -449,7 +463,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     }
                 }
             }
-            Ok(Command::Prompt(chat, snapshot, reply)) => {
+            Ok(Command::Prompt(chat, snapshot, edit, reply)) => {
                 let Some(id) = session_id.as_deref() else {
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Create a session first"}));
                     continue;
@@ -466,7 +480,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Invalid chat input or credential detected"}));
                     continue;
                 }
-                if snapshot.as_ref().is_some_and(|s| !snapshot_capability || chat.is_none() ||
+                if (edit && (!edit_capability || snapshot.is_none())) || snapshot.as_ref().is_some_and(|s| !snapshot_capability || chat.is_none() ||
                     !valid_snapshot(s) || s.contains(key)) {
                     let _=reply.send(json!({"ok":false,"active":true,"error":"Snapshot grant unavailable or invalid"}));
                     continue;
@@ -484,6 +498,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                 let mut cancel_taken = false;
                 let mut permission_ids = std::collections::HashSet::new();
                 let mut snapshot_reads=0usize;
+                let mut staged:Option<String>=None;
                 let result = rt.block_on(exchange.request_controlled(wire.as_bytes(), response_id,
                     |frame| {
                         evidence.update(frame, id)?;
@@ -513,10 +528,12 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         }
                         let mut p = PROGRESS.lock().map_err(|_| "Permission status unavailable")?;
                         let response = if frame["method"]=="fs/read_text_file" && snapshot_capability {
-                            let granted=if p.cancel_requested || snapshot_reads>=4 {None} else {snapshot.as_deref()};
+                            let granted=if p.cancel_requested || snapshot_reads>=4 {None} else {staged.as_deref().or(snapshot.as_deref())};
                             let reply=read_snapshot_reply(frame,id,granted)?;
                             if reply.get("result").is_some() {snapshot_reads+=1;}
                             reply
+                        } else if frame["method"]=="fs/write_text_file" {
+                            stage_write_reply(frame,id,edit && !p.cancel_requested && staged.is_none(),key,&mut staged)?
                         } else {permission_reply(frame, id, p.cancel_requested)?};
                         if !permission_ids.insert(response["id"].to_string()) {
                             return Err("Duplicate permission request ID".into());
@@ -527,6 +544,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         Ok(response)
                     }));
                 drop(progress);
+                let cancel_requested = PROGRESS.lock().map(|p|p.cancel_requested).unwrap_or(true);
                 let cancelled = cancel_taken && result.as_ref().is_ok_and(|frame|
                     frame.get("error").is_none() && frame["result"]["stopReason"] == "cancelled");
                 if cancelled {
@@ -539,11 +557,11 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                 }
                 let chat_success = is_chat && result.as_ref().is_ok_and(|frame|
                     frame.get("error").is_none() && frame["result"]["stopReason"] == "end_turn" &&
-                    evidence.chunks > 0 && visible_prefix(&evidence.text, key)
-                        .is_ok_and(|s| !s.trim().is_empty()));
+                    (staged.is_some() || (evidence.chunks > 0 && visible_prefix(&evidence.text, key)
+                        .is_ok_and(|s| !s.trim().is_empty()))));
                 if chat_success {
                     if reply.send(json!({"ok":true,"active":true,"chatCompleted":true,
-                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn","snapshotReads":snapshot_reads})).is_err() {
+                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn","snapshotReads":snapshot_reads,"stagedReplacement":if !cancel_requested { staged.take() } else { None }})).is_err() {
                         break None;
                     }
                     continue;
@@ -578,7 +596,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
 fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, google: bool) -> Value {
     if google && key.is_some() { return failure("Choose one authentication method"); }
     if key.as_deref().is_some_and(|s| !valid_key(s)) { return failure("Invalid credential shape"); }
-    if !process_probe::valid_initialize_request(&request) && !process_probe::snapshot_initialize_request(&request) {
+    if !process_probe::valid_initialize_request(&request) && !process_probe::snapshot_initialize_request(&request) && !process_probe::edit_initialize_request(&request) {
         return failure("Invalid initialize request");
     }
     if let Mode::Agy(sha) = &mode {
@@ -606,13 +624,13 @@ fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, googl
     }
 }
 
-enum Action { New(Vec<u8>), Prompt, Chat(String), Snapshot(String,String), Close }
+enum Action { New(Vec<u8>), Prompt, Chat(String), Snapshot(String,String), Edit(String,String), Close }
 
 fn command(action: Action) -> Value {
     let Ok(mut slot) = ACTIVE.lock() else { return failure("Connection lock failed"); };
     let Some(tx) = slot.as_ref() else { return failure("No active connection"); };
     let (reply, wait) = mpsc::sync_channel(1);
-    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(None, None, reply), Action::Chat(text) => Command::Prompt(Some(text), None, reply), Action::Snapshot(text,content) => Command::Prompt(Some(text),Some(content),reply), Action::Close => Command::Close(reply) };
+    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(None, None, false, reply), Action::Chat(text) => Command::Prompt(Some(text), None, false, reply), Action::Snapshot(text,content) => Command::Prompt(Some(text),Some(content),false,reply), Action::Edit(text,content) => Command::Prompt(Some(text),Some(content),true,reply), Action::Close => Command::Close(reply) };
     if tx.send(message).is_err() {
         *slot = None; return failure("Connection stopped or idle timeout");
     }
@@ -736,9 +754,35 @@ pub extern "C" fn nexus_acp_close() -> *mut c_char {
     ffi_result(|| command(Action::Close))
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn nexus_acp_chat_edit(text:*const c_char,content:*const c_char)->*mut c_char {
+    ffi_result(||match (read_arg(text),read_arg(content)) {
+        (Some(t),Some(c)) if valid_chat(&t)&&valid_snapshot(&c)=>command(Action::Edit(t,c)),
+        _=>failure("Invalid staged edit request"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn staged_write_scope_and_limits() {
+        let mut staged=None;
+        let mut f=json!({"jsonrpc":"2.0","id":77,"method":"fs/write_text_file","params":{"sessionId":"s","path":SNAPSHOT_PATH,"content":"new"}});
+        assert!(stage_write_reply(&f,"s",false,"SECRET",&mut staged).unwrap().get("error").is_some());
+        assert!(stage_write_reply(&f,"other",true,"SECRET",&mut staged).unwrap().get("error").is_some());
+        f["params"]["path"]=json!("/etc/passwd");
+        assert!(stage_write_reply(&f,"s",true,"SECRET",&mut staged).unwrap().get("error").is_some());
+        f["params"]["path"]=json!(SNAPSHOT_PATH);
+        f["params"]["content"]=json!("SECRET");
+        assert!(stage_write_reply(&f,"s",true,"SECRET",&mut staged).unwrap().get("error").is_some());
+        f["params"]["content"]=json!("x".repeat(4097));
+        assert!(stage_write_reply(&f,"s",true,"SECRET",&mut staged).unwrap().get("error").is_some());
+        f["params"]["content"]=json!("new");
+        assert!(stage_write_reply(&f,"s",true,"SECRET",&mut staged).unwrap().get("result").is_some());
+        assert_eq!(staged.as_deref(),Some("new"));
+        assert!(stage_write_reply(&f,"s",true,"SECRET",&mut staged).unwrap().get("error").is_some());
+    }
     #[test]
     fn virtual_read_scope_and_line_bounds() {
         let mut f=json!({"jsonrpc":"2.0","id":77,"method":"fs/read_text_file","params":{"sessionId":"s","path":SNAPSHOT_PATH,"line":2,"limit":1}});
@@ -837,15 +881,17 @@ mod tests {
         let path=std::env::var_os("NEXUS_ACP_ROOTFS").expect("rootfs");
         let file=std::env::var_os("NEXUS_ACP_EVIDENCE").expect("evidence");
         let mut req:Value=serde_json::from_slice(process_probe::AGY_INITIALIZE_REQUEST).unwrap();
-        req["params"]["clientCapabilities"]=json!({"fs":{"readTextFile":true,"writeTextFile":false}});
+        req["params"]["clientCapabilities"]=json!({"fs":{"readTextFile":true,"writeTextFile":true}});
         let init=start(PathBuf::from(path),Mode::Fixture,format!("{req}\n").into_bytes(),Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()),false);
         let new=command(Action::New(NEW_REQUEST.to_vec()));
         let prompt=command(Action::Snapshot("Read /nexus-selected.txt".into(),"one\nforty-two\nthree".into()));
         let response=prompt_progress()["text"]=="NEXUS_SNAPSHOT_OK";
+        let edit=command(Action::Edit("Stage replacement".into(),"one\nforty-two\nthree".into()));
+        let write_verified=edit["chatCompleted"]==true && edit["stagedReplacement"]=="updated" && edit["snapshotReads"]==1;
         let close=command(Action::Close);
         let evidence=json!({"ok":init["ok"]==true && new["ok"]==true && prompt["chatCompleted"]==true &&
-            prompt["snapshotReads"]==1 && response && close["shutdownClean"]==true,
-            "fixtureOnly":true,"scopeVerified":response,"snapshotReads":prompt["snapshotReads"],"shutdownClean":close["shutdownClean"]});
+            prompt["snapshotReads"]==1 && response && write_verified && close["shutdownClean"]==true,
+            "fixtureOnly":true,"scopeVerified":response,"stagedWriteVerified":write_verified,"snapshotReads":prompt["snapshotReads"],"shutdownClean":close["shutdownClean"]});
         std::fs::write(file,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
         println!("{evidence}");
         assert_eq!(evidence["ok"],true);

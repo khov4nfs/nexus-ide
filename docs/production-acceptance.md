@@ -21,3 +21,8 @@ Baseline: main 426260d (PR #21); runtime run 46005906821 logs show Ubuntu and Al
 Use GitHub Actions main workflow with owner license review and publish_prerelease=true to generate the unsigned IPA; no personal Mac or App Store required. Device signing via existing SideStore. Do not share OAuth codes, tokens, pairing files, logs with secrets, or proprietary AGY binary.
 
 Upstream references: https://github.com/migueldeicaza/SwiftTerm/releases ; https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/protocol/v1/file-system.mdx .
+
+## Consolidated follow-up: staged ACP write candidate
+PR #22 merged at 6179a190; PR head 72e3f91 workflow runs 46007957880 and 46007958087 reported success. This follow-up adds opt-in ACP v1 virtual write capability. It grants only a selected saved editor snapshot on one explicitly consented Gemini-key edit turn; one bounded replacement is staged in memory, never applied by the bridge. The native conflict-aware diff review remains mandatory; cancel or failed responses discard staged changes. Read-only chat grants cannot write. The transport fixture checks both denied writes and successful staging. No direct filesystem, shell, hooks, Google edit, additional harness or Docker capability is claimed. New CI and device validation pending.
+
+Hardening: read-only and staged-write capabilities are separate opt-ins; staged write is Gemini-key mode only, with explicit per-turn consent. Read-after-write serves the staged replacement (including empty content). SwiftTerm v1.19.0 tag was independently resolved through upstream GitHub Git ref to 464df5207fc2432e16c9a23abe538187196daf5f; build and packaging now require that exact revision. This pin does not establish dependency security or redistribution compliance.

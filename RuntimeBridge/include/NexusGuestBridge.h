@@ -33,6 +33,8 @@ char *nexus_acp_prompt_probe(void);
 char *nexus_acp_chat(const char *text);
 // Optional read-only capability: explicit one-turn virtual snapshot, no native path.
 char *nexus_acp_chat_snapshot(const char *text,const char *content);
+// Explicit per-turn virtual write grant; stages replacement for native review only.
+char *nexus_acp_chat_edit(const char *text,const char *content);
 // Concurrent-safe status and cancel request; does not wait for completion.
 char *nexus_acp_prompt_progress(void);
 char *nexus_acp_cancel_prompt(void);
