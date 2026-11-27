@@ -1,0 +1,85 @@
+{
+  "commit": "c8e9dcb954963b0d9f359b3ad9da871f19b28652",
+  "changes": {
+    "kernel/exit.c": [
+      [
+        "static void halt_system(void);",
+        "static bool halt_system(void);\n// Set only by the embedding FFI, not the command-line executable.\nint nexus_embedded_shutdown = 0;"
+      ],
+      [
+        "            halt_system();",
+        "            if (!halt_system())\n                goto skip_zombie_notify;"
+      ],
+      [
+        "static void halt_system(void) {\n    int max_iterations",
+        "static bool halt_system(void) {\n    // pids_lock is held by do_exit. Never sleep, signal host threads, or\n    // terminate the host process in embedded mode. Refuse to report clean\n    // shutdown if live guest tasks remain; shutdown will time out.\n    if (nexus_embedded_shutdown) {\n        for (int i = 2; i <= MAX_PID; i++) {\n            if (pid_get_task(i) != NULL) {\n                printk(\"embedded halt: live guest task remains\\n\");\n                return false;\n            }\n        }\n        lock(&mounts_lock);\n        struct mount *mount, *tmp;\n        list_for_each_entry_safe(&mounts, mount, tmp, mounts) {\n            mount_remove(mount);\n        }\n        unlock(&mounts_lock);\n        return true;\n    }\n    int max_iterations"
+      ]
+    ],
+    "embed/ffi.c": [
+      [
+        "extern void (*exit_hook)(struct task *task, int code);",
+        "extern void (*exit_hook)(struct task *task, int code);\nextern int nexus_embedded_shutdown;"
+      ],
+      [
+        "    g_exit_cb = cb;\n    exit_hook",
+        "    g_exit_cb = cb;\n    nexus_embedded_shutdown = (cb != NULL);\n    exit_hook"
+      ]
+    ],
+    "embed/host/src/instance.rs": [
+      [
+        "            if guard.is_some() {\n                return Ok(());\n            }\n            let timed_out = exit\n                .cv\n                .wait_for(&mut guard, Duration::from_secs(5))\n                .timed_out();\n            if timed_out && guard.is_none() {\n                Err(IshError::Supervisor(\"kernel exit timeout\".into()))\n            } else {\n                Ok(())\n            }",
+        "            let deadline = std::time::Instant::now() + Duration::from_secs(5);\n            while guard.is_none() {\n                let remaining = deadline.saturating_duration_since(std::time::Instant::now());\n                if remaining.is_zero() {\n                    return Err(IshError::Supervisor(\"kernel exit timeout\".into()));\n                }\n                exit.cv.wait_for(&mut guard, remaining);\n            }\n            match *guard {\n                Some(0) => Ok(()),\n                Some(status) => Err(IshError::Supervisor(format!(\"kernel exit status {status}\"))),\n                None => Err(IshError::Supervisor(\"kernel exit timeout\".into())),\n            }"
+      ]
+    ],
+    "embed/supervisor/src/session.rs": [
+      [
+        "    /// Parent end of the child's stdout (and stderr, merged). For tty",
+        "    /// Parent end of the child's stdout. For tty"
+      ],
+      [
+        "    pub output: OwnedFd,",
+        "    pub output: OwnedFd,\n    pub stderr: Option<OwnedFd>,\n    pub stderr_eof: bool,"
+      ],
+      [
+        "        output: OwnedFd,\n        stdin_w:",
+        "        output: OwnedFd,\n        stderr: Option<OwnedFd>,\n        stdin_w:"
+      ],
+      [
+        "            output,\n            stdin_w,",
+        "            output,\n            stderr_eof: stderr.is_none(),\n            stderr,\n            stdin_w,"
+      ]
+    ],
+    "embed/supervisor/src/spawn.rs": [
+      [
+        "    // Self-pipe used to ferry an execve errno",
+        "    // Non-PTY protocols require independent stdout and stderr pipes.\n    let (parent_stderr, child_stderr) = if opts.tty {\n        (None, None)\n    } else {\n        let (r, w) = pipe2_cloexec()?;\n        (Some(r), Some(w))\n    };\n\n    // Self-pipe used to ferry an execve errno"
+      ],
+      [
+        "            } else {\n                libc::dup2(stdout_fd, 1);\n                libc::dup2(stdout_fd, 2);",
+        "            } else {\n                libc::dup2(stdout_fd, 1);\n                libc::dup2(child_stderr.as_ref().unwrap().as_raw_fd(), 2);"
+      ],
+      [
+        "    drop(child_stdout);\n    drop(child_stdin_r);",
+        "    drop(child_stdout);\n    drop(child_stderr);\n    drop(child_stdin_r);"
+      ],
+      [
+        "    let session = Session::new(reqid, pid, stream, parent_out, parent_stdin_w);",
+        "    if let Some(fd) = &parent_stderr { set_nonblocking(fd.as_raw_fd()); }\n    let session = Session::new(reqid, pid, stream, parent_out, parent_stderr, parent_stdin_w);"
+      ]
+    ],
+    "embed/supervisor/src/main.rs": [
+      [
+        "            pollfds.push(libc::pollfd {\n                fd: s.output_fd(),\n                events: libc::POLLIN,\n                revents: 0,\n            });",
+        "            if !s.eof {\n                pollfds.push(libc::pollfd { fd: s.output_fd(), events: libc::POLLIN, revents: 0 });\n            }\n            if !s.stderr_eof {\n                if let Some(fd) = &s.stderr {\n                    pollfds.push(libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 });\n                }\n            }"
+      ],
+      [
+        "fn drain_session_output(sessions: &mut HashMap<u32, Session>, reqid: u32) -> io::Result<()> {\n    // Take the session out so we can call write_frame (which borrows\n    // global stdout) without overlapping mutable borrows.\n    let Some(s) = sessions.get_mut(&reqid) else {\n        return Ok(());\n    };\n    let stream = s.stream;\n    let mut buf = [0u8; OUTPUT_CHUNK];\n    loop {\n        let n = unsafe {\n            libc::read(\n                s.output_fd(),\n                buf.as_mut_ptr() as *mut libc::c_void,\n                buf.len(),\n            )\n        };\n        if n > 0 {\n            let seq = s.next_seq;\n            s.next_seq += 1;\n            let frame = SupervisorToHost::Output {\n                reqid,\n                seq,\n                stream,\n                bytes: buf[..n as usize].to_vec(),\n            };\n            write_frame(&frame)?;\n            continue;\n        }\n        if n == 0 {\n            s.eof = true;\n            return Ok(());\n        }\n        // n < 0\n        let err = io::Error::last_os_error();\n        match err.kind() {\n            io::ErrorKind::WouldBlock => return Ok(()),\n            io::ErrorKind::Interrupted => continue,\n            _ => {\n                // For pty masters, EIO is the canonical \"child closed all\n                // slave references\" signal.\n                if err.raw_os_error() == Some(libc::EIO) {\n                    s.eof = true;\n                    return Ok(());\n                }\n                return Err(err);\n            }\n        }\n    }\n}\n\n",
+        "fn drain_session_output(sessions: &mut HashMap<u32, Session>, reqid: u32) -> io::Result<()> {\n    let Some(s) = sessions.get_mut(&reqid) else { return Ok(()); };\n    if !s.eof {\n        let fd = s.output_fd();\n        s.eof = drain_output_fd(reqid, fd, s.stream, &mut s.next_seq)?;\n    }\n    if !s.stderr_eof {\n        if let Some(fd) = &s.stderr {\n            s.stderr_eof = drain_output_fd(reqid, fd.as_raw_fd(), ish_embed_protocol::Stream::Stderr, &mut s.next_seq)?;\n        }\n    }\n    Ok(())\n}\n\n// Limit each drain pass so a continuously producing stream cannot starve\n// the other stream or the supervisor's control messages.\nfn drain_output_fd(reqid: u32, fd: RawFd, stream: ish_embed_protocol::Stream, next_seq: &mut u64) -> io::Result<bool> {\n    let mut buf = [0u8; OUTPUT_CHUNK];\n    for _ in 0..8 {\n        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };\n        if n > 0 {\n            let seq = *next_seq;\n            *next_seq += 1;\n            write_frame(&SupervisorToHost::Output { reqid, seq, stream, bytes: buf[..n as usize].to_vec() })?;\n            continue;\n        }\n        if n == 0 { return Ok(true); }\n        let err = io::Error::last_os_error();\n        match err.kind() {\n            io::ErrorKind::WouldBlock => return Ok(false),\n            io::ErrorKind::Interrupted => continue,\n            _ if matches!(stream, ish_embed_protocol::Stream::Pty) && err.raw_os_error() == Some(libc::EIO) => return Ok(true),\n            _ => return Err(err),\n        }\n    }\n    Ok(false)\n}\n\n"
+      ],
+      [
+        ".filter(|(_, s)| s.eof && s.exited_announced)",
+        ".filter(|(_, s)| s.eof && s.stderr_eof && s.exited_announced)"
+      ]
+    ]
+  }
+}

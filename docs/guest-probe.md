@@ -71,3 +71,6 @@ on the macOS build machine, with no remote runtime fallback in the iOS app.
 The host test explicitly fails if its rootfs is missing; it is ignored by
 ordinary unit tests and explicitly invoked by the workflow. Initial device
 cross-build evidence does not establish the new probes' correctness.
+
+## v0.2.2 lifecycle correction (pending validation)
+CI run 45947405466 was green, but its log ended during the real guest test without final test summary or JSON. At the pinned revision kernel/exit.c calls host _exit(0) during halt before its exit callback. The supervisor also dup2s stdout onto stderr in pipe mode. Neither the old CI nor merge establishes process acceptance. The tracked, exact-source patches are limited to embedded shutdown (no host exit; fail on live guest tasks), status verification, and separate pipe stderr with bounded draining. Normal CLI halt remains unchanged. Build checks the upstream commit and refuses unexpected edits, including staged changes. No reboot support or strong guest isolation is implied. CI now requires a freshly generated JSON report after the probe returns; the verifier checks each named row, shutdown and stream evidence. A missing report fails even when cargo returns 0. Package installation is deferred until this gate passes.

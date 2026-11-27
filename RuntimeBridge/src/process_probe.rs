@@ -143,7 +143,7 @@ async fn terminal(guest: &IshInstance, env: &HashMap<String,String>) -> Result<V
     result
 }
 async fn cancellation(guest: &IshInstance, env: &HashMap<String,String>) -> Result<Value,String> {
-    let session = guest.spawn(shell("printf 'NEXUS_CANCEL_READY\\n'; while :; do sleep 1; done",env))
+    let session = guest.spawn(shell("printf 'NEXUS_CANCEL_READY\\n'; exec /bin/sleep 600",env))
         .map_err(|e| e.to_string())?;
     let result = async {
         let deadline = Instant::now() + TIMEOUT;

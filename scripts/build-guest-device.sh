@@ -8,7 +8,7 @@ ALPINE=3.21.0
 FILE=alpine-minirootfs-${ALPINE}-aarch64.tar.gz
 URL=https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/$FILE
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || { echo "Requires Apple Silicon macOS + Xcode" >&2; exit 1; }
-for tool in git cargo rustup meson ninja xcodegen xcodebuild curl shasum sqlite3 brew; do
+for tool in git cargo rustup meson ninja xcodegen xcodebuild curl shasum sqlite3 brew python3; do
   command -v "$tool" >/dev/null || { echo "Missing $tool" >&2; exit 1; }
 done
 # Keep Apple clang as the default native compiler. LLVM is used for
@@ -44,7 +44,7 @@ if [[ ! -e Vendor/litter-ish ]]; then
   git -C Vendor/litter-ish submodule update --init --recursive
 fi
 [[ "$(git -C Vendor/litter-ish rev-parse HEAD)" == "$PIN" ]] || { echo "Wrong upstream commit; refusing build" >&2; exit 1; }
-[[ -z "$(git -C Vendor/litter-ish status --porcelain --untracked-files=no)" ]] || { echo "Upstream has tracked modifications; refusing build" >&2; exit 1; }
+python3 scripts/apply-runtime-patches.py Vendor/litter-ish
 rustup target add aarch64-apple-ios aarch64-unknown-linux-musl
 mkdir -p Vendor/litter-ish/build
 # Verify transfer integrity using the official Alpine checksum over TLS.
@@ -98,5 +98,6 @@ mv "$stage/fs" RuntimeAssets/fs
 )
 cp RuntimeBridge/target/aarch64-apple-ios/release/libnexus_guest_bridge.a RuntimeAssets/lib/
 printf 'litter-ish=%s\nalpine=%s\nrootfs_sha256=%s\n' "$PIN" "$ALPINE" "$checksum" > RuntimeAssets/provenance.txt
+printf 'runtime_patch_sha256=%s\n' "$(shasum -a 256 RuntimeBridge/upstream-patches.json | awk '{print $1}')" >> RuntimeAssets/provenance.txt
 xcodegen generate --spec project-guest.yml
 echo "Generated NexusIDEGuest.xcodeproj. Select signing team and run on physical iPhone."

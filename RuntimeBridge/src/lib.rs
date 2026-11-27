@@ -88,7 +88,9 @@ mod tests {
     #[ignore = "requires freshly generated trusted ARM64 fakefs"]
     fn real_guest_process_probe() {
         let path = std::env::var_os("NEXUS_TEST_ROOTFS").expect("set NEXUS_TEST_ROOTFS to fakefs/data");
+        let evidence_path = std::env::var_os("NEXUS_TEST_EVIDENCE").expect("set NEXUS_TEST_EVIDENCE");
         let report = probe(Path::new(&path));
+        std::fs::write(evidence_path, serde_json::to_vec_pretty(&report).unwrap()).expect("write completed evidence");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         assert_eq!(report["ok"].as_bool(), Some(true), "{report}");
         assert_eq!(report["checks"].as_array().map(Vec::len), Some(6));
