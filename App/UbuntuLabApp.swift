@@ -17,6 +17,9 @@ private struct UbuntuLabView: View {
     @State private var created = false
     @State private var prompted = false
     @State private var confirmPrompt = false
+    @State private var promptRunning = false
+    @State private var receivedChunks = 0
+    @State private var cancelRequested = false
     @State private var keyInput = ""
     @State private var keyStored = false
     @State private var keyStatus = ""
@@ -69,6 +72,13 @@ private struct UbuntuLabView: View {
                         if created && useGemini {
                             Button("Test model response") { confirmPrompt = true }.disabled(running || prompted)
                         }
+                        if promptRunning {
+                            Text("Received text chunks: \(receivedChunks)").font(.caption)
+                            Button(cancelRequested ? "Cancellation requested" : "Cancel prompt", role: .destructive) {
+                                let accepted = UbuntuRunner.cancelPrompt()
+                                if accepted { cancelRequested = true }
+                            }.disabled(cancelRequested)
+                        }
                         Button("Close local connection", role: .destructive) { act(close: true) }.disabled(running)
                     }
                 }
@@ -78,6 +88,15 @@ private struct UbuntuLabView: View {
             }
             .navigationTitle("Ubuntu Lab")
             .onAppear { refreshKey() }
+            .task(id: promptRunning) {
+                guard promptRunning else { return }
+                while !Task.isCancelled && promptRunning {
+                    let progress = UbuntuRunner.progress()
+                    receivedChunks = progress.chunks
+                    if progress.cancelRequested { cancelRequested = true }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
                 Button("Cancel", role: .cancel) {}
@@ -117,8 +136,12 @@ private struct UbuntuLabView: View {
         guard active, created, useGemini, !running, !prompted else { return }
         running = true
         prompted = true
+        promptRunning = true
+        receivedChunks = 0
+        cancelRequested = false
         Task {
             let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true) }.value
+            promptRunning = false
             report = result.report
             agentStatus = result.status
             active = result.active
@@ -202,6 +225,22 @@ private enum UbuntuRunner {
         } catch { return failed("Keychain or guest preparation failed") }
     }
 
+    // Small, bounded native mailbox reads; never wait on the command worker.
+    private static func controlReport(_ pointer: UnsafeMutablePointer<CChar>?) -> [String: Any] {
+        guard let pointer else { return [:] }
+        defer { nexus_guest_free(pointer) }
+        return (try? JSONSerialization.jsonObject(with: Data(String(cString: pointer).utf8)) as? [String: Any]) ?? [:]
+    }
+
+    static func progress() -> (chunks: Int, cancelRequested: Bool) {
+        let obj = controlReport(nexus_acp_prompt_progress())
+        return (obj["chunkCount"] as? Int ?? 0, obj["cancelRequested"] as? Bool == true)
+    }
+
+    static func cancelPrompt() -> Bool {
+        controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
+    }
+
     static func action(close: Bool, prompt: Bool = false) -> (report: String, status: String, active: Bool, ok: Bool) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
@@ -226,6 +265,8 @@ private enum UbuntuRunner {
             let status: String
             if close && ok && object["transportClosed"] as? Bool == true && object["shutdownClean"] as? Bool == true {
                 status = "Local connection closed; guest shutdown verified"
+            } else if prompt && ok && active && object["cancelled"] as? Bool == true && object["stopReason"] as? String == "cancelled" {
+                status = "Agent acknowledged cancellation"
             } else if prompt && ok && active && object["promptVerified"] as? Bool == true && object["marker"] as? String == "NEXUS_ACP_OK" {
                 status = "Fixed model response verified; general chat disabled"
             } else if !close && !prompt && ok && active && object["sessionCreated"] as? Bool == true && object["responseId"] as? Int == 2 {
