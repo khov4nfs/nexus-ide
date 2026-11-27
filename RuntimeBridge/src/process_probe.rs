@@ -521,7 +521,15 @@ pub fn valid_initialize_request(bytes: &[u8]) -> bool {
     frame == expected
 }
 
-// Only the persistent transport can advertise this read-only, virtual file capability.
+// Only the persistent transport can advertise virtual file and restricted terminal grants.
+pub(crate) fn terminal_initialize_request(bytes:&[u8])->bool {
+    if bytes.len()>4096 || bytes.last()!=Some(&b'\n') || bytes[..bytes.len()-1].contains(&b'\n') {return false;}
+    let Ok(mut frame)=serde_json::from_slice::<Value>(bytes) else {return false;};
+    let Some(caps)=frame["params"]["clientCapabilities"].as_object_mut() else {return false;};
+    if caps.remove("terminal")!=Some(json!(true)) {return false;}
+    let wire=format!("{frame}\n");
+    valid_initialize_request(wire.as_bytes()) || snapshot_initialize_request(wire.as_bytes()) || edit_initialize_request(wire.as_bytes())
+}
 pub(crate) fn snapshot_initialize_request(bytes:&[u8])->bool { snapshot_request(bytes,false) }
 pub(crate) fn edit_initialize_request(bytes:&[u8])->bool { snapshot_request(bytes,true) }
 fn snapshot_request(bytes:&[u8],write:bool)->bool {
@@ -529,6 +537,11 @@ fn snapshot_request(bytes:&[u8],write:bool)->bool {
     let Ok(frame)=serde_json::from_slice::<Value>(bytes) else {return false;};
     let mut expected:Value=serde_json::from_slice(AGY_INITIALIZE_REQUEST).expect("fixed request");
     expected["params"]["clientCapabilities"]=json!({"fs":{"readTextFile":true,"writeTextFile":write}});
+    if let Some(caps)=frame["params"]["clientCapabilities"].as_object() {
+        if caps.get("terminal")==Some(&json!(true)) {
+            expected["params"]["clientCapabilities"]["terminal"]=json!(true);
+        }
+    }
     frame==expected
 }
 
@@ -645,14 +658,15 @@ impl ACPExchange {
 
     pub(crate) async fn request_updates<F>(&mut self, bytes: &[u8], id: i64, update: F) -> Result<Value,String>
     where F: FnMut(&Value) -> Result<(),String> {
-        self.request_controlled(bytes, id, update, || None, |_| Err("Unexpected agent request".into())).await
+        self.request_controlled(bytes, id, update, || None, |_| Err("Unexpected agent request".into()), None).await
     }
 
     // Control is checked by the owner of the same stdin stream, never by
     // another writer. Cancellation is a notification, not a new request ID.
-    pub(crate) async fn request_controlled<F, C, R>(&mut self, bytes: &[u8], id: i64, mut update: F, mut control: C, mut server_request: R) -> Result<Value,String>
+    pub(crate) async fn request_controlled<F, C, R>(&mut self, bytes: &[u8], id: i64, mut update: F, mut control: C, mut server_request: R, mut terminal: Option<&mut TerminalGrant<'_>>) -> Result<Value,String>
     where F: FnMut(&Value) -> Result<(),String>, C: FnMut() -> Option<Vec<u8>>, R: FnMut(&Value) -> Result<Value,String> {
         let mut deadline = Instant::now() + Duration::from_secs(90);
+        let mut server_ids=std::collections::HashSet::new();
         write_ready(&self.session, bytes, deadline).await?;
         loop {
             if let Some(cancel) = control() {
@@ -677,7 +691,14 @@ impl ACPExchange {
                 }
                 if frame.get("method").is_some() && frame.get("id").is_some() &&
                     frame.get("result").is_none() && frame.get("error").is_none() && answer.is_none() {
-                    let reply = server_request(&frame)?;
+                    let request_id=frame.get("id").filter(|v|v.as_i64().is_some() || v.as_str().is_some_and(|s|!s.is_empty()&&s.len()<=256)).ok_or("Invalid server request ID")?;
+                    if server_ids.len()>=16 || !server_ids.insert(request_id.to_string()) {return Err("Duplicate or excessive server request".into());}
+                    let reply = if frame["method"].as_str().is_some_and(|m|m.starts_with("terminal/")) {
+                        match terminal.as_deref_mut() {
+                            Some(t)=>t.handle(&frame,deadline).await?,
+                            None=>json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32602,"message":"No terminal grant"}}),
+                        }
+                    } else {server_request(&frame)?};
                     let wire = format!("{reply}\n");
                     write_ready(&self.session, wire.as_bytes(), deadline).await?;
                     continue;
@@ -710,6 +731,130 @@ impl ACPExchange {
     }
 }
 
+
+// One exact, user-selected diagnostic per prompt. Never run agent shell strings,
+// arbitrary argv, cwd or env. The guest itself is not a security sandbox.
+pub(crate) fn terminal_command(choice:&str)->Option<(&'static str,&'static [&'static str])> {
+    match choice {
+        "uname" => Some(("/usr/bin/uname",&["-m"])),
+        "pwd" => Some(("/usr/bin/pwd",&[])),
+        _ => None,
+    }
+}
+struct GrantedProcess {
+    session: std::sync::Arc<IshSession>,
+    capture: Capture,
+    limit: usize,
+}
+pub(crate) struct TerminalGrant<'a> {
+    guest: &'a IshInstance,
+    session_id: &'a str,
+    terminal_id: String,
+    choice: Option<&'a str>,
+    key: &'a str,
+    used: bool,
+    process: Option<GrantedProcess>,
+}
+impl<'a> TerminalGrant<'a> {
+    pub(crate) fn new(guest:&'a IshInstance,session_id:&'a str,response_id:i64,choice:Option<&'a str>,key:&'a str)->Self {
+        Self {guest,session_id,terminal_id:format!("nexus-term-{response_id}"),choice,key,used:false,process:None}
+    }
+    pub(crate) fn used(&self)->bool {self.used}
+    async fn stop(process:&mut GrantedProcess,deadline:Instant)->Result<(),String> {
+        if !process.capture.closed {
+            if !process.capture.exited {process.session.terminate().await.map_err(|_|"Terminal termination failed")?;}
+            drain(&process.session,&mut process.capture,deadline).await?;
+        }
+        Ok(())
+    }
+    pub(crate) async fn cleanup(&mut self)->Result<(),String> {
+        if let Some(mut p)=self.process.take() {Self::stop(&mut p,Instant::now()+TIMEOUT).await?;}
+        Ok(())
+    }
+    pub(crate) async fn handle(&mut self,frame:&Value,deadline:Instant)->Result<Value,String> {
+        let id=&frame["id"];
+        let params=&frame["params"];
+        let deny=||json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"No matching terminal grant"}});
+        if params["sessionId"]!=self.session_id || self.choice.is_none() ||
+            crate::persistent_acp::prompt_cancel_requested() {return Ok(deny());}
+        let method=frame["method"].as_str().unwrap_or("");
+        if method=="terminal/create" {
+            if self.used {return Ok(deny());}
+            let Some((program,args))=self.choice.and_then(terminal_command) else {return Ok(deny());};
+            let requested=params["command"].as_str();
+            let name=program.rsplit('/').next().unwrap_or(program);
+            if requested!=Some(program) && requested!=Some(name) {return Ok(deny());}
+            let args_ok=match params.get("args") {
+                None=>args.is_empty(),
+                Some(v)=>v.as_array().is_some_and(|a|a.len()==args.len() && a.iter().zip(args).all(|(v,s)|v.as_str()==Some(*s))),
+            };
+            if !args_ok || !params.get("env").is_none_or(|v|v.as_array().is_some_and(|a|a.is_empty())) ||
+                !params.get("cwd").is_none_or(|v|v.is_null()||v.as_str()==Some("/tmp")) {return Ok(deny());}
+            let limit=match params.get("outputByteLimit") {
+                None|Some(Value::Null)=>4096,
+                Some(v)=>match v.as_u64(){Some(n) if n>0=>n.min(4096) as usize,_=>return Ok(deny())}
+            };
+            let argv=std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>();
+            let mut opts=SpawnOpts::cmd(argv);
+            opts.cwd=Some(Path::new("/tmp").to_path_buf());
+            opts.envp=Some(vec![("PATH".into(),"/usr/bin:/bin".into()),("LANG".into(),"C".into()),("HOME".into(),"/tmp".into())]);
+            opts.tty=true;
+            opts.pipe_stdin=false;
+            opts.size=Some(PtySize{cols:80,rows:24});
+            self.used=true;
+            let session=self.guest.spawn(opts).map_err(|_|"Terminal spawn failed")?;
+            self.process=Some(GrantedProcess{session,capture:Capture{rolling_pty:true,..Default::default()},limit});
+            return Ok(json!({"jsonrpc":"2.0","id":id,"result":{"terminalId":self.terminal_id}}));
+        }
+        if params["terminalId"]!=self.terminal_id {return Ok(deny());}
+        let Some(p)=self.process.as_mut() else {return Ok(deny());};
+        let bounded=deadline.min(Instant::now()+TIMEOUT);
+        let result=match method {
+            "terminal/output"=>{
+                if !p.capture.closed {p.capture.poll(&p.session,bounded).await?;}
+                // Fixed diagnostic output only; withhold partial output until closed.
+                // Do not export credentials, control sequences or arbitrary raw bytes.
+                let mut output=String::new();
+                let mut truncated=false;
+                if p.capture.closed {
+                    let text=String::from_utf8_lossy(&p.capture.pty);
+                    if self.key.is_empty() || text.contains(self.key) {return Err("Terminal credential output blocked".into());}
+                    output=text.chars().filter(|c|!c.is_control() || *c=='\n' || *c=='\t').collect();
+                    truncated=p.capture.truncated_pty || output.len()>p.limit;
+                    let mut start=output.len().saturating_sub(p.limit);
+                    while !output.is_char_boundary(start) {start+=1;}
+                    output=output[start..].to_owned();
+                }
+                let mut r=json!({"output":output,"truncated":truncated});
+                if p.capture.closed {r["exitStatus"]=terminal_status(&p.capture);}
+                r
+            }
+            "terminal/wait_for_exit"=>{
+                while !p.capture.closed {
+                    if crate::persistent_acp::prompt_cancel_requested() {Self::stop(p,bounded).await?;break;}
+                    p.capture.poll(&p.session,bounded).await?;
+                }
+                terminal_status(&p.capture)
+            }
+            "terminal/kill"=>{Self::stop(p,bounded).await?;json!({})}
+            "terminal/release"=>{Self::stop(p,bounded).await?;self.process=None;json!({})}
+            _=>return Ok(deny()),
+        };
+        Ok(json!({"jsonrpc":"2.0","id":id,"result":result}))
+    }
+}
+fn terminal_status(c:&Capture)->Value {
+    let signal=c.signal.filter(|s|*s!=0).map(|s|match s {2=>"SIGINT".to_owned(),9=>"SIGKILL".to_owned(),15=>"SIGTERM".to_owned(),_=>format!("SIG{s}")});
+    json!({"exitCode":c.code,"signal":signal})
+}
+#[cfg(test)]
+#[test]
+fn terminal_command_scope() {
+    assert_eq!(terminal_command("uname"),Some(("/usr/bin/uname",&["-m"][..])));
+    assert_eq!(terminal_command("pwd"),Some(("/usr/bin/pwd",&[][..])));
+    assert!(terminal_command("sh").is_none());
+    assert!(terminal_command("uname; cat /etc/passwd").is_none());
+}
 
 // User-initiated local jobs in a separate disposable Ubuntu boot. No host
 // workspace, native tool callbacks, provider credential or remote executor.

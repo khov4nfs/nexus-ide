@@ -52,6 +52,9 @@ struct UbuntuLabView: View {
     @State private var useGoogle = false
     @State private var enableSnapshotRead = false
     @State private var enableSnapshotWrite = false
+    @State private var enableTerminal = false
+    @State private var terminalChoice = ""
+    @State private var pendingTerminal: String?
     @State private var snapshotReadThisTurn = false
     @State private var pendingReadContent: String?
     @State private var loginURL = ""
@@ -109,6 +112,8 @@ struct UbuntuLabView: View {
                     Toggle("Enable read-only ACP attachment tool", isOn: $enableSnapshotRead)
                         .disabled(attempted || model.guestClaimed)
                     Toggle("Enable staged ACP editor edits", isOn: $enableSnapshotWrite)
+                        .disabled(attempted || model.guestClaimed)
+                    Toggle("Enable restricted ACP terminal diagnostics (Gemini key)", isOn: $enableTerminal)
                         .disabled(attempted || model.guestClaimed)
                     Text("Optional: selected text only, for one confirmed turn. Staged edits require separate editor selection and native diff review; no direct iOS file write.").font(.caption)
                     Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed || importingAGY)
@@ -190,6 +195,13 @@ struct UbuntuLabView: View {
                             if !contextStatus.isEmpty { Text(contextStatus).font(.caption) }
                             if let context = fileContext, let combined = try? context.prompt(question: chatInput) {
                                 Text("Combined prompt: \(combined.utf8.count)/1024 bytes").font(.caption)
+                            }
+                            if enableTerminal && useGemini && fileContext == nil && editSnapshot == nil {
+                                Picker("Allow one terminal diagnostic this turn", selection: $terminalChoice) {
+                                    Text("None").tag("")
+                                    Text("uname -m").tag("uname")
+                                    Text("pwd").tag("pwd")
+                                }.disabled(running)
                             }
                             Button(editSnapshot == nil ? "Send chat" : "Request edit proposal") { prepareChat() }
                                 .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || !UbuntuRunner.validChat(chatInput))
@@ -342,12 +354,14 @@ struct UbuntuLabView: View {
                     let display = pendingDisplay
                     let edit = pendingEdit
                     let content = pendingReadContent
+                    let terminal = pendingTerminal
+                    pendingTerminal = nil
                     pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil
-                    runPrompt(chat: wire, display: display, edit: edit, readContent: content)
+                    runPrompt(chat: wire, display: display, edit: edit, readContent: content, terminal: terminal)
                 }
-                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil }
+                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil; pendingTerminal = nil; terminalChoice = "" }
             } message: {
-                Text(pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Do not share secrets." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
+                Text(pendingTerminal != nil ? "Allow one local Ubuntu diagnostic (\(pendingTerminal == "uname" ? "uname -m" : "pwd")) in this turn? Its output may be sent to the model. No other command, environment or native file access is granted." : pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Do not share secrets." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
             }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
@@ -393,11 +407,12 @@ struct UbuntuLabView: View {
         let selected = sha == nil ? nil : importedAGY
         let writeSnapshot = enableSnapshotWrite && gemini
         let readSnapshot = enableSnapshotRead || writeSnapshot
+        let terminal = enableTerminal && gemini
         attempted = true
         running = true
         loginURL = ""; loginCode = ""; loginSubmitted = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected, readSnapshot: readSnapshot, writeSnapshot: writeSnapshot) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected, readSnapshot: readSnapshot, writeSnapshot: writeSnapshot, terminal: terminal) }.value
             loginURL = ""; loginCode = ""; loginRunning = false
             // Keep the separately reviewed binary; never persist OAuth tokens with it.
             report = result.report
@@ -465,8 +480,9 @@ struct UbuntuLabView: View {
     private func prepareChat() {
         guard !running, !importingContext, active, created, !smokeUsed, turnCount < maxTurns else { return }
         do {
-            let wire: String
+            var wire: String
             pendingReadContent = nil
+            pendingTerminal = nil
             if let editSnapshot {
                 guard proposal == nil else { contextStatus = "Review or discard the previous proposal"; return }
                 if enableSnapshotWrite {
@@ -479,6 +495,10 @@ struct UbuntuLabView: View {
                 wire = chatInput + "\nRead the selected text via fs/read_text_file at /nexus-selected.txt if needed."
                 pendingReadContent = context.text
             } else { wire = try fileContext?.prompt(question: chatInput) ?? chatInput }
+            if enableTerminal && useGemini && fileContext == nil && editSnapshot == nil && ["uname","pwd"].contains(terminalChoice) {
+                pendingTerminal = terminalChoice
+                wire += "\nYou may use the one granted terminal command: " + (terminalChoice == "uname" ? "uname -m" : "pwd") + ". cwd /tmp, no custom environment."
+            }
             guard UbuntuRunner.validChat(wire) else {
                 contextStatus = "Question and snapshot must fit 1024 UTF-8 bytes"; return
             }
@@ -494,7 +514,7 @@ struct UbuntuLabView: View {
         }
     }
 
-    private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil, readContent: String? = nil) {
+    private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil, readContent: String? = nil, terminal: String? = nil) {
         guard active, created, (useGemini || useGoogle), !running, !importingContext, !smokeUsed, turnCount < maxTurns,
               chat != nil || turnCount == 0 else { return }
         if let chat {
@@ -506,6 +526,7 @@ struct UbuntuLabView: View {
                 }
             } catch { chatInput = ""; agentStatus = "Keychain unavailable"; return }
             sentChat = display ?? chat
+            terminalChoice = ""
             chatInput = ""
             fileContext = nil
             editSnapshot = nil
@@ -522,7 +543,7 @@ struct UbuntuLabView: View {
         toolUpdates = 0
         cancelRequested = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent, stageEdit: edit != nil && readContent != nil) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent, stageEdit: edit != nil && readContent != nil, terminal: terminal) }.value
             let snapshot = UbuntuRunner.progress()
             if snapshot.responseID == expectedID {
                 permissionDenials = snapshot.permissionDenials
@@ -587,7 +608,7 @@ private enum UbuntuRunner {
             do { try FileManager.default.removeItem(at: trial); activeTrial = nil } catch { /* leave for next launch */ }
         }
     }
-    static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?, readSnapshot: Bool, writeSnapshot: Bool) -> (report: String, status: String, active: Bool) {
+    static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?, readSnapshot: Bool, writeSnapshot: Bool, terminal: Bool) -> (report: String, status: String, active: Bool) {
         var client = ACPInitializeClient()
         func failed(_ reason: String) -> (String, String, Bool) { (reason, "Not initialized", false) }
         do {
@@ -620,7 +641,7 @@ private enum UbuntuRunner {
                 }
             }
             let data = trial.appendingPathComponent("data", isDirectory: true)
-            let request = sha == nil ? nil : String(decoding: try client.request(readSnapshot: readSnapshot, writeSnapshot: writeSnapshot), as: UTF8.self)
+            let request = sha == nil ? nil : String(decoding: try client.request(readSnapshot: readSnapshot, writeSnapshot: writeSnapshot, terminal: terminal), as: UTF8.self)
             let pointer = data.path.withCString { path in
                 if let sha, let request {
                     return sha.withCString { digest in
@@ -705,11 +726,12 @@ private enum UbuntuRunner {
         controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
     }
 
-    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
+    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false, terminal: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
             else if let chat, let readContent { pointer = chat.withCString { t in readContent.withCString { stageEdit ? nexus_acp_chat_edit(t,$0) : nexus_acp_chat_snapshot(t,$0) } } }
+            else if let chat, let terminal { pointer = chat.withCString { t in terminal.withCString { nexus_acp_chat_terminal(t,$0) } } }
             else if let chat { pointer = chat.withCString { nexus_acp_chat($0) } }
             else if prompt { pointer = nexus_acp_prompt_probe() }
             else {

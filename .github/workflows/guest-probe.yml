@@ -276,6 +276,24 @@ jobs:
           name: acp-snapshot-fixture-evidence
           path: ${{ runner.temp }}/nexus-snapshot.json
           if-no-files-found: error
+      - name: Verify restricted ACP terminal transport (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-terminal-fs"
+          export NEXUS_ACP_ROOTFS="$RUNNER_TEMP/nexus-terminal-fs/data"
+          export NEXUS_ACP_EVIDENCE="$RUNNER_TEMP/nexus-terminal.json"
+          export NEXUS_ACP_TEST_TERMINAL=1
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_acp_terminal_transport -- --ignored --nocapture --test-threads=1
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","terminalVerified","shutdownClean"])' "$NEXUS_ACP_EVIDENCE"
+      - name: Upload ACP terminal fixture evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-terminal-fixture-evidence
+          path: ${{ runner.temp }}/nexus-terminal.json
+          if-no-files-found: error
       - name: Verify persisted guest across independent runtime processes
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"

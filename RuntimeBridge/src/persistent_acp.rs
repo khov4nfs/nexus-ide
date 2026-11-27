@@ -16,7 +16,7 @@ const IDLE: Duration = Duration::from_secs(180);
 const REPLY: Duration = Duration::from_secs(300);
 const NEW_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\",\"mcpServers\":[]}}\n";
 type Reply = SyncSender<Value>;
-enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Option<String>, bool, Reply), Close(Reply) }
+enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Option<String>, bool, Option<String>, Reply), Close(Reply) }
 static ACTIVE: Mutex<Option<SyncSender<Command>>> = Mutex::new(None);
 static WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct ActiveGuard;
@@ -125,6 +125,8 @@ fn prompt_progress() -> Value {
         Err(_) => json!({"ok":false,"running":false,"error":"Progress unavailable"}),
     }
 }
+
+pub(crate) fn prompt_cancel_requested()->bool {PROGRESS.lock().map(|p|p.cancel_requested).unwrap_or(true)}
 
 fn request_cancel() -> Value {
     match PROGRESS.lock() {
@@ -385,6 +387,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     }
     #[cfg(test)]
     if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_SNAPSHOT").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_SNAPSHOT".into(),"1".into());}
+    #[cfg(test)]
+    if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_TERMINAL").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_TERMINAL".into(),"1".into());}
     opts.envp = Some(agent_env.into_iter().collect());
     opts.pipe_stdin = true;
     let session = match guest.spawn(opts) {
@@ -394,6 +398,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
         }
     };
     let mut exchange = ACPExchange::new(session);
+    let terminal_capability=process_probe::terminal_initialize_request(&request);
     let edit_capability=process_probe::edit_initialize_request(&request);
     let snapshot_capability=edit_capability || process_probe::snapshot_initialize_request(&request);
     let init = rt.block_on(exchange.request(&request, 1));
@@ -463,7 +468,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     }
                 }
             }
-            Ok(Command::Prompt(chat, snapshot, edit, reply)) => {
+            Ok(Command::Prompt(chat, snapshot, edit, terminal_choice, reply)) => {
                 let Some(id) = session_id.as_deref() else {
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Create a session first"}));
                     continue;
@@ -485,6 +490,10 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     let _=reply.send(json!({"ok":false,"active":true,"error":"Snapshot grant unavailable or invalid"}));
                     continue;
                 }
+                if terminal_choice.as_deref().is_some_and(|c| !terminal_capability || !keyed || chat.is_none() || snapshot.is_some() || process_probe::terminal_command(c).is_none()) {
+                    let _=reply.send(json!({"ok":false,"active":true,"error":"Terminal grant unavailable or invalid"}));
+                    continue;
+                }
                 let is_chat = chat.is_some();
                 let text = chat.as_deref().unwrap_or(SMOKE_PROMPT);
                 turns += 1;
@@ -499,6 +508,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                 let mut permission_ids = std::collections::HashSet::new();
                 let mut snapshot_reads=0usize;
                 let mut staged:Option<String>=None;
+                let mut terminal=process_probe::TerminalGrant::new(&guest,id,response_id,terminal_choice.as_deref(),key);
                 let result = rt.block_on(exchange.request_controlled(wire.as_bytes(), response_id,
                     |frame| {
                         evidence.update(frame, id)?;
@@ -542,7 +552,9 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                             p.permission_denials += 1;
                         }
                         Ok(response)
-                    }));
+                    }, Some(&mut terminal)));
+                let terminal_used=terminal.used();
+                let result=if rt.block_on(terminal.cleanup()).is_ok(){result}else{Err("Terminal cleanup failed".into())};
                 drop(progress);
                 let cancel_requested = PROGRESS.lock().map(|p|p.cancel_requested).unwrap_or(true);
                 let cancelled = cancel_taken && result.as_ref().is_ok_and(|frame|
@@ -561,7 +573,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         .is_ok_and(|s| !s.trim().is_empty()))));
                 if chat_success {
                     if reply.send(json!({"ok":true,"active":true,"chatCompleted":true,
-                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn","snapshotReads":snapshot_reads,"stagedReplacement":if !cancel_requested { staged.take() } else { None }})).is_err() {
+                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn","snapshotReads":snapshot_reads,"terminalUsed":terminal_used,"stagedReplacement":if !cancel_requested { staged.take() } else { None }})).is_err() {
                         break None;
                     }
                     continue;
@@ -596,7 +608,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
 fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, google: bool) -> Value {
     if google && key.is_some() { return failure("Choose one authentication method"); }
     if key.as_deref().is_some_and(|s| !valid_key(s)) { return failure("Invalid credential shape"); }
-    if !process_probe::valid_initialize_request(&request) && !process_probe::snapshot_initialize_request(&request) && !process_probe::edit_initialize_request(&request) {
+    if !process_probe::valid_initialize_request(&request) && !process_probe::snapshot_initialize_request(&request) && !process_probe::edit_initialize_request(&request) && !process_probe::terminal_initialize_request(&request) {
         return failure("Invalid initialize request");
     }
     if let Mode::Agy(sha) = &mode {
@@ -624,13 +636,13 @@ fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, googl
     }
 }
 
-enum Action { New(Vec<u8>), Prompt, Chat(String), Snapshot(String,String), Edit(String,String), Close }
+enum Action { New(Vec<u8>), Prompt, Chat(String), Snapshot(String,String), Edit(String,String), Terminal(String,String), Close }
 
 fn command(action: Action) -> Value {
     let Ok(mut slot) = ACTIVE.lock() else { return failure("Connection lock failed"); };
     let Some(tx) = slot.as_ref() else { return failure("No active connection"); };
     let (reply, wait) = mpsc::sync_channel(1);
-    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(None, None, false, reply), Action::Chat(text) => Command::Prompt(Some(text), None, false, reply), Action::Snapshot(text,content) => Command::Prompt(Some(text),Some(content),false,reply), Action::Edit(text,content) => Command::Prompt(Some(text),Some(content),true,reply), Action::Close => Command::Close(reply) };
+    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(None, None, false, None, reply), Action::Chat(text) => Command::Prompt(Some(text), None, false, None, reply), Action::Snapshot(text,content) => Command::Prompt(Some(text),Some(content),false,None,reply), Action::Edit(text,content) => Command::Prompt(Some(text),Some(content),true,None,reply), Action::Terminal(text,choice)=>Command::Prompt(Some(text),None,false,Some(choice),reply), Action::Close => Command::Close(reply) };
     if tx.send(message).is_err() {
         *slot = None; return failure("Connection stopped or idle timeout");
     }
@@ -762,6 +774,14 @@ pub unsafe extern "C" fn nexus_acp_chat_edit(text:*const c_char,content:*const c
     })
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn nexus_acp_chat_terminal(text:*const c_char,choice:*const c_char)->*mut c_char {
+    ffi_result(||match (read_arg(text),read_arg(choice)) {
+        (Some(t),Some(c)) if valid_chat(&t)&&process_probe::terminal_command(&c).is_some()=>command(Action::Terminal(t,c)),
+        _=>failure("Invalid terminal grant"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,6 +895,25 @@ mod tests {
         assert!(!valid_login_code(&"a".repeat(2049)));
     }
 
+    #[test]
+    #[ignore = "fresh Ubuntu fakefs; synthetic ACP terminal peer only"]
+    fn real_acp_terminal_transport() {
+        let path=std::env::var_os("NEXUS_ACP_ROOTFS").expect("rootfs");
+        let file=std::env::var_os("NEXUS_ACP_EVIDENCE").expect("evidence");
+        let mut req:Value=serde_json::from_slice(process_probe::AGY_INITIALIZE_REQUEST).unwrap();
+        req["params"]["clientCapabilities"]=json!({"terminal":true});
+        let init=start(PathBuf::from(path),Mode::Fixture,format!("{req}\n").into_bytes(),Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()),false);
+        let new=command(Action::New(NEW_REQUEST.to_vec()));
+        let denied=command(Action::Chat("No terminal grant".into()));
+        let granted=command(Action::Terminal("Run uname -m".into(),"uname".into()));
+        let verified=prompt_progress()["text"]=="NEXUS_TERMINAL_OK" && granted["terminalUsed"]==true;
+        let close=command(Action::Close);
+        let evidence=json!({"ok":init["ok"]==true && new["ok"]==true && denied["chatCompleted"]==true && denied["terminalUsed"]==false && granted["chatCompleted"]==true && verified && close["shutdownClean"]==true,
+            "fixtureOnly":true,"terminalVerified":verified,"shutdownClean":close["shutdownClean"]});
+        std::fs::write(file,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        println!("{evidence}");
+        assert_eq!(evidence["ok"],true);
+    }
     #[test]
     #[ignore = "fresh Ubuntu fakefs; synthetic ACP snapshot peer only"]
     fn real_snapshot_read_transport() {
