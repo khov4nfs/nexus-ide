@@ -529,6 +529,11 @@ impl ACPExchange {
     }
 
     pub(crate) async fn request(&mut self, bytes: &[u8], id: i64) -> Result<Value,String> {
+        self.request_updates(bytes, id, |_| Ok(())).await
+    }
+
+    pub(crate) async fn request_updates<F>(&mut self, bytes: &[u8], id: i64, mut update: F) -> Result<Value,String>
+    where F: FnMut(&Value) -> Result<(),String> {
         let deadline = Instant::now() + Duration::from_secs(90);
         write_ready(&self.session, bytes, deadline).await?;
         loop {
@@ -545,7 +550,8 @@ impl ACPExchange {
                 if frame["jsonrpc"] != "2.0" { return Err("Invalid JSON-RPC version".into()); }
                 if frame.get("id").is_none() && frame["method"].is_string() &&
                     frame.get("result").is_none() && frame.get("error").is_none() {
-                    continue; // Discard notifications in this lab; no tool callbacks.
+                    update(&frame)?;
+                    continue;
                 }
                 if frame.get("method").is_some() || frame["id"].as_i64() != Some(id) ||
                     frame.get("result").is_some() == frame.get("error").is_some() ||
