@@ -14,6 +14,8 @@ PR #17 merged at 034c977; CI run 45965660101 passed 11 Rust unit tests, nine rea
 
 ## Prepare device build
 
+A personal Mac is optional: see [GitHub-hosted IPA delivery](iphone-install.md). The following commands describe the local developer alternative.
+
 On Apple Silicon macOS, install Xcode, XcodeGen, Rust and build dependencies per guest-probe.md. Use a clean checkout and fresh output directories:
 
 ```sh

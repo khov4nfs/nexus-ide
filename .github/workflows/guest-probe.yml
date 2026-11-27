@@ -1,6 +1,20 @@
 name: Experimental iOS guest build
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: Ubuntu integrated or optional pinned workbench
+        type: choice
+        options: [ubuntu, workbench]
+        default: ubuntu
+      license_reviewed:
+        description: I have reviewed redistribution rights and will satisfy all source/notice obligations for the public IPA
+        type: boolean
+        default: false
+      publish_prerelease:
+        description: Publish test IPA to Releases (main only, requires license review)
+        type: boolean
+        default: false
   pull_request:
     paths:
       - 'RuntimeBridge/**'
@@ -8,6 +22,8 @@ on:
       - 'scripts/apply-runtime-patches.py'
       - 'scripts/verify-guest-evidence.py'
       - 'scripts/preflight-runtime.py'
+      - 'scripts/package-ipa.py'
+      - 'scripts/test-package-ipa.py'
       - 'scripts/build-glibc-rootfs.sh'
       - 'scripts/verify-glibc-evidence.py'
       - 'scripts/verify-acp-transport.py'
@@ -41,6 +57,7 @@ jobs:
           python3 scripts/preflight-runtime.py
           python3 scripts/test-agy-import.py
           python3 scripts/test-workbench-import.py
+          python3 scripts/test-package-ipa.py
       - name: Install guest build dependencies
         run: brew install meson ninja llvm lld libarchive sqlite xcodegen
       - name: Build pinned runtime and rootfs
@@ -197,5 +214,46 @@ jobs:
             ${{ runner.temp }}/nexus-local-mcp.json
           if-no-files-found: warn
           retention-days: 7
+      - name: Optional reviewed workbench asset for device test
+        if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
+        run: |
+          asset="$RUNNER_TEMP/openvscode-server-v1.109.5-linux-arm64.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 2 https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v1.109.5/openvscode-server-v1.109.5-linux-arm64.tar.gz -o "$asset"
+          python3 scripts/prepare-workbench-rootfs.py --archive "$asset" --confirm-local-use
+          mv RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/plain-ubuntu-staged"
+          bash scripts/stage-ubuntu-device.sh --workbench
+      - name: Build and verify integrated Release IPA
+        env:
+          VARIANT: ${{ inputs.variant || 'ubuntu' }}
+        run: |
+          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.5.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
+          python3 scripts/package-ipa.py --app "$RUNNER_TEMP/nexus-integrated/Build/Products/Release-iphoneos/NexusIDEUbuntuLab.app" --output "$RUNNER_TEMP/nexus-integrated-ipa" --variant "$VARIANT" --commit "$GITHUB_SHA"
+      - name: Upload integrated unsigned IPA only after owner license review
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.license_reviewed
+        uses: actions/upload-artifact@v4
+        with:
+          name: NexusIDE-integrated-unsigned
+          path: ${{ runner.temp }}/nexus-integrated-ipa/*
+          if-no-files-found: error
+          retention-days: 14
       - name: Record scope
-        run: echo "Unsigned iOS cross-build and separate macOS guest execution test; physical iPhone validation still required. No linked binary distributed."
+        run: echo "Unsigned Release IPA verified structurally; no physical device evidence. Linked guest artifact distribution requires owner license review. No AGY binary."
+  publish-integrated:
+    needs: cross-build
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.license_reviewed && inputs.publish_prerelease
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: NexusIDE-integrated-unsigned
+          path: release
+      - name: Publish reviewed test candidate (not production)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release
+          sha256sum -c SHA256SUMS
+          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json
+
