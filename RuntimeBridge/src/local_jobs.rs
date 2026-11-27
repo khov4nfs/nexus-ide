@@ -669,6 +669,15 @@ mod tests {
                 }
             }
         }
+        let browser_requested=std::env::var_os("NEXUS_WORKBENCH_BROWSER_PYTHON").is_some();
+        let browser_ok=if ready&&matches!(status,Some(200|302|303|307))&&browser_requested&&vsix.is_some(){
+            // Fixed synthetic local browser probe. No user data or real credentials.
+            std::process::Command::new(std::env::var_os("NEXUS_WORKBENCH_BROWSER_PYTHON").unwrap())
+                .arg(std::env::var_os("NEXUS_WORKBENCH_BROWSER_SCRIPT").expect("browser script"))
+                .env("NEXUS_WORKBENCH_TEST_TOKEN",&token)
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .status().is_ok_and(|s|s.success())
+        }else{false};
         let stop=enqueue(Control::Stop);
         let closed=worker.join().expect("workbench owner");
         let extension_verified=vsix.as_ref().map(|_| {
@@ -680,8 +689,11 @@ mod tests {
                             entry.path().join("package.json").is_file()
                     }))
         });
-        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true),
-            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"extensionInstallVerified":extension_verified,"editorVerified":false,"lspVerified":false});
+        let root=guest_path.join("root/nexus-workbench");
+        let activated=browser_ok&&std::fs::read(root.join("nexus-extension-activated.marker")).ok().as_deref()==Some(b"activated");
+        let editor_verified=activated&&std::fs::read(root.join("nexus-editor-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join("nexus-editor-fixture.txt")).ok().as_deref()==Some(b"NEXUS_BROWSER_EDITOR_SAVED");
+        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified)),
+            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":false});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         println!("{report}");
         assert_eq!(report["ok"],true);
