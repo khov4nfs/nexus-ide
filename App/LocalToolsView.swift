@@ -49,6 +49,7 @@ struct LocalToolsView: View {
     @State private var frozenCLI: LocalCLIImport?
     @State private var importingCLI = false
     @State private var cliAction = "shell"
+    @State private var cliPrompt = ""
     @State private var keepCLIGuest = false
     @State private var confirmResetCLI = false
     private var stagedWorkbench: Bool {
@@ -82,8 +83,15 @@ struct LocalToolsView: View {
                         Picker("Launch mode", selection: $cliAction) {
                             Text("Interactive local shell").tag("shell")
                             Text("Version probe").tag("version")
-                            if cliKind == "codex" { Text("Native app-server account probe").tag("appServer") }
+                            if cliKind == "codex" {
+                                Text("Native app-server account probe").tag("appServer")
+                                Text("Native Codex text turn").tag("appServerChat")
+                            }
                         }.disabled(model.guestClaimed)
+                        if cliAction == "appServerChat" {
+                            TextField("Message to Codex (max 2048 bytes)", text: $cliPrompt, axis: .vertical).disabled(model.guestClaimed)
+                            Text("One ephemeral text turn; requires CLI-owned sign-in. Model request may incur charges. Read-only policy requested and checked; no native permissions granted. Output is untrusted and may contain guest secrets.").font(.caption)
+                        }
                         Toggle("Keep separate agent guest and CLI login", isOn: $keepCLIGuest).disabled(model.guestClaimed || importingCLI)
                         Text("Optional: persists CLI-owned login state and project files for this exact binary digest. May retain secrets. Exit the shell cleanly before restarting. No backup, no sharing with other guests, no native token collection.").font(.caption)
                         Button("Reset saved CLI guest", role: .destructive) { confirmResetCLI = true }.disabled(model.guestClaimed || importingCLI || !AGYImportFormat.validDigest(cliDigest))
@@ -135,7 +143,13 @@ struct LocalToolsView: View {
                         frozenCLI = mode == 6 ? cliImport : nil
                         frozenHooks = mode == 1 && enableHooks
                         if mode == 6 {
-                            guard let frozenCLI, let wire = try? JSONSerialization.data(withJSONObject: ["kind":frozenCLI.kind,"sha256":frozenCLI.digest,"action":cliAction], options: [.sortedKeys]) else { report = "Select reviewed executable"; return }
+                            guard let frozenCLI else { report = "Select reviewed executable"; return }
+                            var request = ["kind":frozenCLI.kind,"sha256":frozenCLI.digest,"action":cliAction]
+                            if cliAction == "appServerChat" {
+                                guard !cliPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, cliPrompt.utf8.count <= 2048, !cliPrompt.utf8.contains(0) else { report = "Invalid message"; return }
+                                request["prompt"] = cliPrompt
+                            }
+                            guard let wire = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), wire.count <= 8192 else { report = "Invalid request"; return }
                             frozenInput = String(decoding: wire, as: UTF8.self)
                         } else if frozenHooks {
                             do {
@@ -246,7 +260,7 @@ struct LocalToolsView: View {
                 Button("Start") { start() }
                 Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false; frozenVSIX = nil; frozenCLI = nil }
             } message: {
-                Text(frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
             .task(id: running) {
                 while running && !Task.isCancelled {
