@@ -16,7 +16,7 @@ const IDLE: Duration = Duration::from_secs(60);
 const REPLY: Duration = Duration::from_secs(300);
 const NEW_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\",\"mcpServers\":[]}}\n";
 type Reply = SyncSender<Value>;
-enum Command { New(Vec<u8>, Reply), Prompt(Reply), Close(Reply) }
+enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Reply), Close(Reply) }
 static ACTIVE: Mutex<Option<SyncSender<Command>>> = Mutex::new(None);
 
 enum Mode { Agy(String), #[cfg(test)] Fixture }
@@ -52,22 +52,23 @@ const SMOKE_PROMPT: &str = "Reply with exactly NEXUS_ACP_OK. Do not use tools, r
 const SMOKE_REPLY: &str = "NEXUS_ACP_OK";
 
 // Separate from ACTIVE, whose lock is held while a blocking command waits.
-// Only counters and local control flags leave this mailbox.
+// Only counters, local control flags and filtered chat text leave this mailbox.
 #[derive(Default)]
 struct PromptProgress {
     running: bool,
     chunks: usize,
     cancel_requested: bool,
     cancel_taken: bool,
+    visible: String,
 }
 static PROGRESS: Mutex<PromptProgress> = Mutex::new(PromptProgress {
-    running: false, chunks: 0, cancel_requested: false, cancel_taken: false,
+    running: false, chunks: 0, cancel_requested: false, cancel_taken: false, visible: String::new(),
 });
 
 fn prompt_progress() -> Value {
     match PROGRESS.lock() {
         Ok(p) => json!({"ok":true,"running":p.running,"chunkCount":p.chunks,
-            "cancelRequested":p.cancel_requested}),
+            "cancelRequested":p.cancel_requested,"text":p.visible}),
         Err(_) => json!({"ok":false,"running":false,"error":"Progress unavailable"}),
     }
 }
@@ -104,6 +105,29 @@ fn take_cancel(session: &str) -> Option<Vec<u8>> {
     Some(format!("{frame}\n").into_bytes())
 }
 
+const CHAT_INPUT_LIMIT: usize = 1024;
+const CHAT_OUTPUT_LIMIT: usize = 8192;
+
+fn valid_chat(text: &str) -> bool {
+    !text.trim().is_empty() && text.len() <= CHAT_INPUT_LIMIT &&
+        text.chars().all(|c| !c.is_control() || c == '\n' || c == '\t')
+}
+
+// Literal credential protection across chunk boundaries. Never release a
+// suffix that could be the start of the key. This is NOT a general DLP filter:
+// transformed, encoded, or other secrets may still be returned by the agent.
+fn visible_prefix<'a>(text: &'a str, key: &str) -> Result<&'a str,String> {
+    if key.is_empty() || !key.is_ascii() || text.contains(key) {
+        return Err("Credential output blocked".into());
+    }
+    for n in (1..key.len()).rev() {
+        if text.ends_with(&key[..n]) {
+            return Ok(&text[..text.len()-n]);
+        }
+    }
+    Ok(text)
+}
+
 #[derive(Default)]
 struct PromptEvidence {
     text: String,
@@ -121,7 +145,7 @@ impl PromptEvidence {
                 let content = &u["content"];
                 let text = content["text"].as_str().ok_or("Missing text chunk")?;
                 if content["type"] != "text" || self.chunks >= 128 ||
-                    self.text.len() + text.len() > 1024 { return Err("Unsupported or oversized text".into()); }
+                    self.text.len() + text.len() > CHAT_OUTPUT_LIMIT { return Err("Unsupported or oversized text".into()); }
                 if let Some(id) = u.get("messageId") {
                     let id = id.as_str().filter(|s| !s.is_empty() && s.len() <= 256)
                         .ok_or("Invalid message id")?;
@@ -143,7 +167,7 @@ impl PromptEvidence {
     fn complete(&self, frame: &Value) -> bool {
         frame["jsonrpc"] == "2.0" && frame["id"] == 3 &&
             frame.get("error").is_none() && frame["result"]["stopReason"] == "end_turn" &&
-            self.chunks > 0 && self.text.trim() == SMOKE_REPLY
+            self.chunks > 0 && self.text.len() <= 1024 && self.text.trim() == SMOKE_REPLY
     }
 }
 
@@ -176,6 +200,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
     };
     opts.cwd = Some(PathBuf::from("/tmp"));
     let keyed = key.is_some();
+    let credential_filter = key.clone();
     if keyed && !rt.block_on(process_probe::prepare_gemini_provider(&guest, &env)) {
         let _ = rt.block_on(guest.shutdown());
         let _ = ready.send(failure("Gemini provider preparation failed")); return;
@@ -185,6 +210,10 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
     #[cfg(test)]
     if matches!(&mode, Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_CANCEL").as_deref() == Ok("1") {
         agent_env.insert("NEXUS_FIXTURE_CANCEL".into(), "1".into());
+    }
+    #[cfg(test)]
+    if matches!(&mode, Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_CHAT").as_deref() == Ok("1") {
+        agent_env.insert("NEXUS_FIXTURE_CHAT".into(), "1".into());
     }
     opts.envp = Some(agent_env.into_iter().collect());
     opts.pipe_stdin = true;
@@ -259,7 +288,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                     }
                 }
             }
-            Ok(Command::Prompt(reply)) => {
+            Ok(Command::Prompt(chat, reply)) => {
                 let Some(id) = session_id.as_deref() else {
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Create a session first"}));
                     continue;
@@ -268,9 +297,19 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"One consented Gemini prompt per boot"}));
                     continue;
                 }
+                let Some(key) = credential_filter.as_deref() else {
+                    let _ = reply.send(json!({"ok":false,"active":true,"error":"Credential unavailable"}));
+                    continue;
+                };
+                if chat.as_ref().is_some_and(|text| !valid_chat(text) || text.contains(key)) {
+                    let _ = reply.send(json!({"ok":false,"active":true,"error":"Invalid chat input or credential detected"}));
+                    continue;
+                }
+                let is_chat = chat.is_some();
+                let text = chat.as_deref().unwrap_or(SMOKE_PROMPT);
                 prompted = true;
                 let request = json!({"jsonrpc":"2.0","id":3,"method":"session/prompt",
-                    "params":{"sessionId":id,"prompt":[{"type":"text","text":SMOKE_PROMPT}]}});
+                    "params":{"sessionId":id,"prompt":[{"type":"text","text":text}]}});
                 let wire = format!("{request}\n");
                 let mut evidence = PromptEvidence::default();
                 let progress = ProgressGuard::begin();
@@ -278,7 +317,18 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                 let result = rt.block_on(exchange.request_controlled(wire.as_bytes(), 3,
                     |frame| {
                         evidence.update(frame, id)?;
-                        if let Ok(mut p) = PROGRESS.lock() { p.chunks = evidence.chunks; }
+                        // Check the assembled text, not each chunk independently.
+                        let safe = visible_prefix(&evidence.text, key)?;
+                        if evidence.text.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+                            return Err("Unsupported output control character".into());
+                        }
+                        if !is_chat && evidence.text.len() > 1024 {
+                            return Err("Smoke output too large".into());
+                        }
+                        if let Ok(mut p) = PROGRESS.lock() {
+                            p.chunks = evidence.chunks;
+                            if is_chat { p.visible = safe.to_owned(); }
+                        }
                         Ok(())
                     },
                     || {
@@ -297,16 +347,28 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                     }
                     continue;
                 }
-                let success = result.as_ref().is_ok_and(|frame| evidence.complete(frame));
+                let chat_success = is_chat && result.as_ref().is_ok_and(|frame|
+                    frame.get("error").is_none() && frame["result"]["stopReason"] == "end_turn" &&
+                    evidence.chunks > 0 && visible_prefix(&evidence.text, key)
+                        .is_ok_and(|s| !s.trim().is_empty()));
+                if chat_success {
+                    if reply.send(json!({"ok":true,"active":true,"chatCompleted":true,
+                        "responseId":3,"chunkCount":evidence.chunks,"stopReason":"end_turn"})).is_err() {
+                        break None;
+                    }
+                    continue;
+                }
+                let success = !is_chat && result.as_ref().is_ok_and(|frame| evidence.complete(frame));
                 if success {
                     // Export a constant marker only, never model text, IDs or errors.
                     if reply.send(json!({"ok":true,"active":true,"promptVerified":true,
                         "responseId":3,"chunkCount":evidence.chunks,"stopReason":"end_turn",
                         "marker":SMOKE_REPLY})).is_err() { break None; }
                 } else {
+                    if let Ok(mut p) = PROGRESS.lock() { p.visible.clear(); }
                     let auth = result.as_ref().ok().is_some_and(auth_error);
                     break Some((reply,json!({"ok":false,"active":false,"authenticationRequired":auth,
-                        "error":"Prompt probe rejected or incomplete"})));
+                        "error":"Prompt rejected, blocked or incomplete"})));
                 }
             }
             Ok(Command::Close(reply)) => break Some((reply, json!({"ok":true,"active":false}))),
@@ -353,13 +415,13 @@ fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>) -> Va
     }
 }
 
-enum Action { New(Vec<u8>), Prompt, Close }
+enum Action { New(Vec<u8>), Prompt, Chat(String), Close }
 
 fn command(action: Action) -> Value {
     let Ok(mut slot) = ACTIVE.lock() else { return failure("Connection lock failed"); };
     let Some(tx) = slot.as_ref() else { return failure("No active connection"); };
     let (reply, wait) = mpsc::sync_channel(1);
-    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(reply), Action::Close => Command::Close(reply) };
+    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(None, reply), Action::Chat(text) => Command::Prompt(Some(text), reply), Action::Close => Command::Close(reply) };
     if tx.send(message).is_err() {
         *slot = None; return failure("Connection stopped or idle timeout");
     }
@@ -421,6 +483,16 @@ pub extern "C" fn nexus_acp_prompt_probe() -> *mut c_char {
     ffi_result(|| command(Action::Prompt))
 }
 
+/// # Safety
+/// text must be valid NUL-terminated UTF-8. User must consent to model inference.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_acp_chat(text: *const c_char) -> *mut c_char {
+    ffi_result(|| match read_arg(text) {
+        Some(text) if valid_chat(&text) => command(Action::Chat(text)),
+        _ => json!({"ok":false,"active":true,"error":"Invalid chat input"}),
+    })
+}
+
 // These two functions do not acquire the blocking command lock.
 #[no_mangle]
 pub extern "C" fn nexus_acp_prompt_progress() -> *mut c_char {
@@ -464,7 +536,21 @@ mod tests {
         assert!(e.complete(&json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}})));
         assert!(!e.complete(&json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelled"}})));
         assert!(e.update(&json!({"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call"}}}),"s").is_err());
-        assert!(e.update(&chunk("s",&"a".repeat(1025)),"s").is_err());
+        assert!(e.update(&chunk("s",&"a".repeat(CHAT_OUTPUT_LIMIT+1)),"s").is_err());
+    }
+
+    #[test]
+    fn literal_credential_filter_holds_split_prefix() {
+        let key = "NEXUS_TEST_ONLY_NOT_A_REAL_KEY";
+        assert_eq!(visible_prefix("Tiếng Việt NEXUS_TEST_", key).unwrap(), "Tiếng Việt ");
+        assert!(visible_prefix("Tiếng Việt NEXUS_TEST_ONLY_NOT_A_REAL_KEY", key).is_err());
+        assert_eq!(visible_prefix("Tiếng Việt — ok", key).unwrap(), "Tiếng Việt — ok");
+        assert_eq!(visible_prefix("NEXUS", key).unwrap(), "");
+        assert!(valid_chat("Xin chào\n"));
+        assert!(!valid_chat(""));
+        assert!(!valid_chat(" \n"));
+        assert!(!valid_chat("a\0b"));
+        assert!(!valid_chat(&"é".repeat(513)));
     }
 
     #[test]
@@ -477,8 +563,20 @@ mod tests {
         let second = command(Action::New(NEW_REQUEST.to_vec()));
         let duplicate = command(Action::New(NEW_REQUEST.to_vec()));
         let cancel_mode = std::env::var("NEXUS_ACP_TEST_CANCEL").as_deref() == Ok("1");
+        let chat_mode = std::env::var("NEXUS_ACP_TEST_CHAT").as_deref() == Ok("1");
+        assert!(!(chat_mode && cancel_mode));
         let idle_cancel = request_cancel();
-        let (prompt, progress_seen, cancel_reply, duplicate_cancel) = if cancel_mode {
+        let (prompt, progress_seen, cancel_reply, duplicate_cancel) = if chat_mode {
+            let turn = thread::spawn(|| command(Action::Chat("Xin chào Nexus".into())));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let seen = loop {
+                let snapshot = prompt_progress();
+                if snapshot["running"] == true && snapshot["text"] == "Xin chào " { break true; }
+                if std::time::Instant::now() >= deadline || turn.is_finished() { break false; }
+                thread::sleep(Duration::from_millis(20));
+            };
+            (turn.join().expect("chat worker"), seen, Value::Null, Value::Null)
+        } else if cancel_mode {
             let turn = thread::spawn(|| command(Action::Prompt));
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let progress_seen = loop {
@@ -502,7 +600,9 @@ mod tests {
             duplicate["ok"] == false && duplicate["active"] == true &&
             before_session["ok"] == false && before_session["active"] == true &&
             idle_cancel["ok"] == false && finished["running"] == false &&
-            prompt["ok"] == true && (if cancel_mode {
+            prompt["ok"] == true && (if chat_mode {
+                progress_seen && prompt["chatCompleted"] == true && prompt["chunkCount"] == 2 && finished["text"] == "Xin chào Nexus!"
+            } else if cancel_mode {
                 progress_seen && cancel_reply["ok"] == true && duplicate_cancel["ok"] == false &&
                 prompt["cancelled"] == true && prompt["stopReason"] == "cancelled" && prompt["chunkCount"] == 1
             } else { prompt["marker"] == SMOKE_REPLY && prompt["chunkCount"] == 2 }) &&
@@ -511,7 +611,7 @@ mod tests {
             after_close["ok"] == false && after_close["active"] == false;
         let report = json!({"ok":ok,"fixtureOnly":true,"initialize":first,"newSession":second,
             "duplicate":duplicate,"beforeSession":before_session,"prompt":prompt,"duplicatePrompt":duplicate_prompt,"close":close,"afterClose":after_close,
-            "cancelMode":cancel_mode,"progressSeen":progress_seen,"cancelRequest":cancel_reply,
+            "cancelMode":cancel_mode,"chatMode":chat_mode,"progressSeen":progress_seen,"cancelRequest":cancel_reply,
             "duplicateCancel":duplicate_cancel,"idleCancel":idle_cancel,"finishedProgress":finished});
         std::fs::write(evidence, serde_json::to_vec_pretty(&report).unwrap()).expect("completed evidence");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());

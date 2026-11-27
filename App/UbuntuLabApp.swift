@@ -17,6 +17,10 @@ private struct UbuntuLabView: View {
     @State private var created = false
     @State private var prompted = false
     @State private var confirmPrompt = false
+    @State private var confirmChat = false
+    @State private var chatInput = ""
+    @State private var chatResponse = ""
+    @State private var sentChat = ""
     @State private var promptRunning = false
     @State private var receivedChunks = 0
     @State private var cancelRequested = false
@@ -71,6 +75,10 @@ private struct UbuntuLabView: View {
                         Button("Create empty guest session") { act(close: false) }.disabled(running || created)
                         if created && useGemini {
                             Button("Test model response") { confirmPrompt = true }.disabled(running || prompted)
+                            TextField("Ask the agent", text: $chatInput, axis: .vertical)
+                                .lineLimit(2...6).disabled(running || prompted)
+                            Button("Send chat") { confirmChat = true }
+                                .disabled(running || prompted || !UbuntuRunner.validChat(chatInput))
                         }
                         if promptRunning {
                             Text("Received text chunks: \(receivedChunks)").font(.caption)
@@ -80,6 +88,15 @@ private struct UbuntuLabView: View {
                             }.disabled(cancelRequested)
                         }
                         Button("Close local connection", role: .destructive) { act(close: true) }.disabled(running)
+                    }
+                }
+                if !sentChat.isEmpty {
+                    Section("Chat · temporary") {
+                        Text("You").font(.caption)
+                        Text(sentChat)
+                        Text("Agent").font(.caption)
+                        Text(chatResponse.isEmpty ? (promptRunning ? "Waiting for text…" : "No response available") : chatResponse)
+                        Text("Untrusted response · literal key filter only").font(.caption)
                     }
                 }
                 Section("Evidence") {
@@ -93,9 +110,16 @@ private struct UbuntuLabView: View {
                 while !Task.isCancelled && promptRunning {
                     let progress = UbuntuRunner.progress()
                     receivedChunks = progress.chunks
+                    if !sentChat.isEmpty { chatResponse = progress.text }
                     if progress.cancelRequested { cancelRequested = true }
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
+            }
+            .confirmationDialog("Send your message to the model?", isPresented: $confirmChat) {
+                Button("Send message") { runPrompt(chat: chatInput) }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Your message may be sent to Google and incur charges. Do not include passwords, keys or private data. One text turn per boot. No project mounted. Agent actions are not sandboxed.")
             }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
@@ -132,15 +156,28 @@ private struct UbuntuLabView: View {
         }
     }
 
-    private func runPrompt() {
+    private func runPrompt(chat: String? = nil) {
         guard active, created, useGemini, !running, !prompted else { return }
+        if let chat {
+            guard UbuntuRunner.validChat(chat) else { return }
+            // Do not display or send a prompt containing the stored literal key.
+            do {
+                guard let key = try GeminiKeychain.load(), !chat.contains(key) else {
+                    chatInput = ""; agentStatus = "Credential unavailable or detected in message"; return
+                }
+            } catch { chatInput = ""; agentStatus = "Keychain unavailable"; return }
+            sentChat = chat
+            chatInput = ""
+        }
+        chatResponse = ""
         running = true
         prompted = true
         promptRunning = true
         receivedChunks = 0
         cancelRequested = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat) }.value
+            if chat != nil { chatResponse = result.ok ? UbuntuRunner.progress().text : "" }
             promptRunning = false
             report = result.report
             agentStatus = result.status
@@ -232,19 +269,25 @@ private enum UbuntuRunner {
         return (try? JSONSerialization.jsonObject(with: Data(String(cString: pointer).utf8)) as? [String: Any]) ?? [:]
     }
 
-    static func progress() -> (chunks: Int, cancelRequested: Bool) {
+    static func validChat(_ text: String) -> Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && text.utf8.count <= 1024 &&
+            text.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) || $0.value == 10 || $0.value == 9 }
+    }
+
+    static func progress() -> (chunks: Int, cancelRequested: Bool, text: String) {
         let obj = controlReport(nexus_acp_prompt_progress())
-        return (obj["chunkCount"] as? Int ?? 0, obj["cancelRequested"] as? Bool == true)
+        return (obj["chunkCount"] as? Int ?? 0, obj["cancelRequested"] as? Bool == true, obj["text"] as? String ?? "")
     }
 
     static func cancelPrompt() -> Bool {
         controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
     }
 
-    static func action(close: Bool, prompt: Bool = false) -> (report: String, status: String, active: Bool, ok: Bool) {
+    static func action(close: Bool, prompt: Bool = false, chat: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
+            else if let chat { pointer = chat.withCString { nexus_acp_chat($0) } }
             else if prompt { pointer = nexus_acp_prompt_probe() }
             else {
                 let request = String(decoding: try ACPRequest.newSession(id: 2, cwd: "/tmp"), as: UTF8.self)
@@ -267,8 +310,10 @@ private enum UbuntuRunner {
                 status = "Local connection closed; guest shutdown verified"
             } else if prompt && ok && active && object["cancelled"] as? Bool == true && object["stopReason"] as? String == "cancelled" {
                 status = "Agent acknowledged cancellation"
+            } else if chat != nil && ok && active && object["chatCompleted"] as? Bool == true {
+                status = "Chat turn completed"
             } else if prompt && ok && active && object["promptVerified"] as? Bool == true && object["marker"] as? String == "NEXUS_ACP_OK" {
-                status = "Fixed model response verified; general chat disabled"
+                status = "Fixed model response verified"
             } else if !close && !prompt && ok && active && object["sessionCreated"] as? Bool == true && object["responseId"] as? Int == 2 {
                 status = "Empty guest session created; fixed test available with Gemini key"
             } else if object["authenticationRequired"] as? Bool == true {
