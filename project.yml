@@ -1,0 +1,22 @@
+name: NexusIDE
+options:
+  deploymentTarget:
+    iOS: '17.0'
+packages:
+  NexusCore:
+    path: .
+targets:
+  NexusIDE:
+    type: application
+    platform: iOS
+    sources: [App]
+    dependencies:
+      - package: NexusCore
+        product: NexusCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.nexuside.local
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: '5.0'
+        INFOPLIST_KEY_CFBundleDisplayName: Nexus IDE
+    scheme: {}
