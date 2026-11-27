@@ -8,6 +8,7 @@ test "$ready" = '{"method":"initialized"}'
 IFS= read -r account
 test "$account" = '{"id":2,"method":"account/read","params":{"refreshToken":false}}'
 if [ -n "${NEXUS_CONVERSATION_PHASE:-}" ]; then
+    test "$(cat /tmp/nexus-agent-before)" = before
     printf '%s\n' '{"id":2,"result":{"account":{"type":"chatgpt"},"requiresOpenaiAuth":true}}'
     IFS= read -r start
     if [ "$NEXUS_CONVERSATION_PHASE" = resume ]; then
@@ -28,6 +29,7 @@ if [ -n "${NEXUS_CONVERSATION_PHASE:-}" ]; then
         else
             case "$turn" in *'Second fixture'*) ;; *) exit 35;; esac
             reply="Second reply"
+            printf done >/tmp/nexus-agent-turn-done
         fi
         printf '{"id":%s,"result":{"turn":{"id":"turn-%s","status":"inProgress"}}}\n' "$id" "$id"
         printf '{"method":"item/agentMessage/delta","params":{"threadId":"fixture-thread","turnId":"turn-%s","delta":"%s"}}\n' "$id" "$reply"

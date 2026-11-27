@@ -2,6 +2,7 @@
 set -eu
 case "${NEXUS_CLAUDE_FIXTURE_PHASE:-}" in
 conversation)
+    test "$(cat /tmp/nexus-agent-before)" = before
     id=550e8400-e29b-41d4-a716-446655440000
     resume=
     safe=0
@@ -31,7 +32,7 @@ conversation)
     'Second fixture')
         test "$resume" = "$id"
         test "$(cat /root/nexus-claude-session-fixture)" = "$id"
-        reply="Second reply";;
+        reply="Second reply"; printf done >/tmp/nexus-agent-turn-done;;
     *) exit 7;;
     esac
     printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","result":"%s"}\n' "$id" "$reply"

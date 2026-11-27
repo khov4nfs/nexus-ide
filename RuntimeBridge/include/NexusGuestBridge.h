@@ -56,8 +56,8 @@ char *nexus_local_terminal_input(const char *base64_bytes);
 char *nexus_local_resize(uint16_t cols, uint16_t rows);
 char *nexus_local_stop(void);
 // Native chat mailbox: only accepts a message or finish while waiting.
-char *nexus_local_agent_send(const char *text);
-char *nexus_local_agent_finish(void);
+char *nexus_local_agent_send(uint32_t ticket,const char *text);
+char *nexus_local_agent_finish(uint32_t ticket);
 void nexus_guest_free(char *result);
 #ifdef __cplusplus
 }
