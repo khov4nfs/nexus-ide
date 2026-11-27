@@ -61,6 +61,8 @@ struct UbuntuLabView: View {
     @State private var pickingAGY = false
     @State private var importingAGY = false
     @State private var importStatus = ""
+    @State private var savedImportInvalid = false
+    @State private var confirmRemoveAGY = false
     private var importSlot: Bool {
         guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else { return false }
         return LocalAGYImport.available(in: root)
@@ -87,14 +89,15 @@ struct UbuntuLabView: View {
                         Button("Choose AGY executable") {
                             frozenAGYDigest = expectedAGY
                             pickingAGY = true
-                        }.disabled(attempted || model.guestClaimed || importingAGY || !AGYImportFormat.validDigest(expectedAGY))
+                        }.disabled(attempted || model.guestClaimed || importingAGY || importedAGY != nil || savedImportInvalid || !AGYImportFormat.validDigest(expectedAGY))
                             .fileImporter(isPresented: $pickingAGY, allowedContentTypes: [.data]) { result in
                                 importAGY(result)
                             }
                         if importingAGY { ProgressView("Verifying local ELF and SHA-256") }
-                        if importedAGY != nil {
-                            Button("Discard imported executable", role: .destructive) {
-                                importedAGY?.discard(); importedAGY = nil; importStatus = "Discarded"
+                        if importedAGY != nil || savedImportInvalid {
+                            Text("Reviewed executable is saved privately; SHA-256 checked again before every boot.").font(.caption)
+                            Button("Remove saved AGY executable", role: .destructive) {
+                                confirmRemoveAGY = true
                             }.disabled(attempted || model.guestClaimed || importingAGY)
                         }
                         Text(importStatus).font(.caption)
@@ -151,7 +154,7 @@ struct UbuntuLabView: View {
                     Text(agentStatus)
                     Text("ACP tool permissions: deny only. No native tool access. Agent internal actions are not sandboxed.").font(.caption)
                     if active {
-                        Text("Connection closes after 60 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
+                        Text("Connection closes after 180 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
                         Button("Create empty guest session") { act(close: false) }.disabled(running || created)
                         if created && (useGemini || useGoogle) {
                             Button("Test model response") { confirmPrompt = true }.disabled(running || importingContext || turnCount != 0)
@@ -262,9 +265,41 @@ struct UbuntuLabView: View {
                     }
                 }
             }
-            .onAppear { refreshKey() }
+            .onAppear {
+                refreshKey()
+                if !attempted && !importingAGY && !model.guestClaimed {
+                    do {
+                        importedAGY = try LocalAGYImport.loadSaved()
+                        savedImportInvalid = false
+                        if importedAGY != nil { importStatus = "Saved import found; digest rechecked before execution" }
+                    } catch { importedAGY = nil; savedImportInvalid = true; importStatus = "Saved import invalid; remove it explicitly" }
+                }
+            }
+            .alert("Remove saved AGY executable?", isPresented: $confirmRemoveAGY) {
+                Button("Remove executable", role: .destructive) {
+                    guard !model.guestClaimed, !importingAGY else { return }
+                    do {
+                        try LocalAGYImport.removeSaved()
+                        importedAGY = nil; savedImportInvalid = false; importStatus = "Removed"
+                    } catch { importStatus = "Removal failed" }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { Text("Only the separately imported binary is removed. No native project files are deleted.") }
             .fileImporter(isPresented: $pickingContext, allowedContentTypes: [.plainText]) { result in
                 importContext(result)
+            }
+            .task(id: active && !running) {
+                while active && !running && !Task.isCancelled {
+                    if !UbuntuRunner.connectionActive() {
+                        active = false
+                        created = false
+                        fileContext = nil; editSnapshot = nil; pendingEdit = nil
+                        pendingChat = ""; pendingDisplay = ""
+                        agentStatus = "Agent connection closed or idle timeout; restart app"
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
             }
             .task(id: promptRunning) {
                 guard promptRunning else { return }
@@ -328,13 +363,13 @@ struct UbuntuLabView: View {
               case .success(let url) = result else { return }
         let expected = frozenAGYDigest
         importingAGY = true
-        importedAGY?.discard(); importedAGY = nil
+        guard importedAGY == nil, !savedImportInvalid else { importingAGY = false; return }
         Task {
             let selected = await Task.detached(priority: .userInitiated) {
                 try? LocalAGYImport.select(url, expected: expected)
             }.value
             importingAGY = false
-            guard !model.guestClaimed else { selected?.discard(); return }
+            guard !model.guestClaimed else { return }
             importedAGY = selected
             importStatus = selected == nil ? "Import rejected: file, ARM64 ELF or digest mismatch" : "Local import verified. Nothing executed; consent to connect separately."
         }
@@ -349,8 +384,7 @@ struct UbuntuLabView: View {
         Task {
             let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected) }.value
             loginURL = ""; loginCode = ""; loginRunning = false
-            selected?.discard()
-            if selected != nil { importedAGY = nil }
+            // Keep the separately reviewed binary; never persist OAuth tokens with it.
             report = result.report
             agentStatus = result.status
             active = result.active
@@ -614,6 +648,7 @@ private enum UbuntuRunner {
         return (try? JSONSerialization.jsonObject(with: Data(String(cString: pointer).utf8)) as? [String: Any]) ?? [:]
     }
 
+    static func connectionActive() -> Bool { controlReport(nexus_acp_connection_status())["active"] as? Bool == true }
     static func googleURL(_ text: String) -> URL? {
         guard let c = URLComponents(string: text), c.scheme == "https", c.host == "accounts.google.com",
               c.port == nil, c.user == nil, c.password == nil, c.fragment == nil,

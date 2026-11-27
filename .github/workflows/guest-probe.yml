@@ -196,14 +196,16 @@ jobs:
           export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
           export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
           export CC="$(xcrun --sdk macosx --find clang)"
-          for mode in pty mcp; do
+          for mode in pty mcp call; do
             cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-local-$mode-fs"
             export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-local-$mode-fs/data"
             export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-local-$mode.json"
             rm -f "$NEXUS_LOCAL_EVIDENCE"
-            if [ "$mode" = mcp ]; then export NEXUS_LOCAL_MCP=1; else export NEXUS_LOCAL_MCP=0; fi
+            export NEXUS_LOCAL_MCP=0 NEXUS_LOCAL_CALL=0
+            if [ "$mode" = mcp ]; then export NEXUS_LOCAL_MCP=1; fi
+            if [ "$mode" = call ]; then export NEXUS_LOCAL_CALL=1; fi
             cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_local_job -- --ignored --nocapture --test-threads=1
-            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["shutdownClean"] is True; assert (r["ptyVerified"] is True and r["exitCode"] == 0) if sys.argv[2]=="pty" else (r["tools"]==["fixture_echo"] and r["discoveryOnly"] is True and r["transportClosed"] is True)' "$NEXUS_LOCAL_EVIDENCE" "$mode"
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["shutdownClean"] is True; assert (r["ptyVerified"] is True and r["exitCode"] == 0) if sys.argv[2]=="pty" else (r["tools"]==["fixture_echo"] and r["transportClosed"] is True and ((r["discoveryOnly"] is True) if sys.argv[2]=="mcp" else (r["discoveryOnly"] is False and r["calledTool"]=="fixture_echo" and r["text"]=="NEXUS_MCP_42")))' "$NEXUS_LOCAL_EVIDENCE" "$mode"
           done
       - name: Upload local job evidence
         if: always()
@@ -213,6 +215,7 @@ jobs:
           path: |
             ${{ runner.temp }}/nexus-local-pty.json
             ${{ runner.temp }}/nexus-local-mcp.json
+            ${{ runner.temp }}/nexus-local-call.json
           if-no-files-found: warn
           retention-days: 7
       - name: Verify real ELF import slot in fresh Ubuntu guest (not AGY)
@@ -253,6 +256,26 @@ jobs:
           name: google-login-fixture-evidence
           path: ${{ runner.temp }}/nexus-google.json
           if-no-files-found: error
+      - name: Verify persisted guest across independent runtime processes
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-persist-fs"
+          export NEXUS_PERSIST_ROOTFS="$RUNNER_TEMP/nexus-persist-fs/data"
+          for phase in write read scroll; do
+            export NEXUS_PERSIST_PHASE="$phase"
+            export NEXUS_PERSIST_EVIDENCE="$RUNNER_TEMP/nexus-persist-$phase.json"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_persistent_local_guest -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["verified"] is True and r["shutdownClean"] is True and r["exitCode"] == 0' "$NEXUS_PERSIST_EVIDENCE"
+          done
+      - name: Upload persistent guest evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: persistent-local-guest-evidence
+          path: ${{ runner.temp }}/nexus-persist-*.json
+          if-no-files-found: error
       - name: Optional reviewed workbench asset for device test
         if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
         run: |
@@ -265,7 +288,7 @@ jobs:
         env:
           VARIANT: ${{ inputs.variant || 'ubuntu' }}
         run: |
-          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.5.1 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
+          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.5.2 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
           python3 scripts/package-ipa.py --app "$RUNNER_TEMP/nexus-integrated/Build/Products/Release-iphoneos/NexusIDEUbuntuLab.app" --output "$RUNNER_TEMP/nexus-integrated-ipa" --variant "$VARIANT" --commit "$GITHUB_SHA"
       - name: Upload integrated unsigned IPA only after owner license review
         if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.license_reviewed

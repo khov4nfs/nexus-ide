@@ -24,6 +24,7 @@ char *nexus_acp_start_google(const char *rootfs_data_path, const char *expected_
 char *nexus_google_login_progress(void);
 char *nexus_google_login_code(const char *code);
 char *nexus_google_login_cancel(void);
+char *nexus_acp_connection_status(void);
 char *nexus_acp_new_session(const char *session_new_request);
 // Explicit model-network consent; one fixed prompt, no arbitrary content.
 char *nexus_acp_prompt_probe(void);
@@ -34,7 +35,7 @@ char *nexus_acp_chat(const char *text);
 char *nexus_acp_prompt_progress(void);
 char *nexus_acp_cancel_prompt(void);
 char *nexus_acp_close(void);
-// Separate local boot: 1 PTY, 2 MCP discovery, 3 token-protected workbench.
+// Separate local boot: 1 PTY, 2 MCP discovery, 3 token-protected workbench, 4 one manual MCP call (JSON command/name/arguments).
 #include <stdint.h>
 char *nexus_local_run(const char *rootfs_data_path, uint8_t mode, const char *input);
 char *nexus_local_progress(void);
