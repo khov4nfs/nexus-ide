@@ -2,6 +2,7 @@
 import SwiftUI
 import Foundation
 import NexusCore
+import UniformTypeIdentifiers
 
 @main struct UbuntuLabApp: App {
     var body: some Scene { WindowGroup { UbuntuLabView() } }
@@ -29,6 +30,12 @@ private struct UbuntuLabView: View {
     @State private var confirmPrompt = false
     @State private var confirmChat = false
     @State private var chatInput = ""
+    @State private var pickingContext = false
+    @State private var importingContext = false
+    @State private var fileContext: AgentFileContext?
+    @State private var contextStatus = ""
+    @State private var pendingChat = ""
+    @State private var pendingDisplay = ""
     @State private var chatResponse = ""
     @State private var sentChat = ""
     @State private var promptRunning = false
@@ -87,11 +94,27 @@ private struct UbuntuLabView: View {
                         Text("Connection closes after 60 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
                         Button("Create empty guest session") { act(close: false) }.disabled(running || created)
                         if created && useGemini {
-                            Button("Test model response") { confirmPrompt = true }.disabled(running || turnCount != 0)
+                            Button("Test model response") { confirmPrompt = true }.disabled(running || importingContext || turnCount != 0)
                             TextField("Ask the agent", text: $chatInput, axis: .vertical)
                                 .lineLimit(2...6).disabled(running || smokeUsed || turnCount >= maxTurns)
-                            Button("Send chat") { confirmChat = true }
-                                .disabled(running || smokeUsed || turnCount >= maxTurns || !UbuntuRunner.validChat(chatInput))
+                            Button("Choose text file") { pickingContext = true }
+                                .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns)
+                            if importingContext { ProgressView("Reading selected file") }
+                            if let context = fileContext {
+                                Text("Selected snapshot · \(context.text.utf8.count) bytes").font(.caption)
+                                ScrollView {
+                                    Text(context.text).font(.system(.footnote, design: .monospaced))
+                                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                }.frame(maxHeight: 160)
+                                Button("Remove attachment") { fileContext = nil; contextStatus = "" }
+                                    .disabled(running || importingContext)
+                            }
+                            if !contextStatus.isEmpty { Text(contextStatus).font(.caption) }
+                            if let context = fileContext, let combined = try? context.prompt(question: chatInput) {
+                                Text("Combined prompt: \(combined.utf8.count)/1024 bytes").font(.caption)
+                            }
+                            Button("Send chat") { prepareChat() }
+                                .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || !UbuntuRunner.validChat(chatInput))
                             Text("Chat turns: \(turnCount)/\(maxTurns)").font(.caption)
                         }
                         if turnCount > 0 {
@@ -104,7 +127,7 @@ private struct UbuntuLabView: View {
                                 if accepted { cancelRequested = true }
                             }.disabled(cancelRequested)
                         }
-                        Button("Close local connection", role: .destructive) { act(close: true) }.disabled(running)
+                        Button("Close local connection", role: .destructive) { act(close: true) }.disabled(running || importingContext)
                     }
                 }
                 if !transcript.isEmpty || !sentChat.isEmpty {
@@ -133,6 +156,9 @@ private struct UbuntuLabView: View {
             }
             .navigationTitle("Ubuntu Lab")
             .onAppear { refreshKey() }
+            .fileImporter(isPresented: $pickingContext, allowedContentTypes: [.plainText]) { result in
+                importContext(result)
+            }
             .task(id: promptRunning) {
                 guard promptRunning else { return }
                 while !Task.isCancelled && promptRunning {
@@ -148,10 +174,15 @@ private struct UbuntuLabView: View {
                 }
             }
             .confirmationDialog("Send your message to the model?", isPresented: $confirmChat) {
-                Button("Send message") { runPrompt(chat: chatInput) }
-                Button("Cancel", role: .cancel) {}
+                Button("Send message") {
+                    let wire = pendingChat
+                    let display = pendingDisplay
+                    pendingChat = ""; pendingDisplay = ""
+                    runPrompt(chat: wire, display: display)
+                }
+                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = "" }
             } message: {
-                Text("Your message may be sent to Google and incur charges. Do not include passwords, keys or private data. Up to three text turns per boot, each with consent. No project mounted. Agent actions are not sandboxed.")
+                Text("Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
             }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
@@ -188,8 +219,45 @@ private struct UbuntuLabView: View {
         }
     }
 
-    private func runPrompt(chat: String? = nil) {
-        guard active, created, useGemini, !running, !smokeUsed, turnCount < maxTurns,
+    private func importContext(_ result: Result<URL, Error>) {
+        guard !running, !importingContext, active, created, !smokeUsed, turnCount < maxTurns else { return }
+        fileContext = nil
+        contextStatus = ""
+        guard case .success(let url) = result else { contextStatus = "No file selected"; return }
+        importingContext = true
+        Task {
+            let snapshot = await Task.detached(priority: .userInitiated) {
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                return try? AgentFileContext.read(url)
+            }.value
+            importingContext = false
+            guard active, !running else { return }
+            fileContext = snapshot
+            contextStatus = snapshot == nil ? "Select a regular UTF-8 text file, at most 768 bytes" : "Review the snapshot before sending; filename and path are not included"
+        }
+    }
+
+    private func prepareChat() {
+        guard !running, !importingContext, active, created, !smokeUsed, turnCount < maxTurns else { return }
+        do {
+            let wire = try fileContext?.prompt(question: chatInput) ?? chatInput
+            guard UbuntuRunner.validChat(wire) else {
+                contextStatus = "Question and snapshot must fit 1024 UTF-8 bytes"; return
+            }
+            guard let key = try GeminiKeychain.load(), !wire.contains(key) else {
+                fileContext = nil; chatInput = ""; contextStatus = "Credential unavailable or detected"; return
+            }
+            pendingChat = wire
+            pendingDisplay = fileContext == nil ? chatInput : chatInput + "\n[Selected text snapshot included]"
+            confirmChat = true
+        } catch {
+            contextStatus = "Invalid question, oversized context, or Keychain unavailable"
+        }
+    }
+
+    private func runPrompt(chat: String? = nil, display: String? = nil) {
+        guard active, created, useGemini, !running, !importingContext, !smokeUsed, turnCount < maxTurns,
               chat != nil || turnCount == 0 else { return }
         if let chat {
             guard UbuntuRunner.validChat(chat) else { return }
@@ -199,8 +267,10 @@ private struct UbuntuLabView: View {
                     chatInput = ""; agentStatus = "Credential unavailable or detected in message"; return
                 }
             } catch { chatInput = ""; agentStatus = "Keychain unavailable"; return }
-            sentChat = chat
+            sentChat = display ?? chat
             chatInput = ""
+            fileContext = nil
+            contextStatus = ""
         }
         chatResponse = ""
         running = true
@@ -222,7 +292,7 @@ private struct UbuntuLabView: View {
             let matches = result.responseID == expectedID && snapshot.responseID == expectedID && !snapshot.running
             if let chat {
                 let text = result.ok && matches ? snapshot.text : ""
-                transcript.append(ChatTurn(id: expectedID, user: chat, response: text,
+                transcript.append(ChatTurn(id: expectedID, user: display ?? chat, response: text,
                     status: matches ? result.status : "Turn failed or response mismatch"))
                 sentChat = ""
                 chatResponse = ""
@@ -250,6 +320,7 @@ private struct UbuntuLabView: View {
             agentStatus = result.status
             active = result.active
             if !close && result.ok { created = true }
+            if !active { fileContext = nil; pendingChat = ""; pendingDisplay = ""; contextStatus = "" }
             running = false
         }
     }

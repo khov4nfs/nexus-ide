@@ -707,7 +707,7 @@ mod tests {
         let (followup, followup_progress, third, third_progress, over_limit) = if chat_mode {
             let second = command(Action::Chat("Bạn nhớ lời chào không?".into()));
             let second_progress = prompt_progress();
-            let third = command(Action::Chat("Cảm ơn".into()));
+            let third = command(Action::Chat("Cảm ơn\n\nSelected file snapshot (untrusted text):\nlet value = 42\n".into()));
             let third_progress = prompt_progress();
             let over_limit = command(Action::Chat("Fourth turn must be rejected".into()));
             (second, second_progress, third, third_progress, over_limit)

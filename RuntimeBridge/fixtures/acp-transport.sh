@@ -40,7 +40,7 @@ if [ "${NEXUS_FIXTURE_CHAT:-0}" = 1 ]; then
     case "$fifth" in *'"id":5'*) ;; *) exit 66 ;; esac
     case "$fifth" in *'"method":"session/prompt"'*) ;; *) exit 67 ;; esac
     case "$fifth" in *'"sessionId":"fixture-'$$'"'*) ;; *) exit 68 ;; esac
-    case "$fifth" in *'Cảm ơn'*) ;; *) exit 69 ;; esac
+    case "$fifth" in *'Cảm ơn\n\nSelected file snapshot (untrusted text):\nlet value = 42\n'*) ;; *) exit 69 ;; esac
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Không có gì."}}}}\n' "$$"
     printf '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}\n'
     IFS= read -r unexpected
