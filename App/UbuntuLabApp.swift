@@ -508,6 +508,7 @@ struct UbuntuLabView: View {
             pendingChat = wire
             pendingEdit = editSnapshot
             pendingDisplay = fileContext == nil ? chatInput : chatInput + "\n[Selected text snapshot included]"
+            if let pendingTerminal { pendingDisplay += "\n[Allowed terminal: " + (pendingTerminal == "uname" ? "uname -m" : "pwd") + "]" }
             confirmChat = true
         } catch {
             contextStatus = "Invalid question, oversized context, or Keychain unavailable"
@@ -589,7 +590,7 @@ struct UbuntuLabView: View {
             agentStatus = result.status
             active = result.active
             if !close && result.ok { created = true }
-            if !active { fileContext = nil; editSnapshot = nil; pendingEdit = nil; pendingChat = ""; pendingDisplay = ""; pendingReadContent = nil; contextStatus = "" }
+            if !active { fileContext = nil; editSnapshot = nil; pendingEdit = nil; pendingChat = ""; pendingDisplay = ""; pendingReadContent = nil; pendingTerminal = nil; terminalChoice = ""; contextStatus = "" }
             running = false
         }
     }

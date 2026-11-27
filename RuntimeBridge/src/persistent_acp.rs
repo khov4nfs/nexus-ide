@@ -267,6 +267,7 @@ struct PromptEvidence {
     chunks: usize,
     message_id: Option<String>,
     tool_updates: usize,
+    observe_granted_tools: bool,
 }
 impl PromptEvidence {
     fn update(&mut self, frame: &Value, session: &str) -> Result<(),String> {
@@ -293,14 +294,16 @@ impl PromptEvidence {
                 Ok(())
             }
             Some("tool_call" | "tool_call_update") => {
-                // Observation only. Do not accept execution/completion or raw
-                // tool content as proof that a denied action did not happen.
+                // Observations are not execution evidence or permissions.
+                // In explicitly granted turns allow progress/completion metadata,
+                // but never export raw content or tool titles to native UI.
                 if !u["toolCallId"].as_str().is_some_and(|s| !s.is_empty() && s.len() <= 256) ||
                     self.tool_updates >= 32 {
                     return Err("Invalid or excessive tool updates".into());
                 }
                 match u["status"].as_str() {
                     Some("pending" | "failed") => {}
+                    Some("in_progress" | "completed") if self.observe_granted_tools => {}
                     None if u.get("status").is_none() && u["sessionUpdate"] == "tool_call" => {}
                     _ => return Err("Tool execution or unsupported status reported".into()),
                 }
@@ -502,7 +505,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                 let request = json!({"jsonrpc":"2.0","id":response_id,"method":"session/prompt",
                     "params":{"sessionId":id,"prompt":[{"type":"text","text":text}]}});
                 let wire = format!("{request}\n");
-                let mut evidence = PromptEvidence::default();
+                let mut evidence = PromptEvidence {observe_granted_tools:edit || terminal_choice.is_some(),..Default::default()};
                 let progress = ProgressGuard::begin(response_id);
                 let mut cancel_taken = false;
                 let mut permission_ids = std::collections::HashSet::new();
@@ -885,6 +888,11 @@ mod tests {
         assert!(evidence.update(&update("completed"),"s").is_err());
         assert!(evidence.update(&update("failed"),"s").is_ok());
         assert_eq!(evidence.tool_updates,2);
+        let mut granted=PromptEvidence{observe_granted_tools:true,..Default::default()};
+        assert!(granted.update(&update("in_progress"),"s").is_ok());
+        assert!(granted.update(&update("completed"),"s").is_ok());
+        assert!(granted.update(&update("completed"),"wrong").is_err());
+        assert!(granted.update(&update("unexpected"),"s").is_err());
     }
 
     #[test]

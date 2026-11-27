@@ -818,8 +818,8 @@ impl<'a> TerminalGrant<'a> {
                 let mut truncated=false;
                 if p.capture.closed {
                     let text=String::from_utf8_lossy(&p.capture.pty);
-                    if self.key.is_empty() || text.contains(self.key) {return Err("Terminal credential output blocked".into());}
                     output=text.chars().filter(|c|!c.is_control() || *c=='\n' || *c=='\t').collect();
+                    if self.key.is_empty() || text.contains(self.key) || output.contains(self.key) {return Err("Terminal credential output blocked".into());}
                     truncated=p.capture.truncated_pty || output.len()>p.limit;
                     let mut start=output.len().saturating_sub(p.limit);
                     while !output.is_char_boundary(start) {start+=1;}

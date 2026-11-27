@@ -34,6 +34,7 @@ if [ "${NEXUS_FIXTURE_TERMINAL:-0}" = 1 ]; then
     printf '{"jsonrpc":"2.0","id":82,"method":"terminal/create","params":{"sessionId":"fixture-%s","command":"uname","args":["-m"]}}\n' "$$"
     IFS= read -r got
     case "$got" in *'"id":82'*'"terminalId":"nexus-term-4"'*) ;; *) exit 105 ;; esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"tool_call","toolCallId":"term-call","status":"in_progress"}}}\n' "$$"
     printf '{"jsonrpc":"2.0","id":83,"method":"terminal/wait_for_exit","params":{"sessionId":"fixture-%s","terminalId":"nexus-term-4"}}\n' "$$"
     IFS= read -r got
     case "$got" in *'"id":83'*'"exitCode":0'*) ;; *) exit 106 ;; esac
@@ -46,6 +47,7 @@ if [ "${NEXUS_FIXTURE_TERMINAL:-0}" = 1 ]; then
     printf '{"jsonrpc":"2.0","id":86,"method":"terminal/output","params":{"sessionId":"fixture-%s","terminalId":"nexus-term-4"}}\n' "$$"
     IFS= read -r got
     case "$got" in *'"error":'*'"id":86'*) ;; *) exit 109 ;; esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"tool_call_update","toolCallId":"term-call","status":"completed"}}}\n' "$$"
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"NEXUS_TERMINAL_OK"}}}}\n' "$$"
     printf '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}\n'
     IFS= read -r unexpected
