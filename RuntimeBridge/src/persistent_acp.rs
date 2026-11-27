@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-const IDLE: Duration = Duration::from_secs(60);
+const IDLE: Duration = Duration::from_secs(180);
 const REPLY: Duration = Duration::from_secs(300);
 const NEW_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\",\"mcpServers\":[]}}\n";
 type Reply = SyncSender<Value>;

@@ -21,6 +21,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.nexuside.guest
         GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_CFBundleDisplayName: Nexus Linux Lab
         SWIFT_VERSION: '5.0'
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) NEXUS_EMBEDDED_LINUX"

@@ -154,13 +154,14 @@ pub(crate) async fn google_login(guest: &IshInstance, env: &HashMap<String,Strin
 
 fn google_oauth_url(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
-    // Require a delimiter, since a guest frame may contain half of a URL.
+    let mut start = 0;
+    // A word must end in whitespace; partial final frames are never offered.
     for (end, ch) in text.char_indices() {
         if !ch.is_ascii_whitespace() { continue; }
-        let line = &text[..end];
-        let Some(word) = line.split_ascii_whitespace().last() else { continue; };
+        let word = &text[start..end];
+        start = end + ch.len_utf8();
         if word.len() > 4096 || !word.bytes().all(|b| b.is_ascii_graphic()) ||
-            word.bytes().any(|b| matches!(b,b'\\'|b'<'|b'>'|b'"'|b'\''|b'\x60')) { continue; }
+            word.bytes().any(|b| matches!(b,b'\\'|b'<'|b'>'|b'"'|b'\''|b'\x60'|b'#')) { continue; }
         if (word.starts_with("https://accounts.google.com/o/oauth2/v2/auth?") ||
             word.starts_with("https://accounts.google.com/o/oauth2/auth?")) &&
             word.contains("client_id=") && word.contains("state=") {

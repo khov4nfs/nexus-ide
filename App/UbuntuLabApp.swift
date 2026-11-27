@@ -515,6 +515,18 @@ struct UbuntuLabView: View {
 }
 
 private enum UbuntuRunner {
+    private static let trialLock = NSLock()
+    private static var activeTrial: URL?
+    private static func rememberTrial(_ url: URL) {
+        trialLock.lock(); defer { trialLock.unlock() }; activeTrial = url
+    }
+    private static func cleanTrialIfShutdown(_ object: [String: Any]) {
+        guard object["shutdownClean"] as? Bool == true else { return }
+        trialLock.lock(); defer { trialLock.unlock() }
+        if let trial = activeTrial {
+            do { try FileManager.default.removeItem(at: trial); activeTrial = nil } catch { /* leave for next launch */ }
+        }
+    }
     static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?) -> (report: String, status: String, active: Bool) {
         var client = ACPInitializeClient()
         func failed(_ reason: String) -> (String, String, Bool) { (reason, "Not initialized", false) }
@@ -529,7 +541,15 @@ private enum UbuntuRunner {
                 return failed("Missing Ubuntu fakefs.")
             }
             let trial = fm.temporaryDirectory.appendingPathComponent("NexusUbuntu-\(UUID().uuidString)", isDirectory: true)
+            // Only one boot per app process. Clear stale trials from prior launches.
+            if let old = try? fm.contentsOfDirectory(at: fm.temporaryDirectory, includingPropertiesForKeys: [.isDirectoryKey,.isSymbolicLinkKey]) {
+                for url in old where url.lastPathComponent.hasPrefix("NexusUbuntu-") {
+                    let suffix = String(url.lastPathComponent.dropFirst("NexusUbuntu-".count))
+                    if UUID(uuidString: suffix) != nil, let v = try? url.resourceValues(forKeys: [.isDirectoryKey,.isSymbolicLinkKey]), v.isDirectory == true, v.isSymbolicLink != true { try? fm.removeItem(at: url) }
+                }
+            }
             try fm.copyItem(at: bundled, to: trial)
+            rememberTrial(trial)
             if let imported {
                 do {
                     guard sha == imported.digest else { throw LocalAGYImport.Failure.invalid }
@@ -559,6 +579,7 @@ private enum UbuntuRunner {
             guard let object = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] else {
                 return failed("Invalid bridge report.")
             }
+            cleanTrialIfShutdown(object)
             let pretty = (try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]))
                 .flatMap { String(data: $0, encoding: .utf8) } ?? raw
             guard sha != nil else {
@@ -643,6 +664,7 @@ private enum UbuntuRunner {
                 nexus_guest_free(nexus_acp_close())
                 return ("Invalid report", "Connection unavailable", false, false, 0)
             }
+            cleanTrialIfShutdown(object)
             let active = object["active"] as? Bool == true
             let ok = object["ok"] as? Bool == true
             let status: String

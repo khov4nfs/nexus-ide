@@ -28,7 +28,7 @@ class Tests(unittest.TestCase):
                 with zipfile.ZipFile(path,"w") as z:
                     z.writestr(prefix+"Info.plist",plistlib.dumps({
                         "CFBundleIdentifier":ipa.VARIANTS[variant],"CFBundleSupportedPlatforms":["iPhoneOS"],
-                        "MinimumOSVersion":"17.0","CFBundleExecutable":"NexusIDE",
+                        "MinimumOSVersion":"17.0","UILaunchScreen":{},"CFBundleExecutable":"NexusIDE",
                         "CFBundleShortVersionString":"0.5.0","CFBundleVersion":"1"}))
                     entry=zipfile.ZipInfo(prefix+"NexusIDE")
                     entry.create_system=3

@@ -15,7 +15,7 @@ char *nexus_guest_probe_workspace(const char *rootfs_data_path, const char *text
 char *nexus_guest_probe_glibc(const char *rootfs_data_path, const char *expected_agy_sha256);
 // Native initialize request only; requires non-NULL digest and request.
 char *nexus_guest_probe_glibc_acp(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request);
-// Blocking calls: serialize off the main thread. Idle timeout: 60 seconds.
+// Blocking calls: serialize off the main thread. Idle timeout: 180 seconds.
 char *nexus_acp_start(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request);
 // Explicit consent required; key is passed only to the agent process environment.
 char *nexus_acp_start_gemini(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request, const char *key);
