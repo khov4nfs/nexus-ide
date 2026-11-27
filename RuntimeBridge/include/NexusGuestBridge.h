@@ -19,6 +19,11 @@ char *nexus_guest_probe_glibc_acp(const char *rootfs_data_path, const char *expe
 char *nexus_acp_start(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request);
 // Explicit consent required; key is passed only to the agent process environment.
 char *nexus_acp_start_gemini(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request, const char *key);
+// Google terminal auth: one worker owns the login and subsequent ACP process.
+char *nexus_acp_start_google(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request);
+char *nexus_google_login_progress(void);
+char *nexus_google_login_code(const char *code);
+char *nexus_google_login_cancel(void);
 char *nexus_acp_new_session(const char *session_new_request);
 // Explicit model-network consent; one fixed prompt, no arbitrary content.
 char *nexus_acp_prompt_probe(void);

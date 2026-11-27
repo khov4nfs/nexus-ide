@@ -49,6 +49,12 @@ struct UbuntuLabView: View {
     @State private var keyStored = false
     @State private var keyStatus = ""
     @State private var useGemini = false
+    @State private var useGoogle = false
+    @State private var loginURL = ""
+    @State private var loginCode = ""
+    @State private var loginSubmitted = false
+    @State private var loginRunning = false
+    @Environment(\.openURL) private var openURL
     @State private var importedAGY: LocalAGYImport?
     @State private var expectedAGY = ""
     @State private var frozenAGYDigest = ""
@@ -94,9 +100,29 @@ struct UbuntuLabView: View {
                         Text(importStatus).font(.caption)
                     }
                     Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed || importingAGY)
-                    Button("Initialize imported AGY (no key)") { useGemini = false; confirm = true }.disabled(attempted || model.guestClaimed || importingAGY || digest == nil)
-                    Button("Connect with saved Gemini API key") { useGemini = true; confirm = true }
+                    Button("Initialize imported AGY (no key)") { useGemini = false; useGoogle = false; confirm = true }.disabled(attempted || model.guestClaimed || importingAGY || digest == nil)
+                    Button("Connect with saved Gemini API key") { useGemini = true; useGoogle = false; confirm = true }
                         .disabled(attempted || model.guestClaimed || importingAGY || digest == nil || !keyStored)
+                    Button("Sign in with Google") { useGoogle = true; useGemini = false; confirm = true }
+                        .disabled(attempted || model.guestClaimed || importingAGY || digest == nil)
+                    if running && useGoogle {
+                        Text("Google sign-in uses the official AGY CLI. Open the browser, return promptly and enter the code. Do not share the code or URL. The app may suspend in the background.").font(.caption)
+                        if let url = UbuntuRunner.googleURL(loginURL), !loginSubmitted {
+                            Button("Open Google sign-in in Safari") { openURL(url) }
+                            SecureField("Authorization code from Google", text: $loginCode)
+                                .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            Button("Submit authorization code") {
+                                if UbuntuRunner.submitGoogle(loginCode.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                                    loginCode = ""; loginSubmitted = true; loginURL = ""
+                                } else { agentStatus = "Code rejected; check the format" }
+                            }.disabled(loginCode.isEmpty)
+                        }
+                        if loginSubmitted { Text("Code submitted; verifying login and starting ACP").font(.caption) }
+                        Button("Cancel Google sign-in", role: .destructive) {
+                            _ = UbuntuRunner.cancelGoogle()
+                            loginCode = ""; loginURL = ""
+                        }.disabled(!loginRunning)
+                    }
                     Text(digest == nil ? "No reviewed AGY binary imported." : "Reviewed digest present. Execution and publisher identity not verified.")
                     if running { ProgressView("Keep this app open") }
                 }
@@ -127,12 +153,12 @@ struct UbuntuLabView: View {
                     if active {
                         Text("Connection closes after 60 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
                         Button("Create empty guest session") { act(close: false) }.disabled(running || created)
-                        if created && useGemini {
+                        if created && (useGemini || useGoogle) {
                             Button("Test model response") { confirmPrompt = true }.disabled(running || importingContext || turnCount != 0)
                             TextField("Ask the agent", text: $chatInput, axis: .vertical)
                                 .lineLimit(2...6).disabled(running || smokeUsed || turnCount >= maxTurns)
                             Button("Attach saved editor file for edit") { attachEditor() }
-                                .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || model.path.isEmpty || model.reviewBusy || proposal != nil)
+                                .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || model.path.isEmpty || model.reviewBusy || proposal != nil || useGoogle)
                             Button("Choose text file") { pickingContext = true }
                                 .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns)
                             if importingContext { ProgressView("Reading selected file") }
@@ -254,6 +280,15 @@ struct UbuntuLabView: View {
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
             }
+            .task(id: running && useGoogle && !active) {
+                while running && useGoogle && !active && !Task.isCancelled {
+                    let state = UbuntuRunner.googleProgress()
+                    loginRunning = state.running
+                    loginURL = state.url
+                    if state.submitted { loginSubmitted = true }
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                }
+            }
             .confirmationDialog("Send your message to the model?", isPresented: $confirmChat) {
                 Button("Send message") {
                     let wire = pendingChat
@@ -273,10 +308,10 @@ struct UbuntuLabView: View {
                 Text("The agent may use model inference and incur API charges. Only a fixed test message is sent by Nexus; no user project is mounted. The agent may still perform internal actions; this is not a sandbox.")
             }
             .confirmationDialog("Run original AGY in the local guest?", isPresented: $confirm) {
-                Button("Verify digest and connect") { if let sha = digest { run(sha: sha, gemini: useGemini) } }
+                Button("Verify digest and connect") { if let sha = digest { run(sha: sha, gemini: useGemini, google: useGoogle) } }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text(useGemini ? "Your saved key will enter the local agent process environment. AGY may connect to Google and write its own logs. The emulator is not a security sandbox. Only use a reviewed official binary and a restricted key. No project or prompt is supplied." : "AGY may make startup network requests. No credentials, user project, prompts or permission grants are supplied. This emulator is not a security sandbox. Run only a reviewed official binary.")
+                Text(useGoogle ? "AGY will start its official Google terminal sign-in in a disposable local guest. Safari opens only a Google OAuth URL; paste the authorization code here. Credentials may be cached by AGY in guest storage. No key or project is supplied. Not a security sandbox." : useGemini ? "Your saved key will enter the local agent process environment. AGY may connect to Google and write its own logs. The emulator is not a security sandbox. Only use a reviewed official binary and a restricted key. No project or prompt is supplied." : "AGY may make startup network requests. No credentials, user project, prompts or permission grants are supplied. This emulator is not a security sandbox. Run only a reviewed official binary.")
             }
         }
     }
@@ -305,13 +340,15 @@ struct UbuntuLabView: View {
         }
     }
 
-    private func run(sha: String?, gemini: Bool = false) {
+    private func run(sha: String?, gemini: Bool = false, google: Bool = false) {
         guard !attempted, !importingAGY, model.claimGuest() else { return }
         let selected = sha == nil ? nil : importedAGY
         attempted = true
         running = true
+        loginURL = ""; loginCode = ""; loginSubmitted = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, imported: selected) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected) }.value
+            loginURL = ""; loginCode = ""; loginRunning = false
             selected?.discard()
             if selected != nil { importedAGY = nil }
             report = result.report
@@ -371,6 +408,11 @@ struct UbuntuLabView: View {
         }
     }
 
+    private func credentialAllows(_ text: String) throws -> Bool {
+        if let key = try GeminiKeychain.load() { return !text.contains(key) }
+        return useGoogle
+    }
+
     private func prepareChat() {
         guard !running, !importingContext, active, created, !smokeUsed, turnCount < maxTurns else { return }
         do {
@@ -382,7 +424,7 @@ struct UbuntuLabView: View {
             guard UbuntuRunner.validChat(wire) else {
                 contextStatus = "Question and snapshot must fit 1024 UTF-8 bytes"; return
             }
-            guard let key = try GeminiKeychain.load(), !wire.contains(key) else {
+            guard try credentialAllows(wire) else {
                 fileContext = nil; editSnapshot = nil; chatInput = ""; contextStatus = "Credential unavailable or detected"; return
             }
             pendingChat = wire
@@ -395,13 +437,13 @@ struct UbuntuLabView: View {
     }
 
     private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil) {
-        guard active, created, useGemini, !running, !importingContext, !smokeUsed, turnCount < maxTurns,
+        guard active, created, (useGemini || useGoogle), !running, !importingContext, !smokeUsed, turnCount < maxTurns,
               chat != nil || turnCount == 0 else { return }
         if let chat {
             guard UbuntuRunner.validChat(chat) else { return }
             // Do not display or send a prompt containing the stored literal key.
             do {
-                guard let key = try GeminiKeychain.load(), !chat.contains(key) else {
+                guard try credentialAllows(chat) else {
                     chatInput = ""; agentStatus = "Credential unavailable or detected in message"; return
                 }
             } catch { chatInput = ""; agentStatus = "Keychain unavailable"; return }
@@ -473,7 +515,7 @@ struct UbuntuLabView: View {
 }
 
 private enum UbuntuRunner {
-    static func run(sha: String?, gemini: Bool, imported: LocalAGYImport?) -> (report: String, status: String, active: Bool) {
+    static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?) -> (report: String, status: String, active: Bool) {
         var client = ACPInitializeClient()
         func failed(_ reason: String) -> (String, String, Bool) { (reason, "Not initialized", false) }
         do {
@@ -504,6 +546,7 @@ private enum UbuntuRunner {
                     return sha.withCString { digest in
                         request.withCString { wire in
                             if let key { return key.withCString { nexus_acp_start_gemini(path, digest, wire, $0) } }
+                            if google { return nexus_acp_start_google(path, digest, wire) }
                             return nexus_acp_start(path, digest, wire)
                         }
                     }
@@ -522,7 +565,7 @@ private enum UbuntuRunner {
                 return (pretty, "Libc only; AGY not executed", false)
             }
             if object["authenticationRequired"] as? Bool == true {
-                return (pretty, "Authentication required; interactive sign-in not implemented", false)
+                return (pretty, "Authentication required; restart and select Google sign-in", false)
             }
             guard object["ok"] as? Bool == true, object["active"] as? Bool == true,
                   let response = object["response"] as? [String: Any] else {
@@ -535,7 +578,7 @@ private enum UbuntuRunner {
                 try client.receive(frame)
                 try client.finish()
                 if case let .initialized(name, version) = client.state {
-                    return (pretty, gemini ? "ACP connected with key supplied; model access not verified" : "\(name) \(version): ACP v1 connected", true)
+                    return (pretty, google ? "Google login process completed; ACP connected; model access not verified" : gemini ? "ACP connected with key supplied; model access not verified" : "\(name) \(version): ACP v1 connected", true)
                 }
             } catch {}
             nexus_guest_free(nexus_acp_close())
@@ -549,6 +592,22 @@ private enum UbuntuRunner {
         defer { nexus_guest_free(pointer) }
         return (try? JSONSerialization.jsonObject(with: Data(String(cString: pointer).utf8)) as? [String: Any]) ?? [:]
     }
+
+    static func googleURL(_ text: String) -> URL? {
+        guard let c = URLComponents(string: text), c.scheme == "https", c.host == "accounts.google.com",
+              c.port == nil, c.user == nil, c.password == nil, c.fragment == nil,
+              ["/o/oauth2/v2/auth", "/o/oauth2/auth"].contains(c.path) else { return nil }
+        return c.url
+    }
+    static func googleProgress() -> (running: Bool, url: String, submitted: Bool) {
+        let obj = controlReport(nexus_google_login_progress())
+        return (obj["running"] as? Bool == true,obj["url"] as? String ?? "",obj["submitted"] as? Bool == true)
+    }
+    static func submitGoogle(_ code: String) -> Bool {
+        guard !code.utf8.contains(0) else { return false }
+        return code.withCString { controlReport(nexus_google_login_code($0))["ok"] as? Bool == true }
+    }
+    static func cancelGoogle() -> Bool { controlReport(nexus_google_login_cancel())["ok"] as? Bool == true }
 
     static func validChat(_ text: String) -> Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && text.utf8.count <= 1024 &&
@@ -596,7 +655,7 @@ private enum UbuntuRunner {
             } else if prompt && ok && active && object["promptVerified"] as? Bool == true && object["marker"] as? String == "NEXUS_ACP_OK" {
                 status = "Fixed model response verified"
             } else if !close && !prompt && ok && active && object["sessionCreated"] as? Bool == true && object["responseId"] as? Int == 2 {
-                status = "Empty guest session created; fixed test available with Gemini key"
+                status = "Empty guest session created; fixed test available in credential mode"
             } else if object["authenticationRequired"] as? Bool == true {
                 status = "Authentication required; connection stopped"
             } else {
