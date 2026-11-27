@@ -503,6 +503,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_GOOGLE_EDIT").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_GOOGLE_EDIT".into(),"1".into());}
     #[cfg(test)]
     if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_MCP_SESSION").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_MCP_SESSION".into(),"1".into());}
+    #[cfg(test)]
+    if matches!(&mode,Mode::Fixture) {if let Ok(phase)=std::env::var("NEXUS_ACP_RESUME_PHASE"){agent_env.insert("NEXUS_FIXTURE_RESUME".into(),phase);}}
     opts.envp = Some(agent_env.into_iter().collect());
     opts.pipe_stdin = true;
     let session = match guest.spawn(opts) {
@@ -530,6 +532,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
             Mode::Fixture => {
                 let expected = json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,
                     "agentInfo":{"name":"Nexus Transport Fixture","version":"test"}}});
+                let mut expected=expected;
+                if std::env::var("NEXUS_ACP_RESUME_PHASE").is_ok(){expected["result"]["agentCapabilities"]=json!({"loadSession":true});}
                 if frame == expected { Some(frame) } else { None }
             }
         },
@@ -1004,6 +1008,24 @@ mod tests {
         assert!(valid_session_handle("fixture-resume_1"));
         for s in ["","../bad","a/b","a b","a\n"]{assert!(!valid_session_handle(s));}
         assert!(!valid_session_handle(&"a".repeat(257)));
+    }
+    #[test]
+    #[ignore = "requires two sequential fresh processes using same fakefs"]
+    fn real_acp_resume_transport(){
+        let path=std::env::var_os("NEXUS_ACP_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_ACP_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_ACP_RESUME_PHASE").expect("phase");
+        let init=start(PathBuf::from(path),Mode::Fixture,process_probe::AGY_INITIALIZE_REQUEST.to_vec(),Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()),false);
+        assert_eq!(init["supportsLoad"],true);
+        let r=if phase=="create"{command(Action::New(NEW_REQUEST.to_vec()))}else{command(Action::Load("fixture-resume".into()))};
+        let no_replay=prompt_progress()["text"]=="";
+        let prompt=command(Action::Chat("Continue fixture".into()));
+        let followup=prompt_progress()["text"]=="NEXUS_RESUMED";
+        let close=command(Action::Close);
+        let verified=r["sessionHandle"]=="fixture-resume"&&prompt["chatCompleted"]==true&&followup&&no_replay&&close["shutdownClean"]==true&&(phase=="create"||(r["sessionLoaded"]==true&&r["replayUpdates"]==1));
+        let report=json!({"ok":verified,"fixtureOnly":true,"phase":phase,"shutdownClean":close["shutdownClean"],"replayWithheld":no_replay});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(verified);
     }
     #[test]
     fn restricted_request_and_session_shape() {

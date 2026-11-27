@@ -58,3 +58,5 @@ Native local CLI mode offers a Codex-only app-server initialize/initialized/acco
 
 ## Opt-in persistent AGY guest and ACP session/load
 Gemini-key mode only: separate per-binary-digest guest, excluded from backup, clean explicit close required before reuse, provenance and guest executable digest checks. Google remains disposable. Guest data may contain provider credentials or private history; user must opt in and can reset. ACP load only when initialize advertises loadSession, exact session handle, fixed /tmp and no MCP servers. Replay is bounded and not displayed (may contain older secrets). New native permissions required. User manually saves/copies the handle and explicitly resumes after restart. Idle/crash leaves guest dirty. Real AGY, session replay and device acceptance remain unverified.
+
+Added independent-process create/resume fixture with durable guest marker, replay withheld and subsequent prompt verification. It is synthetic, not proof that original AGY advertises or implements session/load. CI pending.

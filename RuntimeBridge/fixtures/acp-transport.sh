@@ -11,6 +11,24 @@ else
 fi
 IFS= read -r first
 case "$first" in *'"method":"initialize"'*) ;; *) exit 51 ;; esac
+if [ -n "${NEXUS_FIXTURE_RESUME:-}" ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"Nexus Transport Fixture","version":"test"},"agentCapabilities":{"loadSession":true}}}'
+    IFS= read -r request
+    if [ "$NEXUS_FIXTURE_RESUME" = create ]; then
+        case "$request" in *'"method":"session/new"'*) ;; *) exit 120;; esac
+        printf '%s\n' fixture-resume >/root/nexus-resume-fixture
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture-resume"}}'
+    else
+        test "$(cat /root/nexus-resume-fixture)" = fixture-resume
+        case "$request" in *'"method":"session/load"'*'"sessionId":"fixture-resume"'*) ;; *) exit 121;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-resume","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed history"}}}}' '{"jsonrpc":"2.0","id":2,"result":{}}'
+    fi
+    IFS= read -r prompt
+    case "$prompt" in *'"method":"session/prompt"'*'"sessionId":"fixture-resume"'*) ;; *) exit 122;; esac
+    printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-resume","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"NEXUS_RESUMED"}}}}' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+    IFS= read -r unexpected
+    exit 123
+fi
 printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"Nexus Transport Fixture","version":"test"}}}\n'
 printf 'fixture diagnostic, not ACP stdout\n' >&2
 IFS= read -r second

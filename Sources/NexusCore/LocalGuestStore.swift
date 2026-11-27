@@ -1,6 +1,6 @@
 import Foundation
 
-/// Persistent local-tools fakefs only. Never shared with an authenticated agent.
+/// Persistent fakefs lifecycle. Callers must use separate stores for local tools, workbench and authenticated agents.
 /// A dirty marker prevents silently reopening after a crash or failed shutdown.
 /// Caller must own the sole guest boot and serialize access.
 public struct LocalGuestStore: Sendable {

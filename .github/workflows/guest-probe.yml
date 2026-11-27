@@ -334,6 +334,25 @@ jobs:
           name: acp-terminal-fixture-evidence
           path: ${{ runner.temp }}/nexus-terminal.json
           if-no-files-found: error
+      - name: Verify ACP session load across independent guest processes (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-acp-resume"
+          export NEXUS_ACP_ROOTFS="$RUNNER_TEMP/nexus-acp-resume/data"
+          for phase in create resume; do
+            export NEXUS_ACP_RESUME_PHASE="$phase"
+            export NEXUS_ACP_EVIDENCE="$RUNNER_TEMP/nexus-acp-resume-$phase.json"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_acp_resume_transport -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","shutdownClean","replayWithheld"])' "$NEXUS_ACP_EVIDENCE"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acp-resume-fixture-evidence
+          path: ${{ runner.temp }}/nexus-acp-resume-*.json
+          if-no-files-found: error
       - name: Verify Codex app-server JSONL handshake (synthetic peer)
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
