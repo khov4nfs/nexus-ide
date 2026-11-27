@@ -141,6 +141,21 @@ jobs:
           cat "$log"
           rm -f "$log"
           python3 scripts/verify-acp-transport.py "$NEXUS_ACP_EVIDENCE" --cancel
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-acp-chat-fs"
+          export NEXUS_ACP_ROOTFS="$RUNNER_TEMP/nexus-acp-chat-fs/data"
+          export NEXUS_ACP_EVIDENCE="$RUNNER_TEMP/nexus-acp-chat-evidence.json"
+          rm -f "$NEXUS_ACP_EVIDENCE"
+          if ! NEXUS_ACP_TEST_CHAT=1 ISH_TRACE_FRAMES=1 cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_persistent_acp_transport -- --ignored --nocapture --test-threads=1 >"$log" 2>&1; then
+            echo "Chat fixture failed; raw trace withheld"
+            exit 1
+          fi
+          if grep -q 'NEXUS_TEST_ONLY_NOT_A_REAL_KEY' "$log"; then
+            echo "Synthetic credential leaked into chat trace"
+            exit 1
+          fi
+          cat "$log"
+          rm -f "$log"
+          python3 scripts/verify-acp-transport.py "$NEXUS_ACP_EVIDENCE" --chat
       - name: Upload transport fixture evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -149,6 +164,7 @@ jobs:
           path: |
             ${{ runner.temp }}/nexus-acp-evidence.json
             ${{ runner.temp }}/nexus-acp-cancel-evidence.json
+            ${{ runner.temp }}/nexus-acp-chat-evidence.json
           if-no-files-found: warn
           retention-days: 7
       - name: Record scope
