@@ -7,3 +7,8 @@ xcuserdata/
 .DS_Store
 .env
 *.ipa
+
+# Local experimental runtime build products
+/Vendor/
+/RuntimeAssets/
+/RuntimeBridge/target/

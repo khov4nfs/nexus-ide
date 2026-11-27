@@ -55,3 +55,20 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(params["sessionId"] as? String, "test")
     }
 }
+
+extension CoreTests {
+    func testWorkspaceListThroughRootAlias() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let actual = base.appendingPathComponent("actual")
+        let alias = base.appendingPathComponent("alias")
+        try FileManager.default.createDirectory(at: actual, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: actual)
+        let w = try Workspace(root: alias)
+        try await w.write("src/main.js", text: "hello")
+        try await w.write(".hidden/private.txt", text: "hidden")
+        try FileManager.default.createSymbolicLink(at: actual.appendingPathComponent("linked"), withDestinationURL: actual.appendingPathComponent("src"))
+        let listed = try await w.list()
+        XCTAssertEqual(listed, ["src/main.js"])
+    }
+}

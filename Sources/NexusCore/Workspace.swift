@@ -35,12 +35,17 @@ public actor Workspace {
     }
 
     public func list() throws -> [String] {
-        guard let e = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles]) else { return [] }
+        // Enumerate relative names rather than slicing absolute URL paths.
+        // Darwin may spell the same temporary root as /var or /private/var.
+        guard let e = fm.enumerator(atPath: root.path) else { return [] }
         var result: [String] = []
-        for case let url as URL in e {
-            let v = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-            if v.isSymbolicLink == true { e.skipDescendants(); continue }
-            if v.isRegularFile == true { result.append(String(url.path.dropFirst(root.path.count + 1))) }
+        for case let relative as String in e {
+            let url = root.appendingPathComponent(relative)
+            let v = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey])
+            if v.isSymbolicLink == true || relative.split(separator: "/").contains(where: { $0.hasPrefix(".") }) {
+                e.skipDescendants(); continue
+            }
+            if v.isRegularFile == true { result.append(relative) }
         }
         return result.sorted()
     }
