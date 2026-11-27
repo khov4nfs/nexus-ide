@@ -20,7 +20,8 @@ if len(scripts) != 1:
 subprocess.run(["sh", "-n"], input=scripts[0], text=True, check=True)
 for fixture in sorted((root / "RuntimeBridge/fixtures").glob("*.sh")):
     subprocess.run(["sh", "-n", str(fixture)], check=True)
-subprocess.run(["bash", "-n", str(root / "scripts/build-guest-device.sh")], check=True)
+for script in ("build-guest-device.sh", "build-glibc-rootfs.sh"):
+    subprocess.run(["bash", "-n", str(root / "scripts" / script)], check=True)
 for script in sorted((root / "scripts").glob("*.py")):
     compile(script.read_bytes(), str(script), "exec")
 print("Rust, embedded shell, build shell and Python syntax checks passed")

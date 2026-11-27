@@ -334,9 +334,117 @@ pub async fn workspace_roundtrip(guest: &IshInstance, env: &HashMap<String,Strin
     }
 }
 
+
+// Separate compatibility lane for glibc and the official, user-provisioned
+// AGY binary. No model requests, project mounts or authentication.
+const GLIBC_SCRIPT: &str = r#"
+set -eu
+/usr/bin/uname -m
+/usr/bin/getconf GNU_LIBC_VERSION
+# apt-get dynamically links libstdc++; require a real successful loader run.
+/usr/bin/apt-get --version >/dev/null
+test -r /usr/lib/aarch64-linux-gnu/libstdc++.so.6
+/bin/grep -a -q 'GLIBCXX_3\.4\.25' /usr/lib/aarch64-linux-gnu/libstdc++.so.6
+printf 'NEXUS_GLIBCXX_OK\n'
+"#;
+
+fn glibc_output_ok(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else { return false; };
+    let lines: Vec<_> = text.lines().collect();
+    if lines.len() != 3 || lines[0] != "aarch64" || lines[2] != "NEXUS_GLIBCXX_OK" { return false; }
+    let Some(version) = lines[1].strip_prefix("glibc ") else { return false; };
+    let Some((major, minor)) = version.split_once('.') else { return false; };
+    matches!((major.parse::<u32>(), minor.parse::<u32>()), (Ok(a), Ok(b)) if (a,b) >= (2,28))
+}
+
+pub async fn glibc_compat(guest: &IshInstance, env: &HashMap<String,String>) -> Value {
+    let name = "glibc_compat";
+    let mut opts = shell(GLIBC_SCRIPT, env);
+    opts.pipe_stdin = false;
+    let session = match guest.spawn(opts) {
+        Ok(s) => s,
+        Err(e) => return json!({"name":name,"passed":false,"error":e.to_string()}),
+    };
+    let mut capture = Capture::default();
+    let result = drain(&session, &mut capture, Instant::now() + Duration::from_secs(60)).await;
+    if result.is_err() { let _ = session.terminate().await; }
+    let passed = result.is_ok() && capture.code == Some(0) && capture.signal == Some(0)
+        && capture.closed && capture.pty.is_empty() && glibc_output_ok(&capture.stdout);
+    json!({"name":name,"passed":passed,"evidence":capture.evidence(),"error":result.err()})
+}
+
+// Do not treat arbitrary JSON or a JSON-RPC error as a successful initialize.
+fn agy_initialize_ok(frame: &Value) -> bool {
+    frame["jsonrpc"] == "2.0" && frame["id"] == 1 &&
+        frame.get("error").is_none() && frame["result"]["protocolVersion"] == 1 &&
+        frame["result"]["agentInfo"]["name"].as_str()
+            .map(|s| s.to_ascii_lowercase().contains("antigravity")).unwrap_or(false)
+}
+
+pub async fn agy_initialize(guest: &IshInstance, env: &HashMap<String,String>) -> Value {
+    let name = "agy_acp_initialize";
+    // Fixed guest-only path; prepared by the developer from the official
+    // artifact. Never substitute a fixture or run a host binary.
+    let mut opts = SpawnOpts::cmd(["/opt/nexus/agy", "acp", "--disable-telemetry"]);
+    opts.cwd = Some(Path::new("/tmp").to_path_buf());
+    opts.envp = Some(env.iter().map(|(k,v)| (k.clone(),v.clone())).collect());
+    opts.pipe_stdin = true;
+    let session = match guest.spawn(opts) {
+        Ok(s) => s,
+        Err(e) => return json!({"name":name,"passed":false,"error":e.to_string()}),
+    };
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut capture = Capture::default();
+    let result: Result<Value,String> = async {
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{},\"clientInfo\":{\"name\":\"nexus-ios\",\"version\":\"0.3.0\"}}}\n";
+        write_ready(&session, request, deadline).await?;
+        let mut cursor = 0;
+        loop {
+            capture.poll(&session, deadline).await?;
+            while let Some(end) = capture.stdout[cursor..].iter().position(|b| *b == b'\n') {
+                let end = cursor + end;
+                let frame: Value = serde_json::from_slice(&capture.stdout[cursor..end])
+                    .map_err(|_| "non-JSON ACP stdout".to_owned())?;
+                cursor = end + 1;
+                if frame.get("id").is_some() {
+                    if !agy_initialize_ok(&frame) {
+                        return Err("AGY initialize rejected or unexpected request; no authentication or permissions granted".into());
+                    }
+                    // Keep only non-secret identity and protocol evidence.
+                    return Ok(json!({"protocolVersion":frame["result"]["protocolVersion"],
+                        "agentName":frame["result"]["agentInfo"]["name"],
+                        "agentVersion":frame["result"]["agentInfo"]["version"]}));
+                }
+                if frame["jsonrpc"] != "2.0" || !frame["method"].is_string() {
+                    return Err("Unexpected ACP notification".into());
+                }
+            }
+            if capture.exited || capture.closed { return Err("AGY exited before initialize".into()); }
+        }
+    }.await;
+    // No session/new or prompt. Kill only this probe's process group.
+    let terminated = session.terminate().await.is_ok();
+    let drained = drain(&session, &mut capture, Instant::now() + TIMEOUT).await.is_ok();
+    match result {
+        Ok(evidence) => json!({"name":name,"passed":terminated && drained && capture.closed && capture.pty.is_empty(),
+                              "evidence":evidence,"closed":capture.closed}),
+        Err(error) => json!({"name":name,"passed":false,"error":error,"closed":capture.closed}),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compatibility_requires_glibc_and_real_agent_identity() {
+        assert!(glibc_output_ok(b"aarch64\nglibc 2.39\nNEXUS_GLIBCXX_OK\n"));
+        assert!(!glibc_output_ok(b"aarch64\nglibc 2.27\nNEXUS_GLIBCXX_OK\n"));
+        assert!(!glibc_output_ok(b"aarch64\nmusl 1.2\nNEXUS_GLIBCXX_OK\n"));
+        let good = json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"Antigravity ACP Server","version":"test"}}});
+        assert!(agy_initialize_ok(&good));
+        assert!(!agy_initialize_ok(&json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000}})));
+        assert!(!agy_initialize_ok(&json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"fixture"}}})));
+    }
     #[test]
     fn workspace_input_boundaries() {
         assert!(workspace_input_ok(WORKSPACE_FIXTURE));
