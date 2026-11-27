@@ -334,6 +334,22 @@ jobs:
           name: acp-terminal-fixture-evidence
           path: ${{ runner.temp }}/nexus-terminal.json
           if-no-files-found: error
+      - name: Verify Codex app-server JSONL handshake (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-codex-probe"
+          export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-codex-probe/data"
+          export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-codex-probe.json"
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_codex_app_server_fixture -- --ignored --nocapture --test-threads=1
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","initializeVerified","accountReadVerified","fixtureOnly","shutdownClean"]) and r["accountPresent"] is False' "$NEXUS_LOCAL_EVIDENCE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-app-server-fixture-evidence
+          path: ${{ runner.temp }}/nexus-codex-probe.json
+          if-no-files-found: error
       - name: Verify original CLI import slots (Ubuntu ELF fixture only)
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"

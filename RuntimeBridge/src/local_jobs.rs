@@ -60,7 +60,7 @@ fn parse_cli(input:&str)->Option<(String,String,String)> {
     let kind=v["kind"].as_str()?;
     let digest=v["sha256"].as_str()?;
     let action=v["action"].as_str()?;
-    if !matches!(kind,"codex"|"claude") || !process_probe::agy_digest_ok(digest) || !matches!(action,"shell"|"version") {return None;}
+    if !matches!(kind,"codex"|"claude") || !process_probe::agy_digest_ok(digest) || !matches!(action,"shell"|"version"|"appServer") || (action=="appServer" && kind!="codex") {return None;}
     Some((kind.into(),digest.into(),action.into()))
 }
 fn progress() -> Value {
@@ -156,6 +156,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
                 // Only fixed paths/actions; no user-provided shell interpolation,
                 // no CLI flags that disable the original harness safeguards.
                 env.insert("PATH".into(),"/opt/nexus:/usr/bin:/bin:/usr/sbin:/sbin".into());
+                if action=="appServer" {rt.block_on(process_probe::codex_app_server_probe(&guest,&env,false))} else {
                 let script=match (kind.as_str(),action.as_str()) {
                     ("codex","version")=>"exec /opt/nexus/codex --version",
                     ("claude","version")=>"exec /opt/nexus/claude --version",
@@ -163,6 +164,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
                     _=>"umask 077; mkdir -p /root/nexus-cli-project && cd /root/nexus-cli-project && printf 'Reviewed Claude Code: run claude and use its own login.\\n' && exec /bin/sh -i",
                 };
                 rt.block_on(process_probe::local_process(&guest,&env,script,false))
+                }
             }else{fail("Reviewed CLI executable digest mismatch or cancelled")};
             r["binaryDigestVerified"]=json!(verified);
             r["harness"]=json!(kind);
@@ -267,6 +269,22 @@ mod tests {
         assert!(parse_hooks(r#"{"command":"echo main","before":null,"after":null}"#).is_none());
         assert!(parse_hooks(r#"{"command":"echo main","before":" ","after":null}"#).is_none());
         assert!(parse_hooks(r#"{"command":"echo main","before":null,"after":"echo post","autoInstall":true}"#).is_none());
+    }
+    #[test]
+    #[ignore = "requires fresh Ubuntu fakefs; synthetic Codex JSONL peer"]
+    fn real_codex_app_server_fixture(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin".into()),("HOME".into(),"/root".into())]);
+        let mut r=rt.block_on(process_probe::codex_app_server_probe(&guest,&env,true));
+        r["shutdownClean"]=json!(rt.block_on(guest.shutdown()).is_ok());
+        r["fixtureOnly"]=json!(true);
+        assert_eq!(r["ok"],true);
+        assert_eq!(r["shutdownClean"],true);
+        assert_eq!(r["accountPresent"],false);
+        std::fs::write(report,serde_json::to_vec_pretty(&r).unwrap()).unwrap();
     }
     #[test]
     #[ignore = "requires fresh Ubuntu fakefs; real Ubuntu ELF, not actual agent"]

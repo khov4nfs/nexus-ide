@@ -897,6 +897,61 @@ pub(crate) async fn local_hook_with_timeout(guest:&IshInstance,env:&HashMap<Stri
     result.is_ok() && capture.closed && capture.exited && capture.code==Some(0) && capture.signal.unwrap_or(0)==0 && !crate::local_jobs::stop_requested()
 }
 
+// Codex app-server JSONL intentionally does not use ACP's JSON-RPC version
+// requirement. Only the fixed initialize/account read sequence is exposed.
+async fn codex_read(session:&IshSession,capture:&mut Capture,id:i64,deadline:Instant)->Result<Value,String>{
+    let mut notifications=0;
+    loop {
+        if crate::local_jobs::stop_requested(){return Err("Probe cancelled".into());}
+        while let Some(end)=capture.stdout.iter().position(|b|*b==b'\n') {
+            let line=capture.stdout.drain(..=end).collect::<Vec<_>>();
+            let frame:Value=serde_json::from_slice(&line).map_err(|_|"Invalid app-server frame")?;
+            if frame.get("method").is_some() {
+                if frame.get("id").is_some(){return Err("Unexpected app-server request; no approval granted".into());}
+                notifications+=1;
+                if notifications>64{return Err("Too many app-server notifications".into());}
+                continue;
+            }
+            if frame["id"].as_i64()!=Some(id)||frame.get("error").is_some()||!frame["result"].is_object(){return Err("App-server response rejected".into());}
+            return Ok(frame["result"].clone());
+        }
+        if capture.exited||capture.closed||!capture.pty.is_empty(){return Err("App-server stopped".into());}
+        capture.stderr.clear();
+        capture.poll(session,deadline).await?;
+    }
+}
+pub(crate) async fn codex_app_server_probe(guest:&IshInstance,env:&HashMap<String,String>,fixture:bool)->Value{
+    let mut opts=SpawnOpts::cmd(["/opt/nexus/codex","app-server"]);
+    #[cfg(test)]
+    if fixture{opts=shell(include_str!("../fixtures/codex-app-server.sh"),env);}
+    #[cfg(not(test))]
+    if fixture{return json!({"ok":false});}
+    opts.cwd=Some(Path::new("/tmp").to_path_buf());
+    opts.envp=Some(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect());
+    opts.pipe_stdin=true;
+    let Ok(session)=guest.spawn(opts) else{return json!({"ok":false,"error":"App-server spawn failed"});};
+    let mut capture=Capture::default();
+    let deadline=Instant::now()+Duration::from_secs(30);
+    let result:Result<(bool,bool),String>=async{
+        let init=json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"nexus-ios","version":"0.6.0"}}});
+        write_ready(&session,format!("{init}\n").as_bytes(),deadline).await?;
+        let init=codex_read(&session,&mut capture,1,deadline).await?;
+        if !init["userAgent"].as_str().is_some_and(|s|!s.is_empty()){return Err("Unsupported initialize response".into());}
+        write_ready(&session,b"{\"method\":\"initialized\"}\n",deadline).await?;
+        write_ready(&session,b"{\"id\":2,\"method\":\"account/read\",\"params\":{\"refreshToken\":false}}\n",deadline).await?;
+        let account=codex_read(&session,&mut capture,2,deadline).await?;
+        let requires=account["requiresOpenaiAuth"].as_bool().ok_or("Unsupported account response")?;
+        let present=match account.get("account"){Some(Value::Null)=>false,Some(Value::Object(_))=>true,_=>return Err("Unsupported account shape".into())};
+        Ok((present,requires))
+    }.await;
+    let stopped=session.terminate().await.is_ok();
+    let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;
+    match result{
+        Ok((present,requires))=>json!({"ok":stopped&&closed,"initializeVerified":true,"accountReadVerified":true,"accountPresent":present,"requiresOpenaiAuth":requires,"transportClosed":closed}),
+        Err(_)=>json!({"ok":false,"error":"App-server handshake/account probe failed or cancelled","transportClosed":closed}),
+    }
+}
+
 // User-initiated local jobs in a separate disposable Ubuntu boot. No host
 // workspace, native tool callbacks, provider credential or remote executor.
 pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,String>, command: &str, workbench: bool) -> Value {

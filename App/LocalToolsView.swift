@@ -69,6 +69,7 @@ struct LocalToolsView: View {
                             Text("Codex CLI").tag("codex")
                             Text("Claude Code").tag("claude")
                         }.disabled(model.guestClaimed || importingCLI || cliImport != nil)
+                        .onChange(of: cliKind) { _, _ in cliAction = "shell" }
                         TextField("Reviewed Linux ARM64 ELF SHA-256", text: $cliDigest).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed || importingCLI || cliImport != nil)
                         Button("Choose official executable from Files") { cliPicker = true }.disabled(model.guestClaimed || importingCLI || !AGYImportFormat.validDigest(cliDigest) || cliImport != nil)
                         if importingCLI { ProgressView("Verifying local executable") }
@@ -79,8 +80,9 @@ struct LocalToolsView: View {
                         Picker("Launch mode", selection: $cliAction) {
                             Text("Interactive local shell").tag("shell")
                             Text("Version probe").tag("version")
+                            if cliKind == "codex" { Text("Native app-server account probe").tag("appServer") }
                         }.disabled(model.guestClaimed)
-                        Text("Disposable guest, no native credential collection, no automatic installer. Use the original CLI login flow inside the terminal. Do not share codes or terminal output. Linux sandbox/syscall compatibility is unverified; do not bypass native agent safeguards.").font(.caption)
+                        Text("App-server probe initializes the original Codex binary and reads account status only; no login or model request. Disposable guest, no native credential collection, no automatic installer. Use the original CLI login flow inside the terminal. Do not share codes or terminal output. Linux sandbox/syscall compatibility is unverified; do not bypass native agent safeguards.").font(.caption)
                     } else if mode != 3 {
                         TextField("Reviewed guest shell command", text: $command, axis: .vertical)
                             .font(.system(.body, design: .monospaced)).autocorrectionDisabled()
