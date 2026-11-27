@@ -15,6 +15,13 @@ public struct AgentEditProposal: Identifiable, Sendable {
               Set(object.keys) == ["replacement"], let text = object["replacement"] as? String else {
             throw Failure.invalidResponse
         }
+        try self.init(snapshot: snapshot, stagedReplacement: text, credential: credential)
+    }
+
+    /// Already correlated virtual-file result, not JSON embedded in model text.
+    public init(snapshot: WorkspaceSnapshot, stagedReplacement: String?, credential: String) throws {
+        guard snapshot.text.utf8.count <= AgentFileContext.maxFileBytes else { throw Failure.tooLarge }
+        guard let text = stagedReplacement else { throw Failure.invalidResponse }
         guard text.utf8.count <= 4096 else { throw Failure.tooLarge }
         guard text.unicodeScalars.allSatisfy({
             !CharacterSet.controlCharacters.contains($0) || $0.value == 10 || $0.value == 9

@@ -269,7 +269,7 @@ jobs:
           export NEXUS_ACP_EVIDENCE="$RUNNER_TEMP/nexus-snapshot.json"
           export NEXUS_ACP_TEST_SNAPSHOT=1
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_snapshot_read_transport -- --ignored --nocapture --test-threads=1
-          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["fixtureOnly"] is True and r["scopeVerified"] is True and r["snapshotReads"] == 1 and r["shutdownClean"] is True' "$NEXUS_ACP_EVIDENCE"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["fixtureOnly"] is True and r["scopeVerified"] is True and r["stagedWriteVerified"] is True and r["snapshotReads"] == 1 and r["shutdownClean"] is True' "$NEXUS_ACP_EVIDENCE"
       - name: Upload scoped snapshot evidence
         uses: actions/upload-artifact@v4
         with:

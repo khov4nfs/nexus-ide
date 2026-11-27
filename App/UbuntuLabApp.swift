@@ -51,6 +51,7 @@ struct UbuntuLabView: View {
     @State private var useGemini = false
     @State private var useGoogle = false
     @State private var enableSnapshotRead = false
+    @State private var enableSnapshotWrite = false
     @State private var snapshotReadThisTurn = false
     @State private var pendingReadContent: String?
     @State private var loginURL = ""
@@ -105,9 +106,11 @@ struct UbuntuLabView: View {
                         }
                         Text(importStatus).font(.caption)
                     }
-                    Toggle("Enable ACP attachment / staged edit tools", isOn: $enableSnapshotRead)
+                    Toggle("Enable read-only ACP attachment tool", isOn: $enableSnapshotRead)
                         .disabled(attempted || model.guestClaimed)
-                    Text("Optional: selected text only, for one confirmed turn. Editor edits can be staged for review; no direct iOS file write.").font(.caption)
+                    Toggle("Enable staged ACP editor edits", isOn: $enableSnapshotWrite)
+                        .disabled(attempted || model.guestClaimed)
+                    Text("Optional: selected text only, for one confirmed turn. Staged edits require separate editor selection and native diff review; no direct iOS file write.").font(.caption)
                     Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed || importingAGY)
                     Button("Initialize imported AGY (no key)") { useGemini = false; useGoogle = false; confirm = true }.disabled(attempted || model.guestClaimed || importingAGY || digest == nil)
                     Button("Connect with saved Gemini API key") { useGemini = true; useGoogle = false; confirm = true }
@@ -344,7 +347,7 @@ struct UbuntuLabView: View {
                 }
                 Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil }
             } message: {
-                Text("Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
+                Text(pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Do not share secrets." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
             }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
@@ -388,12 +391,13 @@ struct UbuntuLabView: View {
     private func run(sha: String?, gemini: Bool = false, google: Bool = false) {
         guard !attempted, !importingAGY, model.claimGuest() else { return }
         let selected = sha == nil ? nil : importedAGY
-        let readSnapshot = enableSnapshotRead
+        let writeSnapshot = enableSnapshotWrite && gemini
+        let readSnapshot = enableSnapshotRead || writeSnapshot
         attempted = true
         running = true
         loginURL = ""; loginCode = ""; loginSubmitted = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected, readSnapshot: readSnapshot) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected, readSnapshot: readSnapshot, writeSnapshot: writeSnapshot) }.value
             loginURL = ""; loginCode = ""; loginRunning = false
             // Keep the separately reviewed binary; never persist OAuth tokens with it.
             report = result.report
@@ -465,8 +469,8 @@ struct UbuntuLabView: View {
             pendingReadContent = nil
             if let editSnapshot {
                 guard proposal == nil else { contextStatus = "Review or discard the previous proposal"; return }
-                if enableSnapshotRead {
-                    guard try credentialAllows(editSnapshot.text) else { contextStatus = "Credential detected"; return }
+                if enableSnapshotWrite {
+                    guard useGemini, !chatInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, try credentialAllows(editSnapshot.text) else { contextStatus = "Credential detected"; return }
                     wire = chatInput + "\nRead /nexus-selected.txt and stage one complete replacement via fs/write_text_file. Native user will review before applying."
                     pendingReadContent = editSnapshot.text
                 } else { wire = try AgentEditProposal.prompt(snapshot: editSnapshot, question: chatInput) }
@@ -531,7 +535,9 @@ struct UbuntuLabView: View {
                     status: matches ? result.status : "Turn failed or response mismatch"))
                 if let edit {
                     if result.ok && matches && result.status == "Chat turn completed", let key = try? GeminiKeychain.load(),
-                       let candidate = try? AgentEditProposal(snapshot: edit, response: readContent != nil ? (result.stagedResponse ?? "") : text, credential: key) {
+                       let candidate = try? (readContent != nil
+                           ? AgentEditProposal(snapshot: edit, stagedReplacement: result.stagedResponse, credential: key)
+                           : AgentEditProposal(snapshot: edit, response: text, credential: key)) {
                         proposal = candidate
                         editStatus = "Untrusted proposal ready for explicit review"
                     } else { editStatus = "No valid complete replacement returned; nothing written" }
@@ -581,7 +587,7 @@ private enum UbuntuRunner {
             do { try FileManager.default.removeItem(at: trial); activeTrial = nil } catch { /* leave for next launch */ }
         }
     }
-    static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?, readSnapshot: Bool) -> (report: String, status: String, active: Bool) {
+    static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?, readSnapshot: Bool, writeSnapshot: Bool) -> (report: String, status: String, active: Bool) {
         var client = ACPInitializeClient()
         func failed(_ reason: String) -> (String, String, Bool) { (reason, "Not initialized", false) }
         do {
@@ -614,7 +620,7 @@ private enum UbuntuRunner {
                 }
             }
             let data = trial.appendingPathComponent("data", isDirectory: true)
-            let request = sha == nil ? nil : String(decoding: try client.request(readSnapshot: readSnapshot, writeSnapshot: readSnapshot), as: UTF8.self)
+            let request = sha == nil ? nil : String(decoding: try client.request(readSnapshot: readSnapshot, writeSnapshot: writeSnapshot), as: UTF8.self)
             let pointer = data.path.withCString { path in
                 if let sha, let request {
                     return sha.withCString { digest in
@@ -742,10 +748,8 @@ private enum UbuntuRunner {
             var reportObject = object
             let replacement = reportObject.removeValue(forKey: "stagedReplacement") as? String
             let stagedResponse: String?
-            if stageEdit, ok, status == "Chat turn completed", let replacement,
-               let encoded = try? JSONSerialization.data(withJSONObject: ["replacement": replacement]) {
-                stagedResponse = String(decoding: encoded, as: UTF8.self)
-            } else { stagedResponse = nil }
+            if stageEdit, ok, status == "Chat turn completed" { stagedResponse = replacement }
+            else { stagedResponse = nil }
             let report = (try? JSONSerialization.data(withJSONObject: reportObject, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) } ?? "Report unavailable"
             return (report, status, active, ok, object["responseId"] as? Int ?? 0, stagedResponse)
         } catch {

@@ -229,8 +229,8 @@ const SNAPSHOT_PATH:&str="/nexus-selected.txt";
 fn valid_snapshot(s:&str)->bool {
     !s.trim().is_empty() && s.len()<=768 && s.chars().all(|c| !c.is_control() || c=='\n' || c=='\t')
 }
-// Never opens a filesystem path. Only serves immutable bytes explicitly
-// provided by the user for the current turn, and only for one virtual path.
+// Never opens a filesystem path. Only serves consented bytes or the validated
+// staged replacement for the current turn and one virtual path.
 fn read_snapshot_reply(frame:&Value,session:&str,snapshot:Option<&str>)->Result<Value,String> {
     if frame["jsonrpc"]!="2.0" || frame["method"]!="fs/read_text_file" ||
         frame.get("result").is_some() || frame.get("error").is_some() {return Err("Invalid read request".into());}
@@ -238,10 +238,10 @@ fn read_snapshot_reply(frame:&Value,session:&str,snapshot:Option<&str>)->Result<
     let deny=||json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"No matching snapshot grant"}});
     let params=&frame["params"];
     if params["sessionId"]!=session || params["path"]!=SNAPSHOT_PATH {return Ok(deny());}
-    let Some(text)=snapshot.filter(|s|valid_snapshot(s)) else {return Ok(deny());};
-    let line=match params.get("line") {None|Some(Value::Null)=>1,Some(v)=>match v.as_u64(){Some(n) if n>=1 && n<=769=>n as usize,_=>return Ok(deny())}};
-    let limit=match params.get("limit") {None|Some(Value::Null)=>769,Some(v)=>match v.as_u64(){Some(n) if n>=1 && n<=769=>n as usize,_=>return Ok(deny())}};
-    let content=if line==1 && params.get("limit").is_none() {text.to_owned()} else {
+    let Some(text)=snapshot.filter(|s|s.len()<=4096 && s.chars().all(|c|!c.is_control() || c=='\n' || c=='\t')) else {return Ok(deny());};
+    let line=match params.get("line") {None|Some(Value::Null)=>1,Some(v)=>match v.as_u64(){Some(n) if n>=1 && n<=4097=>n as usize,_=>return Ok(deny())}};
+    let limit=match params.get("limit") {None|Some(Value::Null)=>4097,Some(v)=>match v.as_u64(){Some(n) if n>=1 && n<=4097=>n as usize,_=>return Ok(deny())}};
+    let content=if line==1 && params.get("limit").is_none_or(Value::is_null) {text.to_owned()} else {
         text.split('\n').skip(line-1).take(limit).collect::<Vec<_>>().join("\n")
     };
     Ok(json!({"jsonrpc":"2.0","id":id,"result":{"content":content}}))
@@ -544,6 +544,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         Ok(response)
                     }));
                 drop(progress);
+                let cancel_requested = PROGRESS.lock().map(|p|p.cancel_requested).unwrap_or(true);
                 let cancelled = cancel_taken && result.as_ref().is_ok_and(|frame|
                     frame.get("error").is_none() && frame["result"]["stopReason"] == "cancelled");
                 if cancelled {
@@ -560,7 +561,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         .is_ok_and(|s| !s.trim().is_empty()))));
                 if chat_success {
                     if reply.send(json!({"ok":true,"active":true,"chatCompleted":true,
-                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn","snapshotReads":snapshot_reads,"stagedReplacement":if !cancel_taken { staged.take() } else { None }})).is_err() {
+                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn","snapshotReads":snapshot_reads,"stagedReplacement":if !cancel_requested { staged.take() } else { None }})).is_err() {
                         break None;
                     }
                     continue;
@@ -886,7 +887,7 @@ mod tests {
         let prompt=command(Action::Snapshot("Read /nexus-selected.txt".into(),"one\nforty-two\nthree".into()));
         let response=prompt_progress()["text"]=="NEXUS_SNAPSHOT_OK";
         let edit=command(Action::Edit("Stage replacement".into(),"one\nforty-two\nthree".into()));
-        let write_verified=edit["chatCompleted"]==true && edit["stagedReplacement"]=="updated";
+        let write_verified=edit["chatCompleted"]==true && edit["stagedReplacement"]=="updated" && edit["snapshotReads"]==1;
         let close=command(Action::Close);
         let evidence=json!({"ok":init["ok"]==true && new["ok"]==true && prompt["chatCompleted"]==true &&
             prompt["snapshotReads"]==1 && response && write_verified && close["shutdownClean"]==true,

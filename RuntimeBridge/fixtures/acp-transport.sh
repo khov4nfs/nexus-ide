@@ -37,6 +37,9 @@ if [ "${NEXUS_FIXTURE_SNAPSHOT:-0}" = 1 ]; then
     printf '{"jsonrpc":"2.0","id":93,"method":"fs/write_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt","content":"updated"}}\n' "$"
     IFS= read -r got
     case "$got" in *'"id":93'*'"result":{}'*) ;; *) exit 97 ;; esac
+    printf '{"jsonrpc":"2.0","id":94,"method":"fs/read_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt"}}\n' "$"
+    IFS= read -r got
+    case "$got" in *'"id":94'*'"content":"updated"'*) ;; *) exit 98 ;; esac
     printf '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}\n'
     IFS= read -r unexpected
     exit 94
