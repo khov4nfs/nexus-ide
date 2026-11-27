@@ -691,6 +691,11 @@ impl ACPExchange {
                 if self.offset != self.capture.stdout.len() {
                     return Err("Trailing incomplete ACP frame".into());
                 }
+                // All complete frames have been consumed. Retain monotonic transport
+                // cursor, not the previous request payloads. Per-request limit unchanged.
+                self.capture.stdout.clear();
+                self.capture.stderr.clear();
+                self.offset=0;
                 return Ok(frame);
             }
         }

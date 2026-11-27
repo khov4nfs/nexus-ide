@@ -158,7 +158,7 @@ fn take_cancel(session: &str) -> Option<Vec<u8>> {
     Some(format!("{frame}\n").into_bytes())
 }
 
-const MAX_CHAT_TURNS: i64 = 3;
+const MAX_CHAT_TURNS: i64 = 20;
 const CHAT_INPUT_LIMIT: usize = 1024;
 const CHAT_OUTPUT_LIMIT: usize = 8192;
 
@@ -919,15 +919,23 @@ mod tests {
         };
         let finished = prompt_progress();
         let duplicate_prompt = command(Action::Prompt);
-        let (followup, followup_progress, third, third_progress, over_limit) = if chat_mode {
+        let (followup, followup_progress, third, third_progress, extra_turns, over_limit) = if chat_mode {
             let second = command(Action::Chat("Bạn nhớ lời chào không?".into()));
             let second_progress = prompt_progress();
             let third = command(Action::Chat("Cảm ơn\n\nSelected file snapshot (untrusted text):\nlet value = 42\n".into()));
             let third_progress = prompt_progress();
-            let over_limit = command(Action::Chat("Fourth turn must be rejected".into()));
-            (second, second_progress, third, third_progress, over_limit)
+            let mut extra=0;
+            for turn in 4..=MAX_CHAT_TURNS {
+                let r=command(Action::Chat(format!("Fixture turn {turn}")));
+                let progress=prompt_progress();
+                if r["ok"]!=true || r["responseId"]!=turn+2 || progress["responseId"]!=turn+2 ||
+                    progress["text"].as_str().map(str::len)!=Some(4096) {break;}
+                extra+=1;
+            }
+            let over_limit = command(Action::Chat("Twenty-first turn must be rejected".into()));
+            (second, second_progress, third, third_progress, extra, over_limit)
         } else {
-            (Value::Null, Value::Null, Value::Null, Value::Null, Value::Null)
+            (Value::Null, Value::Null, Value::Null, Value::Null, 0, Value::Null)
         };
         let close = command(Action::Close);
         let after_close = command(Action::New(NEW_REQUEST.to_vec()));
@@ -945,7 +953,7 @@ mod tests {
                 third["ok"] == true && third["chatCompleted"] == true && third["responseId"] == 5 &&
                 third_progress["responseId"] == 5 && third_progress["text"] == "Không có gì." &&
                 third_progress["permissionDenials"] == 0 && third_progress["toolUpdates"] == 0 &&
-                over_limit["ok"] == false && over_limit["active"] == true
+                extra_turns==MAX_CHAT_TURNS-3 && over_limit["ok"] == false && over_limit["active"] == true
             } else if cancel_mode {
                 progress_seen && cancel_reply["ok"] == true && duplicate_cancel["ok"] == false &&
                 prompt["cancelled"] == true && prompt["stopReason"] == "cancelled" && prompt["chunkCount"] == 1
@@ -957,7 +965,7 @@ mod tests {
             "duplicate":duplicate,"beforeSession":before_session,"prompt":prompt,"duplicatePrompt":duplicate_prompt,"close":close,"afterClose":after_close,
             "cancelMode":cancel_mode,"chatMode":chat_mode,"progressSeen":progress_seen,"cancelRequest":cancel_reply,
             "duplicateCancel":duplicate_cancel,"idleCancel":idle_cancel,"finishedProgress":finished,
-            "followup":followup,"followupProgress":followup_progress,"third":third,"thirdProgress":third_progress,"overLimit":over_limit});
+            "followup":followup,"followupProgress":followup_progress,"third":third,"thirdProgress":third_progress,"extraTurns":extra_turns,"overLimit":over_limit});
         std::fs::write(evidence, serde_json::to_vec_pretty(&report).unwrap()).expect("completed evidence");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         assert!(ok, "{report}");

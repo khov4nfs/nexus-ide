@@ -1,0 +1,23 @@
+# Nexus IDE v0.6.0 release candidate: acceptance gates
+
+Baseline: main 426260d (PR #21); runtime run 46005906821 logs show Ubuntu and Alpine gates, MCP fixture tools/call NEXUS_MCP_42, persistence write/read across independent host processes, rolling output test, and Google login synthetic transport. Earlier owner iPhone 16 Pro iOS 27.2.1 screenshots show ARM64 Ubuntu, libc 2.39, PTY commands, file write/read, resize, and clean shutdown. Exact device commit and later fixes not verified.
+
+## New candidate
+- Local ANSI terminal powered by upstream SwiftTerm v1.19.0 (pre-2.0 API). Build checks published short revision 464df52, clean checkout/tag and records full resolved revision and upstream license in IPA. Full exact revision and transitive dependency review still required before production; older API tag selected for compatibility, not a claim of latest security support. No SSH. Rust binary PTY input base64 and monotonic absolute cursor on bounded 64 KiB byte tail. Detect missing output and fail closed, keep previous plain-text controls. Resize via terminal view dimensions within bridge bounds. Link opening and programmatic clipboard callbacks no-op. Untrusted terminal rendering still needs security review and physical-device tests. Large pasted chunks may be rejected; no automatic retry.
+- ACP v1 optional read-only virtual attachment: explicit capability toggle before connecting, per-turn user-confirmed 768-byte immutable selected text only at /nexus-selected.txt. No native path lookup, write, directory enumeration or terminal capability. Wrong path/session/no grant rejected, line/limit bounded, at most four successful reads per turn. Capability off by default; original inline snapshot and key-only diff proposal unchanged. Agent may ask permission or decline; general permission engine remains deny-only, no security isolation claim. ACP v2 migration requires a different MCP-based approach; no assertion of v2 support.
+- Up to 20 consented chat turns, 1024-byte input and 8192-byte response per turn; consumed wire capture cleared after a complete correlated response, cursor retained. 64KiB per request cap, 90s deadline, 180s idle; existing strict trailing-frame checks. CI fixture extends to 20 turns with >64KiB cumulative output and rejects 21st. Fixed smoke test remains exclusive.
+- Workbench optional workflow runs a real reviewed ARM64 archive under guest and checks loopback HTTP plus shutdown before packaging. This is not full editor or extension testing. It may fail on unsupported guest syscalls/network; no fallback to a remote server.
+- Version 0.6.0 unsigned personal device candidate. Existing license review and prerelease distribution conditions remain.
+
+## Required before declaring production
+1. CI all regressions pass; reviewed dependency exact revisions and third-party notices/source obligations satisfied, artifact SHA-256 and build metadata match.
+2. SideStore update on physical iPhone with same app identity, verify full height/width, persistence, no unintended data loss.
+3. Native SwiftTerm keyboard, paste, ANSI colors/cursor, resize, Ctrl-C, exit, gap handling, memory and foreground/background tests.
+4. Official reviewed Linux ARM64 AGY import, Google browser login, session/new, real model response, multi-turn, cancellation, close; verify no credential disclosure and cache handling. No persistent OAuth guarantee.
+5. Explicit virtual attachment read with official AGY; wrong path rejected, user-reviewed replacement flow separate. No general native filesystem write or terminal grants.
+6. Real MCP server manual discovery/call, saved guest reopen, dirty recovery UX; workbench actual loopback editor save, extension/LSP behavior. Automatic hooks and extra agent harnesses remain unimplemented.
+7. Full Linux VM/Docker remains separate R&D: user-mode emulator is not a Linux kernel, no working full-system integration in this PR. Cannot call complete production until scoped acceptance is satisfied.
+
+Use GitHub Actions main workflow with owner license review and publish_prerelease=true to generate the unsigned IPA; no personal Mac or App Store required. Device signing via existing SideStore. Do not share OAuth codes, tokens, pairing files, logs with secrets, or proprietary AGY binary.
+
+Upstream references: https://github.com/migueldeicaza/SwiftTerm/releases ; https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/protocol/v1/file-system.mdx .

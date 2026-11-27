@@ -28,7 +28,7 @@ struct UbuntuLabView: View {
     @State private var turnCount = 0
     @State private var smokeUsed = false
     @State private var transcript: [ChatTurn] = []
-    private let maxTurns = 3
+    private let maxTurns = 20
     @State private var confirmPrompt = false
     @State private var confirmChat = false
     @State private var chatInput = ""
@@ -303,7 +303,7 @@ struct UbuntuLabView: View {
                         active = false
                         created = false
                         fileContext = nil; editSnapshot = nil; pendingEdit = nil
-                        pendingChat = ""; pendingDisplay = ""
+                        pendingChat = ""; pendingDisplay = ""; pendingReadContent = nil
                         agentStatus = "Agent connection closed or idle timeout; restart app"
                         break
                     }
@@ -558,7 +558,7 @@ struct UbuntuLabView: View {
             agentStatus = result.status
             active = result.active
             if !close && result.ok { created = true }
-            if !active { fileContext = nil; editSnapshot = nil; pendingEdit = nil; pendingChat = ""; pendingDisplay = ""; contextStatus = "" }
+            if !active { fileContext = nil; editSnapshot = nil; pendingEdit = nil; pendingChat = ""; pendingDisplay = ""; pendingReadContent = nil; contextStatus = "" }
             running = false
         }
     }

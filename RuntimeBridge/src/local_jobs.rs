@@ -172,6 +172,56 @@ mod tests {
         assert!(parse_call(r#"{"command":"exec server","name":"echo","arguments":{},"extra":true}"#).is_none());
     }
     #[test]
+    #[ignore = "requires reviewed real OpenVSCode rootfs; loopback host probe"]
+    fn real_workbench_loopback() {
+        use std::io::{Read,Write};
+        use std::net::{TcpStream,SocketAddr};
+        use std::time::{Duration,Instant};
+        let path=std::env::var_os("NEXUS_WORKBENCH_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_WORKBENCH_EVIDENCE").expect("evidence");
+        // Synthetic CI-only token. No real account or native workspace.
+        let token="f".repeat(64);
+        let worker_token=token.clone();
+        let worker=std::thread::spawn(move||run(Path::new(&path),3,&worker_token));
+        let deadline=Instant::now()+Duration::from_secs(90);
+        let ready=loop {
+            if progress()["ready"]==true {break true;}
+            if worker.is_finished() || Instant::now()>=deadline {break false;}
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let mut status=None;
+        if ready {
+            let addr:SocketAddr="127.0.0.1:18765".parse().unwrap();
+            if let Ok(mut stream)=TcpStream::connect_timeout(&addr,Duration::from_secs(5)) {
+                let _=stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let _=stream.set_write_timeout(Some(Duration::from_secs(5)));
+                let request=format!("GET /?tkn={token} HTTP/1.1\r\nHost: 127.0.0.1:18765\r\nConnection: close\r\n\r\n");
+                if stream.write_all(request.as_bytes()).is_ok() {
+                    let mut buf=[0u8;1024];
+                    let mut header=Vec::new();
+                    while header.len()<8192 {
+                        match stream.read(&mut buf) {
+                            Ok(n) if n>0 => {header.extend_from_slice(&buf[..n]); if header.windows(2).any(|s|s==b"\r\n"){break;}}
+                            _=>break,
+                        }
+                    }
+                    status=String::from_utf8_lossy(&header).lines().next().and_then(|s| {
+                        let mut parts=s.split_ascii_whitespace();
+                        if parts.next()!=Some("HTTP/1.1") {return None;}
+                        parts.next()?.parse::<u16>().ok()
+                    });
+                }
+            }
+        }
+        let stop=enqueue(Control::Stop);
+        let closed=worker.join().expect("workbench owner");
+        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true,
+            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"editorVerified":false});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        println!("{report}");
+        assert_eq!(report["ok"],true);
+    }
+    #[test]
     #[ignore = "requires separate process per persisted guest boot"]
     fn real_persistent_local_guest() {
         let path=std::env::var_os("NEXUS_PERSIST_ROOTFS").expect("rootfs");

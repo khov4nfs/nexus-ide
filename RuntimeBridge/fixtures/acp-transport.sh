@@ -61,6 +61,17 @@ if [ "${NEXUS_FIXTURE_CHAT:-0}" = 1 ]; then
     case "$fifth" in *'Cảm ơn\n\nSelected file snapshot (untrusted text):\nlet value = 42\n'*) ;; *) exit 69 ;; esac
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Không có gì."}}}}\n' "$$"
     printf '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}\n'
+    # Seventeen more turns, >64KiB cumulative output, same session.
+    payload=$(head -c 4096 /dev/zero | tr '\000' x)
+    turn=4
+    while [ "$turn" -le 20 ]; do
+        IFS= read -r next
+        id=$((turn+2))
+        case "$next" in *'"id":'"$id,"*'"method":"session/prompt"'*'"sessionId":"fixture-'$$'"'*) ;; *) exit 95 ;; esac
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$$" "$payload"
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+        turn=$((turn+1))
+    done
     IFS= read -r unexpected
     exit 61
 fi
