@@ -7,6 +7,7 @@ on:
       - 'scripts/build-guest-device.sh'
       - 'scripts/apply-runtime-patches.py'
       - 'scripts/verify-guest-evidence.py'
+      - 'scripts/preflight-runtime.py'
       - 'project-guest.yml'
       - 'App/GuestProbeView.swift'
       - '.github/workflows/guest-probe.yml'
@@ -18,10 +19,14 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate source syntax before dependency installation
+        run: |
+          rustup component add rustfmt
+          python3 scripts/preflight-runtime.py
       - name: Install guest build dependencies
         run: brew install meson ninja llvm lld libarchive sqlite xcodegen
-      - name: Validate build script syntax
-        run: bash -n scripts/build-guest-device.sh
       - name: Build pinned runtime and rootfs
         run: bash scripts/build-guest-device.sh
       - name: Preserve Meson logs on failure
@@ -36,8 +41,9 @@ jobs:
           retention-days: 7
       - name: Unsigned ARM64 device build
         run: xcodebuild -project NexusIDEGuest.xcodeproj -scheme NexusIDEGuest -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
-      - name: Real guest process tests on macOS build host
+      - name: Real guest process and signed package tests on macOS build host
         env:
+          NEXUS_TEST_PACKAGES: '1'
           NEXUS_TEST_ROOTFS: ${{ github.workspace }}/Vendor/litter-ish/build/fs/data
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
@@ -48,7 +54,7 @@ jobs:
           export NEXUS_TEST_EVIDENCE="$RUNNER_TEMP/nexus-guest-evidence.json"
           rm -f "$NEXUS_TEST_EVIDENCE"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_guest_process_probe -- --ignored --nocapture --test-threads=1
-          python3 scripts/verify-guest-evidence.py "$NEXUS_TEST_EVIDENCE"
+          python3 scripts/verify-guest-evidence.py "$NEXUS_TEST_EVIDENCE" --packages
       - name: Upload completed guest evidence
         if: always()
         uses: actions/upload-artifact@v4

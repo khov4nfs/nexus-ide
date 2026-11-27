@@ -13,10 +13,10 @@ struct GuestProbeView: View {
                 Section("Local ARM64 Linux · experimental") {
 #if NEXUS_EMBEDDED_LINUX && os(iOS) && !targetEnvironment(simulator)
                     Text("Runtime linked into this app. Device execution is not verified until the checks below pass.")
-                    Button("Run trusted guest smoke test") { confirm = true }
+                    Button("Run Linux Lab checks") { confirm = true }
                         .disabled(attempted || running)
                     if running { ProgressView("Running guest process checks… keep the app open") }
-                    Text("Checks: ARM64, stdout, exit status, separate streams, stdin, PTY resize and cancellation. One attempt per app process. No custom commands or secrets.")
+                    Text("Process checks run offline. Optional package test downloads signed jq from the official Alpine HTTPS repository. One attempt per app process; no custom commands or secrets.")
 #else
                     Text("Guest runtime is not linked in this build.")
                     Text("Build the separate NexusIDEGuest device target using the pinned upstream build script. No remote fallback.")
@@ -28,21 +28,22 @@ struct GuestProbeView: View {
             }
             .navigationTitle("Linux Lab")
             .confirmationDialog("Run experimental in-process Linux code?", isPresented: $confirm, titleVisibility: .visible) {
-                Button("Run fixed smoke test") { runProbe() }
+                Button("Run offline process checks") { runProbe(packages: false) }
+                Button("Run checks + install jq (network)") { runProbe(packages: true) }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("The emulator is not a security sandbox. Only the bundled test rootfs is used. Save open work first; a runtime crash may terminate the app.")
+                Text("The emulator is not a security sandbox. Only a disposable rootfs copy is used. The optional jq test connects to the official Alpine HTTPS mirror and uses public DNS 1.1.1.1 if guest DNS is missing. Save work first; a runtime crash may terminate the app.")
             }
         }
     }
 
-    private func runProbe() {
+    private func runProbe(packages: Bool) {
 #if NEXUS_EMBEDDED_LINUX && os(iOS) && !targetEnvironment(simulator)
         guard !attempted else { return }
         attempted = true
         running = true
         Task {
-            report = await Task.detached(priority: .userInitiated) { GuestProbeRunner.run() }.value
+            report = await Task.detached(priority: .userInitiated) { GuestProbeRunner.run(packages: packages) }.value
             running = false
         }
 #endif
@@ -51,7 +52,7 @@ struct GuestProbeView: View {
 
 #if NEXUS_EMBEDDED_LINUX && os(iOS) && !targetEnvironment(simulator)
 private enum GuestProbeRunner {
-    static func run() -> String {
+    static func run(packages: Bool) -> String {
         do {
             let fm = FileManager.default
             guard let bundled = Bundle.main.url(forResource: "fs", withExtension: nil) else {
@@ -62,7 +63,7 @@ private enum GuestProbeRunner {
             let fs = trial.appendingPathComponent("fs", isDirectory: true)
             try fm.copyItem(at: bundled, to: fs)
             let data = fs.appendingPathComponent("data", isDirectory: true)
-            guard let result = data.path.withCString({ nexus_guest_probe($0) }) else {
+            guard let result = data.path.withCString({ packages ? nexus_guest_probe_packages($0) : nexus_guest_probe($0) }) else {
                 return "Guest bridge returned no report."
             }
             defer { nexus_guest_free(result) }

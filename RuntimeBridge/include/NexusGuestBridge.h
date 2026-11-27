@@ -5,6 +5,8 @@ extern "C" {
 #endif
 // Blocking, single attempt per process. Caller owns returned JSON via free.
 char *nexus_guest_probe(const char *rootfs_data_path);
+// Explicit network opt-in: fixed signed Alpine jq package installation probe.
+char *nexus_guest_probe_packages(const char *rootfs_data_path);
 void nexus_guest_free(char *result);
 #ifdef __cplusplus
 }

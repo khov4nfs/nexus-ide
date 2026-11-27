@@ -29,3 +29,5 @@ the pinned litter-ish Rust host library in-process, copies a bundled fakefs into
 a disposable writable directory, and runs a fixed smoke probe (ARM64, shell,
 stdout and nonzero exit). See [device build and acceptance gate](docs/guest-probe.md).
 This is not an available general Linux terminal or an AGY integration yet.
+
+PR #3 CI verified six real guest process checks on macOS and an unsigned ARM64 iOS build. The optional signed Alpine jq package probe (v0.2.3 development) is pending new CI and iPhone evidence. No general-purpose Linux shell is exposed.
