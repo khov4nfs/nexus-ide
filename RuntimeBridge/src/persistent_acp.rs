@@ -493,7 +493,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     let _=reply.send(json!({"ok":false,"active":true,"error":"Snapshot grant unavailable or invalid"}));
                     continue;
                 }
-                if terminal_choice.as_deref().is_some_and(|c| !terminal_capability || !keyed || chat.is_none() || snapshot.is_some() || process_probe::terminal_command(c).is_none()) {
+                if terminal_choice.as_deref().is_some_and(|c| !terminal_capability || !keyed || chat.is_none() || snapshot.is_some() || process_probe::terminal_command(c).is_none_or(|argv|argv.iter().any(|arg|arg.contains(key)))) {
                     let _=reply.send(json!({"ok":false,"active":true,"error":"Terminal grant unavailable or invalid"}));
                     continue;
                 }
@@ -913,7 +913,7 @@ mod tests {
         let init=start(PathBuf::from(path),Mode::Fixture,format!("{req}\n").into_bytes(),Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()),false);
         let new=command(Action::New(NEW_REQUEST.to_vec()));
         let denied=command(Action::Chat("No terminal grant".into()));
-        let granted=command(Action::Terminal("Run uname -m".into(),"uname".into()));
+        let granted=command(Action::Terminal("Run reviewed argv".into(),r#"["/usr/bin/uname","-m"]"#.into()));
         let verified=prompt_progress()["text"]=="NEXUS_TERMINAL_OK" && granted["terminalUsed"]==true;
         let close=command(Action::Close);
         let evidence=json!({"ok":init["ok"]==true && new["ok"]==true && denied["chatCompleted"]==true && denied["terminalUsed"]==false && granted["chatCompleted"]==true && verified && close["shutdownClean"]==true,

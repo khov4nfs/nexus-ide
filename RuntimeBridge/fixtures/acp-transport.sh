@@ -27,11 +27,11 @@ if [ "${NEXUS_FIXTURE_TERMINAL:-0}" = 1 ]; then
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"DENIED"}}}}\n' "$$"
     printf '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}\n'
     IFS= read -r fourth
-    case "$fourth" in *'"id":4'*'Run uname -m'*) ;; *) exit 103 ;; esac
-    printf '{"jsonrpc":"2.0","id":81,"method":"terminal/create","params":{"sessionId":"fixture-%s","command":"uname","args":["-a"]}}\n' "$$"
+    case "$fourth" in *'"id":4'*'Run reviewed argv'*) ;; *) exit 103 ;; esac
+    printf '{"jsonrpc":"2.0","id":81,"method":"terminal/create","params":{"sessionId":"fixture-%s","command":"/usr/bin/uname","args":["-a"]}}\n' "$$"
     IFS= read -r got
     case "$got" in *'"error":'*'"id":81'*) ;; *) exit 104 ;; esac
-    printf '{"jsonrpc":"2.0","id":82,"method":"terminal/create","params":{"sessionId":"fixture-%s","command":"uname","args":["-m"]}}\n' "$$"
+    printf '{"jsonrpc":"2.0","id":82,"method":"terminal/create","params":{"sessionId":"fixture-%s","command":"/usr/bin/uname","args":["-m"]}}\n' "$$"
     IFS= read -r got
     case "$got" in *'"id":82'*'"terminalId":"nexus-term-4"'*) ;; *) exit 105 ;; esac
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"tool_call","toolCallId":"term-call","status":"in_progress"}}}\n' "$$"

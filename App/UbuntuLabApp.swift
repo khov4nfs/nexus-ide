@@ -54,6 +54,7 @@ struct UbuntuLabView: View {
     @State private var enableSnapshotWrite = false
     @State private var enableTerminal = false
     @State private var terminalChoice = ""
+    @State private var customTerminal = "[\"/usr/bin/printf\",\"%s\\n\",\"hello\"]"
     @State private var pendingTerminal: String?
     @State private var snapshotReadThisTurn = false
     @State private var pendingReadContent: String?
@@ -113,7 +114,7 @@ struct UbuntuLabView: View {
                         .disabled(attempted || model.guestClaimed)
                     Toggle("Enable staged ACP editor edits", isOn: $enableSnapshotWrite)
                         .disabled(attempted || model.guestClaimed)
-                    Toggle("Enable restricted ACP terminal diagnostics (Gemini key)", isOn: $enableTerminal)
+                    Toggle("Enable approved ACP terminal commands (Gemini key)", isOn: $enableTerminal)
                         .disabled(attempted || model.guestClaimed)
                     Text("Optional: selected text only, for one confirmed turn. Staged edits require separate editor selection and native diff review; no direct iOS file write.").font(.caption)
                     Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed || importingAGY)
@@ -197,11 +198,18 @@ struct UbuntuLabView: View {
                                 Text("Combined prompt: \(combined.utf8.count)/1024 bytes").font(.caption)
                             }
                             if enableTerminal && useGemini && fileContext == nil && editSnapshot == nil {
-                                Picker("Allow one terminal diagnostic this turn", selection: $terminalChoice) {
+                                Picker("Allow one terminal command this turn", selection: $terminalChoice) {
                                     Text("None").tag("")
                                     Text("uname -m").tag("uname")
                                     Text("pwd").tag("pwd")
+                                    Text("Custom exact argv").tag("custom")
                                 }.disabled(running)
+                                if terminalChoice == "custom" {
+                                    TextField("JSON argv (absolute guest executable)", text: $customTerminal, axis: .vertical)
+                                        .font(.system(.body, design: .monospaced))
+                                        .autocorrectionDisabled().textInputAutocapitalization(.never).disabled(running)
+                                    Text("A reviewed command can modify guest files or access its network and credentials. Do not grant commands you do not understand. No shell interpolation by Nexus.").font(.caption)
+                                }
                             }
                             Button(editSnapshot == nil ? "Send chat" : "Request edit proposal") { prepareChat() }
                                 .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || !UbuntuRunner.validChat(chatInput))
@@ -361,7 +369,7 @@ struct UbuntuLabView: View {
                 }
                 Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil; pendingTerminal = nil; terminalChoice = "" }
             } message: {
-                Text(pendingTerminal != nil ? "Allow one local Ubuntu diagnostic (\(pendingTerminal == "uname" ? "uname -m" : "pwd")) in this turn? Its output may be sent to the model. No other command, environment or native file access is granted." : pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Do not share secrets." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
+                Text(pendingTerminal != nil ? "Allow this exact guest command once?\n" + Self.terminalDescription(pendingTerminal ?? "") + "\nIts output may be sent to the model. Commands may modify guest files, access guest credentials or use the network. No security sandbox." : pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Do not share secrets." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
             }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
@@ -477,6 +485,14 @@ struct UbuntuLabView: View {
         return useGoogle
     }
 
+    private static func terminalDescription(_ choice: String) -> String {
+        switch choice {
+        case "uname": return "[\"/usr/bin/uname\",\"-m\"]"
+        case "pwd": return "[\"/usr/bin/pwd\"]"
+        default: return choice
+        }
+    }
+
     private func prepareChat() {
         guard !running, !importingContext, active, created, !smokeUsed, turnCount < maxTurns else { return }
         do {
@@ -495,9 +511,15 @@ struct UbuntuLabView: View {
                 wire = chatInput + "\nRead the selected text via fs/read_text_file at /nexus-selected.txt if needed."
                 pendingReadContent = context.text
             } else { wire = try fileContext?.prompt(question: chatInput) ?? chatInput }
-            if enableTerminal && useGemini && fileContext == nil && editSnapshot == nil && ["uname","pwd"].contains(terminalChoice) {
-                pendingTerminal = terminalChoice
-                wire += "\nYou may use the one granted terminal command: " + (terminalChoice == "uname" ? "uname -m" : "pwd") + ". cwd /tmp, no custom environment."
+            if enableTerminal && useGemini && fileContext == nil && editSnapshot == nil && !terminalChoice.isEmpty {
+                let choice: String
+                if terminalChoice == "custom" {
+                    let argv = try ACPTerminalApproval.parse(Data(customTerminal.utf8))
+                    guard try argv.arguments.allSatisfy({ try credentialAllows($0) }) else { contextStatus = "Credential detected"; return }
+                    choice = try argv.wire()
+                } else { choice = terminalChoice }
+                pendingTerminal = choice
+                wire += "\nYou may use the one granted terminal argv: " + Self.terminalDescription(choice) + ". cwd /tmp, no custom environment."
             }
             guard UbuntuRunner.validChat(wire) else {
                 contextStatus = "Question and snapshot must fit 1024 UTF-8 bytes"; return
@@ -508,7 +530,7 @@ struct UbuntuLabView: View {
             pendingChat = wire
             pendingEdit = editSnapshot
             pendingDisplay = fileContext == nil ? chatInput : chatInput + "\n[Selected text snapshot included]"
-            if let pendingTerminal { pendingDisplay += "\n[Allowed terminal: " + (pendingTerminal == "uname" ? "uname -m" : "pwd") + "]" }
+            if let pendingTerminal { pendingDisplay += "\n[Allowed terminal: " + Self.terminalDescription(pendingTerminal) + "]" }
             confirmChat = true
         } catch {
             contextStatus = "Invalid question, oversized context, or Keychain unavailable"
