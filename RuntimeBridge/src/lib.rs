@@ -71,6 +71,37 @@ fn probe(path: &Path, packages: bool, toolchains: bool, workspace_text: &str) ->
     json!({"ok":ok,"stage":"probe","packageRequested":packages,"toolchainsRequested":toolchains,"checks":rows,"shutdownError":shutdown.err()})
 }
 
+// A separate process is required for each guest boot. This never boots
+// Ubuntu after Alpine in the same process.
+fn compatibility_probe(path: &Path, agy: bool) -> Value {
+    if !path.is_dir() || !path.parent().map(|p| p.join("meta.db").is_file()).unwrap_or(false) {
+        return json!({"ok":false,"stage":"rootfs","error":"Missing prepared fakefs"});
+    }
+    if ATTEMPTED.swap(true, Ordering::AcqRel) {
+        return json!({"ok":false,"stage":"boot","error":"Restart process before another boot"});
+    }
+    let guest = match IshInstance::boot(path, Some(Path::new("/"))) {
+        Ok(g) => g,
+        Err(e) => return json!({"ok":false,"stage":"boot","error":e.to_string()}),
+    };
+    let env = HashMap::from([("PATH".to_owned(),"/usr/bin:/bin:/usr/sbin:/sbin".to_owned()),
+        ("HOME".to_owned(),"/root".to_owned()),("LANG".to_owned(),"C".to_owned())]);
+    let mut rows = Vec::new();
+    let shutdown = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt.block_on(async {
+            rows.push(process_probe::glibc_compat(&guest, &env).await);
+            if agy && rows[0]["passed"] == true {
+                rows.push(process_probe::agy_initialize(&guest, &env).await);
+            }
+            guest.shutdown().await.map_err(|e| e.to_string())
+        }),
+        Err(e) => Err(e.to_string()),
+    };
+    let ok = shutdown.is_ok() && rows.len() == (if agy { 2 } else { 1 }) &&
+        rows.iter().all(|r| r["passed"] == true);
+    json!({"ok":ok,"stage":"compatibility","agyRequested":agy,"checks":rows,"shutdownError":shutdown.err()})
+}
+
 /// # Safety
 /// path must point to a valid, null-terminated string for this call.
 #[no_mangle]
@@ -130,6 +161,18 @@ pub unsafe extern "C" fn nexus_guest_free(result: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a fresh Ubuntu fakefs; optional real AGY installed by developer"]
+    fn real_glibc_compatibility() {
+        let path = std::env::var_os("NEXUS_GLIBC_ROOTFS").expect("set NEXUS_GLIBC_ROOTFS");
+        let evidence = std::env::var_os("NEXUS_GLIBC_EVIDENCE").expect("set NEXUS_GLIBC_EVIDENCE");
+        let agy = std::env::var("NEXUS_TEST_AGY").as_deref() == Ok("1");
+        let report = compatibility_probe(Path::new(&path), agy);
+        std::fs::write(evidence, serde_json::to_vec_pretty(&report).unwrap()).expect("write completed evidence");
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        assert_eq!(report["ok"].as_bool(), Some(true), "{report}");
+    }
 
     // Explicit opt-in host execution gate, never a silent pass without rootfs.
     #[test]

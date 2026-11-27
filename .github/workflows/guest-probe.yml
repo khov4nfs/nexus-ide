@@ -8,6 +8,8 @@ on:
       - 'scripts/apply-runtime-patches.py'
       - 'scripts/verify-guest-evidence.py'
       - 'scripts/preflight-runtime.py'
+      - 'scripts/build-glibc-rootfs.sh'
+      - 'scripts/verify-glibc-evidence.py'
       - 'project-guest.yml'
       - 'App/GuestProbeView.swift'
       - '.github/workflows/guest-probe.yml'
@@ -62,6 +64,28 @@ jobs:
         with:
           name: guest-probe-evidence
           path: ${{ runner.temp }}/nexus-guest-evidence.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Build separate Ubuntu ARM64 compatibility rootfs
+        run: bash scripts/build-glibc-rootfs.sh
+      - name: Real glibc compatibility test (separate process)
+        env:
+          NEXUS_GLIBC_ROOTFS: ${{ github.workspace }}/Vendor/litter-ish/build/ubuntu-fs/data
+          NEXUS_GLIBC_EVIDENCE: ${{ runner.temp }}/nexus-glibc-evidence.json
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          rm -f "$NEXUS_GLIBC_EVIDENCE"
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_glibc_compatibility -- --ignored --nocapture --test-threads=1
+          python3 scripts/verify-glibc-evidence.py "$NEXUS_GLIBC_EVIDENCE"
+      - name: Upload compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: glibc-compatibility-evidence
+          path: ${{ runner.temp }}/nexus-glibc-evidence.json
           if-no-files-found: warn
           retention-days: 7
       - name: Record scope
