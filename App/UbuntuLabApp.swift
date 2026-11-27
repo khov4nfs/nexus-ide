@@ -43,6 +43,11 @@ struct UbuntuLabView: View {
     @State private var promptRunning = false
     @State private var receivedChunks = 0
     @State private var permissionDenials = 0
+    @State private var permissionAllows = 0
+    @State private var agentPlan: [String] = []
+    @State private var permissionRequest: ACPReviewRequest?
+    @State private var reviewPermissions = false
+    @State private var pendingReview = false
     @State private var toolUpdates = 0
     @State private var cancelRequested = false
     @State private var keyInput = ""
@@ -54,7 +59,13 @@ struct UbuntuLabView: View {
     @State private var enableSnapshotWrite = false
     @State private var enableTerminal = false
     @State private var terminalChoice = ""
+    @State private var customTerminal = #"["/usr/bin/printf","%s","hello"]"#
     @State private var pendingTerminal: String?
+    @State private var enableSessionMCP = false
+    @State private var mcpServerName = ""
+    @State private var mcpServerArgv = ""
+    @State private var pendingMCP: ACPStdioServer?
+    @State private var confirmMCP = false
     @State private var snapshotReadThisTurn = false
     @State private var pendingReadContent: String?
     @State private var loginURL = ""
@@ -113,7 +124,7 @@ struct UbuntuLabView: View {
                         .disabled(attempted || model.guestClaimed)
                     Toggle("Enable staged ACP editor edits", isOn: $enableSnapshotWrite)
                         .disabled(attempted || model.guestClaimed)
-                    Toggle("Enable restricted ACP terminal diagnostics (Gemini key)", isOn: $enableTerminal)
+                    Toggle("Enable approved ACP terminal commands (Gemini key)", isOn: $enableTerminal)
                         .disabled(attempted || model.guestClaimed)
                     Text("Optional: selected text only, for one confirmed turn. Staged edits require separate editor selection and native diff review; no direct iOS file write.").font(.caption)
                     Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed || importingAGY)
@@ -169,13 +180,25 @@ struct UbuntuLabView: View {
                     Text("ACP permissions deny by default. Selected virtual file edits require native review. Agent internal actions are not sandboxed.").font(.caption)
                     if active {
                         Text("Connection closes after 180 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
-                        Button("Create empty guest session") { act(close: false) }.disabled(running || created)
+                        if useGemini && !created {
+                            Toggle("Register one reviewed local MCP server", isOn: $enableSessionMCP).disabled(running)
+                            if enableSessionMCP {
+                                TextField("Server name", text: $mcpServerName).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(running)
+                                TextField("JSON argv (existing guest executable)", text: $mcpServerArgv, axis: .vertical)
+                                    .font(.system(.body, design: .monospaced)).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(running)
+                                Text("The executable must already exist in the agent guest. Registration may start it immediately. AGY controls its lifecycle and may pass guest credentials; do not register untrusted servers. No HTTP transport or automatic install.").font(.caption)
+                            }
+                        }
+                        Button(enableSessionMCP && useGemini ? "Review MCP session" : "Create empty guest session") {
+                            if enableSessionMCP && useGemini { prepareMCP() }
+                            else { act(close: false) }
+                        }.disabled(running || created)
                         if created && (useGemini || useGoogle) {
                             Button("Test model response") { confirmPrompt = true }.disabled(running || importingContext || turnCount != 0)
                             TextField("Ask the agent", text: $chatInput, axis: .vertical)
                                 .lineLimit(2...6).disabled(running || smokeUsed || turnCount >= maxTurns)
                             Button("Attach saved editor file for edit") { attachEditor() }
-                                .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || model.path.isEmpty || model.reviewBusy || proposal != nil || useGoogle)
+                                .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || model.path.isEmpty || model.reviewBusy || proposal != nil || (useGoogle && !enableSnapshotWrite))
                             Button("Choose text file") { pickingContext = true }
                                 .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns)
                             if importingContext { ProgressView("Reading selected file") }
@@ -197,20 +220,41 @@ struct UbuntuLabView: View {
                                 Text("Combined prompt: \(combined.utf8.count)/1024 bytes").font(.caption)
                             }
                             if enableTerminal && useGemini && fileContext == nil && editSnapshot == nil {
-                                Picker("Allow one terminal diagnostic this turn", selection: $terminalChoice) {
+                                Picker("Allow one terminal command this turn", selection: $terminalChoice) {
                                     Text("None").tag("")
                                     Text("uname -m").tag("uname")
                                     Text("pwd").tag("pwd")
+                                    Text("Custom exact argv").tag("custom")
                                 }.disabled(running)
+                                if terminalChoice == "custom" {
+                                    TextField("JSON argv (absolute guest executable)", text: $customTerminal, axis: .vertical)
+                                        .font(.system(.body, design: .monospaced))
+                                        .autocorrectionDisabled().textInputAutocapitalization(.never).disabled(running)
+                                    Text("A reviewed command can modify guest files or access its network and credentials. Do not grant commands you do not understand. No shell interpolation by Nexus.").font(.caption)
+                                }
+                            }
+                            if useGemini && !useGoogle && fileContext == nil && editSnapshot == nil && terminalChoice.isEmpty {
+                                Toggle("Review agent permissions this turn", isOn: $reviewPermissions).disabled(running)
                             }
                             Button(editSnapshot == nil ? "Send chat" : "Request edit proposal") { prepareChat() }
                                 .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || !UbuntuRunner.validChat(chatInput))
                             Text("Chat turns: \(turnCount)/\(maxTurns)").font(.caption)
                         }
                         if turnCount > 0 {
-                            Text("Permission denials selected: \(permissionDenials) · Tool updates: \(toolUpdates)").font(.caption)
+                            Text("Permissions: \(permissionAllows) allowed / \(permissionDenials) denied · Tool updates: \(toolUpdates)").font(.caption)
+                        }
+                        if !agentPlan.isEmpty {
+                            ForEach(Array(agentPlan.enumerated()), id: \.offset) { entry in Text(entry.element).font(.caption) }
                         }
                         if promptRunning {
+                            if let request = permissionRequest {
+                                Text("Untrusted agent permission request · 15s maximum").font(.headline)
+                                Text(request.title)
+                                Text(request.detail).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                                Text("Allow once may cause guest side effects or network access. This is not a sandbox.").font(.caption)
+                                Button("Allow once") { if UbuntuRunner.decidePermission(request.ticket, allow: true) { permissionRequest = nil } }.disabled(cancelRequested)
+                                Button("Reject", role: .destructive) { if UbuntuRunner.decidePermission(request.ticket, allow: false) { permissionRequest = nil } }
+                            }
                             Text("Received text chunks: \(receivedChunks)").font(.caption)
                             Button(cancelRequested ? "Cancellation requested" : "Cancel prompt", role: .destructive) {
                                 let accepted = UbuntuRunner.cancelPrompt()
@@ -332,6 +376,9 @@ struct UbuntuLabView: View {
                     if progress.responseID == turnCount + 2 {
                         receivedChunks = progress.chunks
                         permissionDenials = progress.permissionDenials
+                        permissionAllows = progress.permissionAllows
+                        agentPlan = progress.plan
+                        permissionRequest = progress.permission
                         toolUpdates = progress.toolUpdates
                         if !sentChat.isEmpty { chatResponse = progress.text }
                         if progress.cancelRequested { cancelRequested = true }
@@ -348,6 +395,16 @@ struct UbuntuLabView: View {
                     try? await Task.sleep(nanoseconds: 200_000_000)
                 }
             }
+            .confirmationDialog("Register this local MCP server for the entire agent session?", isPresented: $confirmMCP) {
+                Button("Register and create session") {
+                    let server = pendingMCP
+                    pendingMCP = nil
+                    if let server { act(close: false, mcp: server) }
+                }
+                Button("Cancel", role: .cancel) { pendingMCP = nil }
+            } message: {
+                Text((pendingMCP?.display ?? "") + "\nAGY may launch the executable and invoke tools internally, with side effects or network access. The bridge injects no MCP environment variables but cannot isolate guest secrets. Native permission requests are denied by default unless explicitly reviewed in a plain Gemini chat turn. Only approve trusted code.")
+            }
             .confirmationDialog("Send your message to the model?", isPresented: $confirmChat) {
                 Button("Send message") {
                     let wire = pendingChat
@@ -355,13 +412,15 @@ struct UbuntuLabView: View {
                     let edit = pendingEdit
                     let content = pendingReadContent
                     let terminal = pendingTerminal
+                    let review = pendingReview
+                    pendingReview = false; reviewPermissions = false
                     pendingTerminal = nil
                     pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil
-                    runPrompt(chat: wire, display: display, edit: edit, readContent: content, terminal: terminal)
+                    runPrompt(chat: wire, display: display, edit: edit, readContent: content, terminal: terminal, review: review)
                 }
-                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil; pendingTerminal = nil; terminalChoice = "" }
+                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil; pendingTerminal = nil; terminalChoice = ""; pendingReview = false; reviewPermissions = false }
             } message: {
-                Text(pendingTerminal != nil ? "Allow one local Ubuntu diagnostic (\(pendingTerminal == "uname" ? "uname -m" : "pwd")) in this turn? Its output may be sent to the model. No other command, environment or native file access is granted." : pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Do not share secrets." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
+                Text(pendingReview ? "Send plain Gemini chat and enable explicit one-shot review for fully described agent permission requests? Nothing is approved automatically; guest operations may have side effects. No sandbox." : pendingTerminal != nil ? "Allow this exact guest command once?\n" + Self.terminalDescription(pendingTerminal ?? "") + "\nIts output may be sent to the model. Commands may modify guest files, access guest credentials or use the network. No security sandbox." : pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Google-mode edits filter the known login code, not all OAuth tokens. Do not share secrets; review the full replacement." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
             }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
@@ -405,7 +464,7 @@ struct UbuntuLabView: View {
     private func run(sha: String?, gemini: Bool = false, google: Bool = false) {
         guard !attempted, !importingAGY, model.claimGuest() else { return }
         let selected = sha == nil ? nil : importedAGY
-        let writeSnapshot = enableSnapshotWrite && gemini
+        let writeSnapshot = enableSnapshotWrite && (gemini || google)
         let readSnapshot = enableSnapshotRead || writeSnapshot
         let terminal = enableTerminal && gemini
         attempted = true
@@ -423,7 +482,7 @@ struct UbuntuLabView: View {
     }
 
     private func attachEditor() {
-        guard !running, !importingContext, active, created, proposal == nil else { return }
+        guard !running, !importingContext, active, created, proposal == nil, !useGoogle || enableSnapshotWrite else { return }
         importingContext = true
         fileContext = nil; editSnapshot = nil
         Task {
@@ -431,7 +490,7 @@ struct UbuntuLabView: View {
             do {
                 let snapshot = try await model.selectedSnapshot()
                 let context = try AgentFileContext(data: Data(snapshot.text.utf8))
-                guard let key = try GeminiKeychain.load(), !snapshot.text.contains(key) else {
+                guard try credentialAllows(snapshot.text) else {
                     contextStatus = "Credential detected or unavailable"; return
                 }
                 fileContext = context
@@ -477,6 +536,14 @@ struct UbuntuLabView: View {
         return useGoogle
     }
 
+    private static func terminalDescription(_ choice: String) -> String {
+        switch choice {
+        case "uname": return "[\"/usr/bin/uname\",\"-m\"]"
+        case "pwd": return "[\"/usr/bin/pwd\"]"
+        default: return choice
+        }
+    }
+
     private func prepareChat() {
         guard !running, !importingContext, active, created, !smokeUsed, turnCount < maxTurns else { return }
         do {
@@ -486,18 +553,27 @@ struct UbuntuLabView: View {
             if let editSnapshot {
                 guard proposal == nil else { contextStatus = "Review or discard the previous proposal"; return }
                 if enableSnapshotWrite {
-                    guard useGemini, !chatInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, try credentialAllows(editSnapshot.text) else { contextStatus = "Credential detected"; return }
+                    guard (useGemini || useGoogle), !chatInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, try credentialAllows(editSnapshot.text) else { contextStatus = "Credential detected"; return }
                     wire = chatInput + "\nRead /nexus-selected.txt and stage one complete replacement via fs/write_text_file. Native user will review before applying."
                     pendingReadContent = editSnapshot.text
-                } else { wire = try AgentEditProposal.prompt(snapshot: editSnapshot, question: chatInput) }
+                } else {
+                    guard !useGoogle else { contextStatus = "Google mode requires staged ACP editing"; return }
+                    wire = try AgentEditProposal.prompt(snapshot: editSnapshot, question: chatInput)
+                }
             } else if enableSnapshotRead, snapshotReadThisTurn, let context = fileContext {
                 guard try credentialAllows(context.text) else { contextStatus = "Credential detected"; return }
                 wire = chatInput + "\nRead the selected text via fs/read_text_file at /nexus-selected.txt if needed."
                 pendingReadContent = context.text
             } else { wire = try fileContext?.prompt(question: chatInput) ?? chatInput }
-            if enableTerminal && useGemini && fileContext == nil && editSnapshot == nil && ["uname","pwd"].contains(terminalChoice) {
-                pendingTerminal = terminalChoice
-                wire += "\nYou may use the one granted terminal command: " + (terminalChoice == "uname" ? "uname -m" : "pwd") + ". cwd /tmp, no custom environment."
+            if enableTerminal && useGemini && fileContext == nil && editSnapshot == nil && !terminalChoice.isEmpty {
+                let choice: String
+                if terminalChoice == "custom" {
+                    let argv = try ACPTerminalApproval.parse(Data(customTerminal.utf8))
+                    guard try argv.arguments.allSatisfy({ try credentialAllows($0) }) else { contextStatus = "Credential detected"; return }
+                    choice = try argv.wire()
+                } else { choice = terminalChoice }
+                pendingTerminal = choice
+                wire += "\nYou may use the one granted terminal argv: " + Self.terminalDescription(choice) + ". cwd /tmp, no custom environment."
             }
             guard UbuntuRunner.validChat(wire) else {
                 contextStatus = "Question and snapshot must fit 1024 UTF-8 bytes"; return
@@ -505,17 +581,18 @@ struct UbuntuLabView: View {
             guard try credentialAllows(wire) else {
                 fileContext = nil; editSnapshot = nil; chatInput = ""; contextStatus = "Credential unavailable or detected"; return
             }
+            pendingReview = reviewPermissions && useGemini && !useGoogle && fileContext == nil && editSnapshot == nil && pendingTerminal == nil
             pendingChat = wire
             pendingEdit = editSnapshot
             pendingDisplay = fileContext == nil ? chatInput : chatInput + "\n[Selected text snapshot included]"
-            if let pendingTerminal { pendingDisplay += "\n[Allowed terminal: " + (pendingTerminal == "uname" ? "uname -m" : "pwd") + "]" }
+            if let pendingTerminal { pendingDisplay += "\n[Allowed terminal: " + Self.terminalDescription(pendingTerminal) + "]" }
             confirmChat = true
         } catch {
             contextStatus = "Invalid question, oversized context, or Keychain unavailable"
         }
     }
 
-    private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil, readContent: String? = nil, terminal: String? = nil) {
+    private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil, readContent: String? = nil, terminal: String? = nil, review: Bool = false) {
         guard active, created, (useGemini || useGoogle), !running, !importingContext, !smokeUsed, turnCount < maxTurns,
               chat != nil || turnCount == 0 else { return }
         if let chat {
@@ -541,13 +618,16 @@ struct UbuntuLabView: View {
         promptRunning = true
         receivedChunks = 0
         permissionDenials = 0
+        permissionAllows = 0; agentPlan = []; permissionRequest = nil
         toolUpdates = 0
         cancelRequested = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent, stageEdit: edit != nil && readContent != nil, terminal: terminal) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent, stageEdit: edit != nil && readContent != nil, terminal: terminal, review: review) }.value
             let snapshot = UbuntuRunner.progress()
             if snapshot.responseID == expectedID {
                 permissionDenials = snapshot.permissionDenials
+                permissionAllows = snapshot.permissionAllows
+                agentPlan = snapshot.plan
                 toolUpdates = snapshot.toolUpdates
             }
             let matches = result.responseID == expectedID && snapshot.responseID == expectedID && !snapshot.running
@@ -556,10 +636,20 @@ struct UbuntuLabView: View {
                 transcript.append(ChatTurn(id: expectedID, user: display ?? chat, response: text,
                     status: matches ? result.status : "Turn failed or response mismatch"))
                 if let edit {
-                    if result.ok && matches && result.status == "Chat turn completed", let key = try? GeminiKeychain.load(),
-                       let candidate = try? (readContent != nil
-                           ? AgentEditProposal(snapshot: edit, stagedReplacement: result.stagedResponse, credential: key)
-                           : AgentEditProposal(snapshot: edit, response: text, credential: key)) {
+                    var candidate: AgentEditProposal?
+                    if result.ok && matches && result.status == "Chat turn completed", !cancelRequested {
+                        do {
+                            let key = try GeminiKeychain.load()
+                            if useGoogle && readContent != nil {
+                                candidate = try AgentEditProposal(snapshot: edit, googleStagedReplacement: result.stagedResponse, knownGeminiCredential: key)
+                            } else if let key {
+                                candidate = readContent != nil
+                                    ? try AgentEditProposal(snapshot: edit, stagedReplacement: result.stagedResponse, credential: key)
+                                    : try AgentEditProposal(snapshot: edit, response: text, credential: key)
+                            }
+                        } catch { candidate = nil }
+                    }
+                    if let candidate {
                         proposal = candidate
                         editStatus = "Untrusted proposal ready for explicit review"
                     } else { editStatus = "No valid complete replacement returned; nothing written" }
@@ -567,6 +657,7 @@ struct UbuntuLabView: View {
                 sentChat = ""
                 chatResponse = ""
             }
+            permissionRequest = nil
             promptRunning = false
             report = result.report
             agentStatus = result.status
@@ -581,11 +672,23 @@ struct UbuntuLabView: View {
         }
     }
 
-    private func act(close: Bool) {
+    private func prepareMCP() {
+        guard active, !created, !running, useGemini else { return }
+        do {
+            let server = try ACPStdioServer(name: mcpServerName, argv: ACPTerminalApproval.parse(Data(mcpServerArgv.utf8)))
+            guard try credentialAllows(server.name), try server.argv.arguments.allSatisfy({ try credentialAllows($0) }) else {
+                agentStatus = "Credential detected in MCP descriptor"; return
+            }
+            pendingMCP = server
+            confirmMCP = true
+        } catch { agentStatus = "Invalid MCP name or JSON argv" }
+    }
+
+    private func act(close: Bool, mcp: ACPStdioServer? = nil) {
         guard active, !running else { return }
         running = true
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: close) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: close, mcp: mcp) }.value
             report = result.report
             agentStatus = result.status
             active = result.active
@@ -595,6 +698,8 @@ struct UbuntuLabView: View {
         }
     }
 }
+
+private struct ACPReviewRequest { let ticket: Int64; let title: String; let detail: String }
 
 private enum UbuntuRunner {
     private static let trialLock = NSLock()
@@ -718,25 +823,31 @@ private enum UbuntuRunner {
             text.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) || $0.value == 10 || $0.value == 9 }
     }
 
-    static func progress() -> (chunks: Int, cancelRequested: Bool, text: String, responseID: Int, running: Bool, permissionDenials: Int, toolUpdates: Int) {
+    static func progress() -> (chunks: Int, cancelRequested: Bool, text: String, responseID: Int, running: Bool, permissionDenials: Int, toolUpdates: Int, permissionAllows: Int, plan: [String], permission: ACPReviewRequest?) {
         let obj = controlReport(nexus_acp_prompt_progress())
-        return (obj["chunkCount"] as? Int ?? 0, obj["cancelRequested"] as? Bool == true, obj["text"] as? String ?? "", obj["responseId"] as? Int ?? 0, obj["running"] as? Bool == true, obj["permissionDenials"] as? Int ?? 0, obj["toolUpdates"] as? Int ?? 0)
+        let permission: ACPReviewRequest?
+        if let p = obj["permission"] as? [String: Any], let ticket = p["ticket"] as? Int64, let title = p["title"] as? String, let detail = p["detail"] as? String { permission = ACPReviewRequest(ticket: ticket, title: title, detail: detail) } else { permission = nil }
+        return (obj["chunkCount"] as? Int ?? 0, obj["cancelRequested"] as? Bool == true, obj["text"] as? String ?? "", obj["responseId"] as? Int ?? 0, obj["running"] as? Bool == true, obj["permissionDenials"] as? Int ?? 0, obj["toolUpdates"] as? Int ?? 0, obj["permissionAllows"] as? Int ?? 0, obj["plan"] as? [String] ?? [], permission)
+    }
+
+    static func decidePermission(_ ticket: Int64, allow: Bool) -> Bool {
+        controlReport(nexus_acp_permission_decision(ticket, allow ? 1 : 0))["ok"] as? Bool == true
     }
 
     static func cancelPrompt() -> Bool {
         controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
     }
 
-    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false, terminal: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
+    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false, terminal: String? = nil, mcp: ACPStdioServer? = nil, review: Bool = false) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
             else if let chat, let readContent { pointer = chat.withCString { t in readContent.withCString { stageEdit ? nexus_acp_chat_edit(t,$0) : nexus_acp_chat_snapshot(t,$0) } } }
             else if let chat, let terminal { pointer = chat.withCString { t in terminal.withCString { nexus_acp_chat_terminal(t,$0) } } }
-            else if let chat { pointer = chat.withCString { nexus_acp_chat($0) } }
+            else if let chat { pointer = chat.withCString { review ? nexus_acp_chat_reviewed($0) : nexus_acp_chat($0) } }
             else if prompt { pointer = nexus_acp_prompt_probe() }
             else {
-                let request = String(decoding: try ACPRequest.newSession(id: 2, cwd: "/tmp"), as: UTF8.self)
+                let request = String(decoding: try ACPRequest.newSession(id: 2, cwd: "/tmp", mcp: mcp), as: UTF8.self)
                 pointer = request.withCString { nexus_acp_new_session($0) }
             }
             guard let pointer else {
@@ -762,7 +873,7 @@ private enum UbuntuRunner {
             } else if prompt && ok && active && object["promptVerified"] as? Bool == true && object["marker"] as? String == "NEXUS_ACP_OK" {
                 status = "Fixed model response verified"
             } else if !close && !prompt && ok && active && object["sessionCreated"] as? Bool == true && object["responseId"] as? Int == 2 {
-                status = "Empty guest session created; fixed test available in credential mode"
+                status = object["mcpConfigured"] as? Bool == true ? "Session accepted with MCP descriptor; server operation not verified" : "Empty guest session created; fixed test available in credential mode"
             } else if object["authenticationRequired"] as? Bool == true {
                 status = "Authentication required; connection stopped"
             } else {

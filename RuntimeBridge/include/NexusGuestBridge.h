@@ -30,18 +30,21 @@ char *nexus_acp_new_session(const char *session_new_request);
 char *nexus_acp_prompt_probe(void);
 // Up to twenty consented text turns (max 1024 UTF-8 bytes each); no project mount.
 // Smoke test and chat are mutually exclusive within one boot.
+#include <stdint.h>
 char *nexus_acp_chat(const char *text);
+char *nexus_acp_chat_reviewed(const char *text);
+char *nexus_acp_permission_decision(int64_t ticket,uint8_t allow);
 // Optional read-only capability: explicit one-turn virtual snapshot, no native path.
 char *nexus_acp_chat_snapshot(const char *text,const char *content);
 // Explicit per-turn virtual write grant; stages replacement for native review only.
 char *nexus_acp_chat_edit(const char *text,const char *content);
-// One explicitly selected diagnostic, no arbitrary argv or native shell.
+// One explicitly approved argv, no agent-selected arguments or native shell.
 char *nexus_acp_chat_terminal(const char *text,const char *choice);
 // Concurrent-safe status and cancel request; does not wait for completion.
 char *nexus_acp_prompt_progress(void);
 char *nexus_acp_cancel_prompt(void);
 char *nexus_acp_close(void);
-// Separate local boot: 1 PTY, 2 MCP discovery, 3 token-protected workbench, 4 one manual MCP call (JSON command/name/arguments).
+// Separate local boot: 1 PTY, 2 MCP discovery, 3 workbench, 4 MCP call, 5 PTY with reviewed lifecycle hooks, 6 reviewed original CLI.
 #include <stdint.h>
 char *nexus_local_run(const char *rootfs_data_path, uint8_t mode, const char *input);
 char *nexus_local_progress(void);

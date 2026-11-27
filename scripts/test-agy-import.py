@@ -35,6 +35,10 @@ class ImportTests(unittest.TestCase):
                 info = archive.getmember("./opt/nexus/agy")
                 self.assertEqual(info.mode, 0o755)
                 self.assertEqual(archive.extractfile(info).read(), bytes(header))
+                for name, marker in prepare.CLI_SLOTS.items():
+                    slot = archive.getmember("./opt/nexus/" + name)
+                    self.assertEqual(slot.mode, 0o755)
+                    self.assertEqual(archive.extractfile(slot).read(), marker)
             with self.assertRaises(ValueError):
                 prepare.overlay_archive(dst, binary, d / "collision.tar.gz")
             struct.pack_into("<H", header, 18, 62)

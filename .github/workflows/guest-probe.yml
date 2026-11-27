@@ -31,6 +31,7 @@ on:
       - 'scripts/prepare-agy-rootfs.py'
       - 'scripts/prepare-workbench-rootfs.py'
       - 'scripts/test-workbench-import.py'
+      - 'scripts/build-test-vsix.py'
       - 'scripts/test-agy-import.py'
       - 'scripts/stage-ubuntu-device.sh'
       - 'scripts/prepare-swiftterm.sh'
@@ -258,6 +259,27 @@ jobs:
           name: google-login-fixture-evidence
           path: ${{ runner.temp }}/nexus-google.json
           if-no-files-found: error
+      - name: Verify Google-mode ACP staged edit (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-google-edit-fs"
+          export NEXUS_GOOGLE_ROOTFS="$RUNNER_TEMP/nexus-google-edit-fs/data"
+          export NEXUS_GOOGLE_EVIDENCE="$RUNNER_TEMP/nexus-google-edit.json"
+          export NEXUS_ACP_TEST_GOOGLE_EDIT=1
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_google_edit_transport -- --ignored --nocapture --test-threads=1 >"$RUNNER_TEMP/nexus-google-edit-log" 2>&1 || { echo "Google edit fixture failed; raw log withheld"; exit 1; }
+          if grep -q NEXUS_FIXTURE_AUTH_CODE "$RUNNER_TEMP/nexus-google-edit-log"; then echo "Fixture code leaked"; exit 1; fi
+          cat "$RUNNER_TEMP/nexus-google-edit-log"
+          rm "$RUNNER_TEMP/nexus-google-edit-log"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","googleStagedWriteVerified","shutdownClean"])' "$NEXUS_GOOGLE_EVIDENCE"
+      - name: Upload Google staged edit evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: google-staged-edit-evidence
+          path: ${{ runner.temp }}/nexus-google-edit.json
+          if-no-files-found: error
       - name: Verify ACP virtual snapshot scope (synthetic peer)
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
@@ -276,6 +298,24 @@ jobs:
           name: acp-snapshot-fixture-evidence
           path: ${{ runner.temp }}/nexus-snapshot.json
           if-no-files-found: error
+      - name: Verify local MCP session descriptor (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-mcp-session-fs"
+          export NEXUS_ACP_ROOTFS="$RUNNER_TEMP/nexus-mcp-session-fs/data"
+          export NEXUS_ACP_EVIDENCE="$RUNNER_TEMP/nexus-mcp-session.json"
+          export NEXUS_ACP_TEST_MCP_SESSION=1
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_acp_mcp_session_transport -- --ignored --nocapture --test-threads=1
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","descriptorVerified","shutdownClean"]) and r["serverExecutionVerified"] is False' "$NEXUS_ACP_EVIDENCE"
+      - name: Upload MCP session descriptor evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-session-descriptor-evidence
+          path: ${{ runner.temp }}/nexus-mcp-session.json
+          if-no-files-found: error
       - name: Verify restricted ACP terminal transport (synthetic peer)
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
@@ -293,6 +333,48 @@ jobs:
         with:
           name: acp-terminal-fixture-evidence
           path: ${{ runner.temp }}/nexus-terminal.json
+          if-no-files-found: error
+      - name: Verify original CLI import slots (Ubuntu ELF fixture only)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for kind in codex claude; do
+            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-cli-$kind"
+            export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-cli-$kind/data"
+            export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-cli-$kind.json"
+            export NEXUS_CLI_KIND="$kind"
+            cat "$NEXUS_LOCAL_ROOTFS/usr/bin/true" > "$NEXUS_LOCAL_ROOTFS/opt/nexus/$kind"
+            export NEXUS_CLI_SHA="$(shasum -a 256 "$NEXUS_LOCAL_ROOTFS/usr/bin/true" | awk '{print $1}')"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_cli_import_slot -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["shutdownClean"] is True and r["fixture"] == "Ubuntu true, not Codex or Claude"' "$NEXUS_LOCAL_EVIDENCE"
+          done
+      - name: Upload CLI import slot evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-cli-import-fixture-evidence
+          path: ${{ runner.temp }}/nexus-cli-*.json
+          if-no-files-found: error
+      - name: Verify local PTY lifecycle hooks
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for phase in success failure main_failure; do
+            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-hooks-$phase"
+            export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-hooks-$phase/data"
+            export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-hooks-$phase.json"
+            export NEXUS_HOOK_PHASE="$phase"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_local_hooks -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["shutdownClean"] is True' "$NEXUS_LOCAL_EVIDENCE"
+          done
+      - name: Upload local hook evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-hook-evidence
+          path: ${{ runner.temp }}/nexus-hooks-*.json
           if-no-files-found: error
       - name: Verify persisted guest across independent runtime processes
         run: |
@@ -332,8 +414,11 @@ jobs:
           cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-workbench-fs"
           export NEXUS_WORKBENCH_ROOTFS="$RUNNER_TEMP/nexus-workbench-fs/data"
           export NEXUS_WORKBENCH_EVIDENCE="$RUNNER_TEMP/nexus-workbench.json"
+          python3 scripts/build-test-vsix.py "$RUNNER_TEMP/nexus-fixture.vsix"
+          export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-fixture.vsix" | awk '{print $1}')"
+          cat "$RUNNER_TEMP/nexus-fixture.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
-          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["editorVerified"] is False' "$NEXUS_WORKBENCH_EVIDENCE"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["extensionInstallVerified"] is True and r["editorVerified"] is False and r["lspVerified"] is False' "$NEXUS_WORKBENCH_EVIDENCE"
       - name: Upload workbench loopback evidence
         if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
         uses: actions/upload-artifact@v4

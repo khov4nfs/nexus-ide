@@ -24,6 +24,7 @@ else
 fi
 if [[ "${1:-}" == --workbench ]]; then
   test "$(cat "$source/workbench.sha256")" = 36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc
+  printf 'NEXUS_VSIX_IMPORT_SLOT_V1\n' | cmp - "$source/data/opt/nexus/extension.vsix"
   for item in launcher node; do
     expected=$(cat "$source/workbench-$item.sha256")
     [[ "$expected" =~ ^[a-f0-9]{64}$ ]]
@@ -33,6 +34,10 @@ if [[ "${1:-}" == --workbench ]]; then
 else
   test ! -e "$source/workbench.sha256"
 fi
+for cli in codex claude; do
+  if [[ "$cli" == codex ]]; then marker=NEXUS_CODEX_IMPORT_SLOT_V1; else marker=NEXUS_CLAUDE_IMPORT_SLOT_V1; fi
+  printf '%s\n' "$marker" | cmp - "$source/data/opt/nexus/$cli"
+done
 # Source must be fresh and stopped. No copying an active fakefs database.
 test ! -e "$source/meta.db-wal"
 test ! -e "$source/meta.db-shm"

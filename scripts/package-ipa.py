@@ -101,6 +101,11 @@ def verify(path, variant):
             if b'version=v1.19.0\ncommit=464df5207fc2432e16c9a23abe538187196daf5f\n' not in z.read(prefix+'SwiftTerm-provenance.txt'): raise ValueError('Missing SwiftTerm provenance')
             if slot not in names:
                 raise ValueError("Missing AGY import slot")
+            for name in ("codex", "claude"):
+                cli_slot = guest + "data/opt/nexus/" + name
+                marker = ("NEXUS_" + name.upper() + "_IMPORT_SLOT_V1\n").encode()
+                if cli_slot not in names or z.getinfo(cli_slot).file_size != len(marker) or z.read(cli_slot) != marker:
+                    raise ValueError("Expected empty reviewed CLI import slot: " + name)
             with z.open(guest+"meta.db") as db:
                 if db.read(16) != b"SQLite format 3\0":
                     raise ValueError("Invalid fakefs database")
@@ -111,6 +116,8 @@ def verify(path, variant):
         if variant == "workbench":
             if z.read(guest+"workbench.sha256").decode().strip() != WORKBENCH_SHA:
                 raise ValueError("Missing pinned workbench")
+            if z.read(guest+"data/opt/nexus/extension.vsix") != b"NEXUS_VSIX_IMPORT_SLOT_V1\n":
+                raise ValueError("Expected empty VSIX import slot")
             for entry in ("data/opt/nexus/workbench/node","data/opt/nexus/workbench/bin/openvscode-server"):
                 if guest+entry not in names:
                     raise ValueError("Missing workbench executable")

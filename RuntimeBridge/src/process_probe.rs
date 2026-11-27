@@ -493,8 +493,11 @@ pub fn agy_digest_ok(s: &str) -> bool {
 }
 
 pub async fn agy_binary_digest(guest: &IshInstance, env: &HashMap<String,String>, expected: &str) -> Value {
+    guest_file_digest(guest,env,"/opt/nexus/agy",expected).await
+}
+pub(crate) async fn guest_file_digest(guest:&IshInstance,env:&HashMap<String,String>,path:&str,expected:&str)->Value {
     let name = "agy_binary_digest";
-    let mut opts = SpawnOpts::cmd(["/usr/bin/sha256sum", "/opt/nexus/agy"]);
+    let mut opts = SpawnOpts::cmd(["/usr/bin/sha256sum", path]);
     opts.cwd = Some(Path::new("/").to_path_buf());
     opts.envp = Some(env.iter().map(|(k,v)| (k.clone(),v.clone())).collect());
     let session = match guest.spawn(opts) {
@@ -506,7 +509,7 @@ pub async fn agy_binary_digest(guest: &IshInstance, env: &HashMap<String,String>
     if result.is_err() { let _ = session.terminate().await; }
     let passed = result.is_ok() && capture.code == Some(0) && capture.signal == Some(0)
         && capture.closed && capture.pty.is_empty()
-        && capture.stdout == format!("{expected}  /opt/nexus/agy\n").as_bytes();
+        && capture.stdout == format!("{expected}  {path}\n").as_bytes();
     json!({"name":name,"passed":passed,"sha256":expected,"closed":capture.closed,
            "error":if passed { None } else { Some("Guest executable digest check failed") }})
 }
@@ -658,13 +661,13 @@ impl ACPExchange {
 
     pub(crate) async fn request_updates<F>(&mut self, bytes: &[u8], id: i64, update: F) -> Result<Value,String>
     where F: FnMut(&Value) -> Result<(),String> {
-        self.request_controlled(bytes, id, update, || None, |_| Err("Unexpected agent request".into()), None).await
+        self.request_controlled(bytes, id, update, || None, |_,_| Err("Unexpected agent request".into()), None).await
     }
 
     // Control is checked by the owner of the same stdin stream, never by
     // another writer. Cancellation is a notification, not a new request ID.
     pub(crate) async fn request_controlled<F, C, R>(&mut self, bytes: &[u8], id: i64, mut update: F, mut control: C, mut server_request: R, mut terminal: Option<&mut TerminalGrant<'_>>) -> Result<Value,String>
-    where F: FnMut(&Value) -> Result<(),String>, C: FnMut() -> Option<Vec<u8>>, R: FnMut(&Value) -> Result<Value,String> {
+    where F: FnMut(&Value) -> Result<(),String>, C: FnMut() -> Option<Vec<u8>>, R: FnMut(&Value, Instant) -> Result<Value,String> {
         let mut deadline = Instant::now() + Duration::from_secs(90);
         let mut server_ids=std::collections::HashSet::new();
         write_ready(&self.session, bytes, deadline).await?;
@@ -698,7 +701,7 @@ impl ACPExchange {
                             Some(t)=>t.handle(&frame,deadline).await?,
                             None=>json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32602,"message":"No terminal grant"}}),
                         }
-                    } else {server_request(&frame)?};
+                    } else {server_request(&frame,deadline)?};
                     let wire = format!("{reply}\n");
                     write_ready(&self.session, wire.as_bytes(), deadline).await?;
                     continue;
@@ -732,14 +735,18 @@ impl ACPExchange {
 }
 
 
-// One exact, user-selected diagnostic per prompt. Never run agent shell strings,
-// arbitrary argv, cwd or env. The guest itself is not a security sandbox.
-pub(crate) fn terminal_command(choice:&str)->Option<(&'static str,&'static [&'static str])> {
-    match choice {
-        "uname" => Some(("/usr/bin/uname",&["-m"])),
-        "pwd" => Some(("/usr/bin/pwd",&[])),
-        _ => None,
-    }
+// One explicitly approved argv per prompt. The bridge never interpolates a
+// shell command or accepts agent-selected arguments, cwd or environment.
+pub(crate) fn terminal_command(choice:&str)->Option<Vec<String>> {
+    if choice=="uname" {return Some(vec!["/usr/bin/uname".into(),"-m".into()]);}
+    if choice=="pwd" {return Some(vec!["/usr/bin/pwd".into()]);}
+    if choice.len()>2048 {return None;}
+    let argv:Vec<String>=serde_json::from_str(choice).ok()?;
+    let program=argv.first()?;
+    if argv.len()>17 || program.len()>256 || !program.starts_with('/') ||
+        program.split('/').skip(1).any(|s|s.is_empty()||s=="."||s==".."||!s.bytes().all(|b|b.is_ascii_alphanumeric()||b"._+-".contains(&b))) ||
+        argv.iter().any(|s|s.len()>512||s.chars().any(char::is_control)) {return None;}
+    Some(argv)
 }
 struct GrantedProcess {
     session: std::sync::Arc<IshSession>,
@@ -780,13 +787,18 @@ impl<'a> TerminalGrant<'a> {
         let method=frame["method"].as_str().unwrap_or("");
         if method=="terminal/create" {
             if self.used {return Ok(deny());}
-            let Some((program,args))=self.choice.and_then(terminal_command) else {return Ok(deny());};
+            let Some(argv)=self.choice.and_then(terminal_command) else {return Ok(deny());};
+            if argv.iter().any(|arg|arg.contains(self.key)) {return Ok(deny());}
+            let program=argv[0].as_str();
+            let args=&argv[1..];
             let requested=params["command"].as_str();
+            // Keep basename aliases only for the two original fixed presets.
+            let legacy=matches!(self.choice,Some("uname"|"pwd"));
             let name=program.rsplit('/').next().unwrap_or(program);
-            if requested!=Some(program) && requested!=Some(name) {return Ok(deny());}
+            if requested!=Some(program) && !(legacy && requested==Some(name)) {return Ok(deny());}
             let args_ok=match params.get("args") {
                 None=>args.is_empty(),
-                Some(v)=>v.as_array().is_some_and(|a|a.len()==args.len() && a.iter().zip(args).all(|(v,s)|v.as_str()==Some(*s))),
+                Some(v)=>v.as_array().is_some_and(|a|a.len()==args.len() && a.iter().zip(args).all(|(v,s)|v.as_str()==Some(s.as_str()))),
             };
             if !args_ok || !params.get("env").is_none_or(|v|v.as_array().is_some_and(|a|a.is_empty())) ||
                 !params.get("cwd").is_none_or(|v|v.is_null()||v.as_str()==Some("/tmp")) {return Ok(deny());}
@@ -794,8 +806,7 @@ impl<'a> TerminalGrant<'a> {
                 None|Some(Value::Null)=>4096,
                 Some(v)=>match v.as_u64(){Some(n) if n>0=>n.min(4096) as usize,_=>return Ok(deny())}
             };
-            let argv=std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>();
-            let mut opts=SpawnOpts::cmd(argv);
+            let mut opts=SpawnOpts::cmd(argv.iter().map(String::as_str).collect::<Vec<_>>());
             opts.cwd=Some(Path::new("/tmp").to_path_buf());
             opts.envp=Some(vec![("PATH".into(),"/usr/bin:/bin".into()),("LANG".into(),"C".into()),("HOME".into(),"/tmp".into())]);
             opts.tty=true;
@@ -812,7 +823,7 @@ impl<'a> TerminalGrant<'a> {
         let result=match method {
             "terminal/output"=>{
                 if !p.capture.closed {p.capture.poll(&p.session,bounded).await?;}
-                // Fixed diagnostic output only; withhold partial output until closed.
+                // Withhold partial command output until closed.
                 // Do not export credentials, control sequences or arbitrary raw bytes.
                 let mut output=String::new();
                 let mut truncated=false;
@@ -850,10 +861,40 @@ fn terminal_status(c:&Capture)->Value {
 #[cfg(test)]
 #[test]
 fn terminal_command_scope() {
-    assert_eq!(terminal_command("uname"),Some(("/usr/bin/uname",&["-m"][..])));
-    assert_eq!(terminal_command("pwd"),Some(("/usr/bin/pwd",&[][..])));
+    assert_eq!(terminal_command("uname"),Some(vec!["/usr/bin/uname".to_owned(),"-m".to_owned()]));
+    assert_eq!(terminal_command("pwd"),Some(vec!["/usr/bin/pwd".to_owned()]));
+    assert_eq!(terminal_command(r#"["/usr/bin/printf","%s","hello world"]"#).unwrap()[2],"hello world");
+    assert!(terminal_command(r#"["/usr/bin/../bin/sh"]"#).is_none());
+    assert!(terminal_command(r#"["printf","hello"]"#).is_none());
+    assert!(terminal_command(r#"["/usr/bin/printf","\u0000"]"#).is_none());
     assert!(terminal_command("sh").is_none());
     assert!(terminal_command("uname; cat /etc/passwd").is_none());
+}
+
+// Run only an explicitly reviewed local lifecycle hook, never an agent string.
+pub(crate) async fn local_hook(guest:&IshInstance,env:&HashMap<String,String>,command:&str)->bool {
+    local_hook_with_timeout(guest,env,command,30).await
+}
+pub(crate) async fn local_hook_with_timeout(guest:&IshInstance,env:&HashMap<String,String>,command:&str,seconds:u64)->bool {
+    if crate::local_jobs::stop_requested() {return false;}
+    let mut opts=shell(command,env);
+    opts.cwd=Some(Path::new("/tmp").to_path_buf());
+    opts.pipe_stdin=false;
+    let Ok(session)=guest.spawn(opts) else {return false;};
+    let mut capture=Capture::default();
+    let deadline=Instant::now()+Duration::from_secs(seconds);
+    let result:Result<(),String>=async {
+        while !capture.closed {
+            if crate::local_jobs::stop_requested() {return Err("Hook cancelled".into());}
+            capture.poll(&session,deadline).await?;
+        }
+        Ok(())
+    }.await;
+    if result.is_err() {
+        let _=session.terminate().await;
+        let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
+    }
+    result.is_ok() && capture.closed && capture.exited && capture.code==Some(0) && capture.signal.unwrap_or(0)==0 && !crate::local_jobs::stop_requested()
 }
 
 // User-initiated local jobs in a separate disposable Ubuntu boot. No host
@@ -874,7 +915,7 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
     };
     let mut capture = Capture::default();
     capture.rolling_pty = !workbench;
-    let deadline = Instant::now() + Duration::from_secs(if workbench {300} else {1800});
+    let deadline = Instant::now() + Duration::from_secs(1800);
     let mut stopped = false;
     let result: Result<(),String> = async {
         loop {

@@ -14,7 +14,7 @@ struct State {
 static STATE: Mutex<State> = Mutex::new(State {
     running:false, ready:false, mode:0, output:String::new(), raw:Vec::new(), total:0, controls:VecDeque::new(), stop:false,
 });
-const WORKBENCH: &str = "umask 077; mkdir -p /tmp/nexus-workbench /tmp/nexus-vscode-data /tmp/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /tmp/nexus-vscode-data --extensions-dir /tmp/nexus-vscode-extensions /tmp/nexus-workbench";
+const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
 fn fail(message: &str) -> Value { json!({"ok":false,"error":message}) }
 fn valid_command(s: &str) -> bool { !s.trim().is_empty() && s.len() <= 2048 && !s.contains('\0') }
 fn parse_call(input:&str)->Option<Value> {
@@ -27,7 +27,42 @@ fn parse_call(input:&str)->Option<Value> {
     if !obj.get("arguments")?.is_object() || obj["arguments"].to_string().len()>4096 {return None;}
     Some(value)
 }
+// Hooked PTY jobs are separate from agent jobs and never receive provider keys.
+fn parse_hooks(input:&str)->Option<Value> {
+    if input.len()>8192 {return None;}
+    let value:Value=serde_json::from_str(input).ok()?;
+    let obj=value.as_object()?;
+    if obj.len()!=3 || !valid_command(obj.get("command")?.as_str()?) {return None;}
+    for field in ["before","after"] {
+        let hook=obj.get(field)?;
+        if !hook.is_null() && !hook.as_str().is_some_and(valid_command) {return None;}
+    }
+    if obj["before"].is_null() && obj["after"].is_null() {return None;}
+    Some(value)
+}
+pub(crate) fn stop_requested()->bool {STATE.lock().map(|s|s.stop).unwrap_or(true)}
 fn valid_token(s: &str) -> bool { s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) }
+fn parse_workbench(input:&str)->Option<(String,Option<String>)> {
+    if valid_token(input) {return Some((input.to_owned(),None));}
+    if input.len()>512 {return None;}
+    let v:Value=serde_json::from_str(input).ok()?;
+    if v.as_object()?.len()!=2 {return None;}
+    let token=v["token"].as_str()?.to_owned();
+    let digest=v["vsixSha256"].as_str()?.to_owned();
+    if !valid_token(&token) || !process_probe::agy_digest_ok(&digest) {return None;}
+    Some((token,Some(digest)))
+}
+const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
+fn parse_cli(input:&str)->Option<(String,String,String)> {
+    if input.len()>512 {return None;}
+    let v:Value=serde_json::from_str(input).ok()?;
+    if v.as_object()?.len()!=3 {return None;}
+    let kind=v["kind"].as_str()?;
+    let digest=v["sha256"].as_str()?;
+    let action=v["action"].as_str()?;
+    if !matches!(kind,"codex"|"claude") || !process_probe::agy_digest_ok(digest) || !matches!(action,"shell"|"version") {return None;}
+    Some((kind.into(),digest.into(),action.into()))
+}
 fn progress() -> Value {
     STATE.lock().map(|s| json!({"ok":true,"running":s.running,"ready":s.ready,"output":s.output,"stopRequested":s.stop}))
         .unwrap_or_else(|_| fail("Local status unavailable"))
@@ -65,7 +100,10 @@ impl Drop for Guard {
 }
 fn run(path: &Path, mode: u8, input: &str) -> Value {
     let call=if mode==4 {match parse_call(input) {Some(v)=>Some(v),None=>return fail("Invalid MCP call")}} else {None};
-    if !matches!(mode,1..=4) || (mode == 3 && !valid_token(input)) ||
+    let hooks=if mode==5 {match parse_hooks(input) {Some(v)=>Some(v),None=>return fail("Invalid hook plan")}} else {None};
+    let workbench=if mode==3 {match parse_workbench(input) {Some(v)=>Some(v),None=>return fail("Invalid workbench launch")}} else {None};
+    let cli=if mode==6 {match parse_cli(input) {Some(v)=>Some(v),None=>return fail("Invalid CLI launch")}} else {None};
+    if !matches!(mode,1..=6) ||
         (matches!(mode,1|2) && !valid_command(input)) { return fail("Invalid local job"); }
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
@@ -77,7 +115,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     }
     let Ok(mut s) = STATE.lock() else { return fail("Local job lock failed"); };
     if s.running || ATTEMPTED.swap(true,Ordering::AcqRel) { return fail("Restart app before another guest boot"); }
-    *s = State { running:true,ready:false,mode,output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false };
+    *s = State { running:true,ready:false,mode:if matches!(mode,5|6) {1}else{mode},output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false };
     drop(s);
     let _guard = Guard;
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -88,14 +126,62 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     };
     let mut env = HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),
         ("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into()),
-        ("TERM".into(),if mode==1 {"xterm-256color".into()} else {"dumb".into()}),("NODE_OPTIONS".into(),"--jitless".into())]);
+        ("TERM".into(),if matches!(mode,1|5|6) {"xterm-256color".into()} else {"dumb".into()}),("NODE_OPTIONS".into(),"--jitless".into())]);
     let libc = rt.block_on(process_probe::glibc_compat(&guest,&env));
     let mut result = if libc["passed"] != true { fail("Ubuntu compatibility failed") }
+        else if let Some(plan)=hooks.as_ref() {
+            let before=plan["before"].as_str();
+            let after=plan["after"].as_str();
+            let before_ok=before.is_none_or(|_|!stop_requested()) && match before {
+                Some(cmd)=>rt.block_on(process_probe::local_hook(&guest,&env,cmd)),
+                None=>true,
+            };
+            let mut result=if before_ok && !stop_requested() {
+                rt.block_on(process_probe::local_process(&guest,&env,plan["command"].as_str().unwrap(),false))
+            } else {fail("Before hook failed or job cancelled")};
+            let main_ok=result["ok"]==true && result["exitCode"]==0 && result["stopped"]!=true && !stop_requested();
+            let after_ok=if main_ok {
+                match after {Some(cmd)=>Some(rt.block_on(process_probe::local_hook(&guest,&env,cmd))),None=>None}
+            }else{None};
+            result["hooks"]=json!({"before":if before.is_some(){Some(before_ok)}else{None},"after":after_ok,"afterSkipped":after.is_some()&&after_ok.is_none()});
+            result["ok"]=json!(main_ok && after_ok.unwrap_or(true) && !stop_requested());
+            result
+        }
         else if let Some(call)=call.as_ref() {rt.block_on(process_probe::mcp_job(&guest,&env,call["command"].as_str().unwrap(),Some((call["name"].as_str().unwrap(),&call["arguments"]))))}
         else if mode == 2 { rt.block_on(process_probe::mcp_discover(&guest,&env,input)) }
-        else {
-            if mode == 3 { env.insert("NEXUS_WORKBENCH_TOKEN".into(),input.into()); }
-            rt.block_on(process_probe::local_process(&guest,&env,if mode == 3 { WORKBENCH } else { input },mode == 3))
+        else if let Some((kind,digest,action))=cli.as_ref() {
+            let executable=if kind=="codex" {"/opt/nexus/codex"}else{"/opt/nexus/claude"};
+            let verified=rt.block_on(process_probe::guest_file_digest(&guest,&env,executable,digest))["passed"]==true;
+            let mut r=if verified && !stop_requested() {
+                // Only fixed paths/actions; no user-provided shell interpolation,
+                // no CLI flags that disable the original harness safeguards.
+                env.insert("PATH".into(),"/opt/nexus:/usr/bin:/bin:/usr/sbin:/sbin".into());
+                let script=match (kind.as_str(),action.as_str()) {
+                    ("codex","version")=>"exec /opt/nexus/codex --version",
+                    ("claude","version")=>"exec /opt/nexus/claude --version",
+                    ("codex","shell")=>"umask 077; mkdir -p /root/nexus-cli-project && cd /root/nexus-cli-project && printf 'Reviewed Codex: use official login, then codex.\\n' && exec /bin/sh -i",
+                    _=>"umask 077; mkdir -p /root/nexus-cli-project && cd /root/nexus-cli-project && printf 'Reviewed Claude Code: run claude and use its own login.\\n' && exec /bin/sh -i",
+                };
+                rt.block_on(process_probe::local_process(&guest,&env,script,false))
+            }else{fail("Reviewed CLI executable digest mismatch or cancelled")};
+            r["binaryDigestVerified"]=json!(verified);
+            r["harness"]=json!(kind);
+            r["action"]=json!(action);
+            r
+        }
+        else if let Some((token,vsix))=workbench.as_ref() {
+            let installed=vsix.as_deref().map(|digest| {
+                let verified=rt.block_on(process_probe::guest_file_digest(&guest,&env,"/opt/nexus/extension.vsix",digest))["passed"]==true;
+                verified && !stop_requested() && rt.block_on(process_probe::local_hook_with_timeout(&guest,&env,INSTALL_VSIX,120))
+            });
+            let mut r=if installed.unwrap_or(true) && !stop_requested() {
+                env.insert("NEXUS_WORKBENCH_TOKEN".into(),token.clone());
+                rt.block_on(process_probe::local_process(&guest,&env,WORKBENCH,true))
+            } else {fail("Reviewed VSIX verification or installation failed, or launch cancelled")};
+            r["extensionInstalled"]=json!(installed);
+            r
+        } else {
+            rt.block_on(process_probe::local_process(&guest,&env,input,false))
         };
     let shutdown = rt.block_on(guest.shutdown()).is_ok();
     result["shutdownClean"] = json!(shutdown);
@@ -166,10 +252,62 @@ mod tests {
         assert!(!valid_command("x\0y"));
         assert!(!valid_command(&"x".repeat(2049)));
         assert!(valid_token(&"a".repeat(64)));
+        assert!(parse_cli(&json!({"kind":"codex","sha256":"a".repeat(64),"action":"shell"}).to_string()).is_some());
+        assert!(parse_cli(&json!({"kind":"unknown","sha256":"a".repeat(64),"action":"shell"}).to_string()).is_none());
+        assert!(parse_workbench(&json!({"token":"a".repeat(64),"vsixSha256":"b".repeat(64)}).to_string()).is_some());
+        assert!(parse_workbench(&json!({"token":"a".repeat(64),"vsixSha256":"bad"}).to_string()).is_none());
         assert!(!valid_token("token"));
         assert!(parse_call(r#"{"command":"exec server","name":"echo","arguments":{}}"#).is_some());
         assert!(parse_call(r#"{"command":"exec server","name":"echo","arguments":[]}"#).is_none());
         assert!(parse_call(r#"{"command":"exec server","name":"echo","arguments":{},"extra":true}"#).is_none());
+    }
+    #[test]
+    fn hooks_require_exact_explicit_plan() {
+        assert!(parse_hooks(r#"{"command":"echo main","before":"echo pre","after":null}"#).is_some());
+        assert!(parse_hooks(r#"{"command":"echo main","before":null,"after":null}"#).is_none());
+        assert!(parse_hooks(r#"{"command":"echo main","before":" ","after":null}"#).is_none());
+        assert!(parse_hooks(r#"{"command":"echo main","before":null,"after":"echo post","autoInstall":true}"#).is_none());
+    }
+    #[test]
+    #[ignore = "requires fresh Ubuntu fakefs; real Ubuntu ELF, not actual agent"]
+    fn real_cli_import_slot() {
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let kind=std::env::var("NEXUS_CLI_KIND").expect("kind");
+        let digest=std::env::var("NEXUS_CLI_SHA").expect("sha");
+        let input=json!({"kind":kind,"sha256":digest,"action":"version"}).to_string();
+        let result=run(Path::new(&path),6,&input);
+        let output=progress()["output"].as_str().unwrap_or("").to_owned();
+        let verified=result["ok"]==true && result["binaryDigestVerified"]==true && result["exitCode"]==0 && output.contains("GNU coreutils");
+        let evidence=json!({"ok":verified && result["shutdownClean"]==true,"fixture":"Ubuntu true, not Codex or Claude","kind":kind,"shutdownClean":result["shutdownClean"]});
+        std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        println!("{evidence}");
+        assert_eq!(evidence["ok"],true);
+    }
+    #[test]
+    #[ignore = "requires fresh Ubuntu fakefs in separate process"]
+    fn real_local_hooks() {
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_HOOK_PHASE").expect("phase");
+        let plan=match phase.as_str() {
+            "success"=>json!({"before":"printf pre >/tmp/nexus-hook-state","command":"test \"$(cat /tmp/nexus-hook-state)\" = pre && printf main >/tmp/nexus-hook-state && printf 'NEXUS_HOOK_MAIN\\n'","after":"test \"$(cat /tmp/nexus-hook-state)\" = main"}),
+            "failure"=>json!({"before":"exit 7","command":"printf NEXUS_FORBIDDEN_MAIN","after":"exit 0"}),
+            "main_failure"=>json!({"before":"true","command":"exit 7","after":"exit 0"}),
+            _=>panic!("invalid hook phase"),
+        };
+        let result=run(Path::new(&path),5,&plan.to_string());
+        let output=progress()["output"].as_str().unwrap_or("").to_owned();
+        let verified=match phase.as_str() {
+            "success"=>result["ok"]==true && result["hooks"]["before"]==true && result["hooks"]["after"]==true && output.contains("NEXUS_HOOK_MAIN"),
+            "failure"=>result["ok"]==false && result["hooks"]["before"]==false && result["hooks"]["afterSkipped"]==true && !output.contains("NEXUS_FORBIDDEN_MAIN"),
+            "main_failure"=>result["ok"]==false && result["exitCode"]==7 && result["hooks"]["before"]==true && result["hooks"]["afterSkipped"]==true,
+            _=>false
+        };
+        let evidence=json!({"ok":verified && result["shutdownClean"]==true,"phase":phase,"shutdownClean":result["shutdownClean"]});
+        std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        println!("{evidence}");
+        assert_eq!(evidence["ok"],true);
     }
     #[test]
     #[ignore = "requires reviewed real OpenVSCode rootfs; loopback host probe"]
@@ -181,9 +319,14 @@ mod tests {
         let evidence=std::env::var_os("NEXUS_WORKBENCH_EVIDENCE").expect("evidence");
         // Synthetic CI-only token. No real account or native workspace.
         let token="f".repeat(64);
-        let worker_token=token.clone();
+        let vsix=std::env::var("NEXUS_WORKBENCH_VSIX_SHA").ok();
+        let worker_token=match vsix.as_deref() {
+            Some(digest)=>json!({"token":token,"vsixSha256":digest}).to_string(),
+            None=>token.clone(),
+        };
+        let guest_path=Path::new(&path).to_path_buf();
         let worker=std::thread::spawn(move||run(Path::new(&path),3,&worker_token));
-        let deadline=Instant::now()+Duration::from_secs(90);
+        let deadline=Instant::now()+Duration::from_secs(240);
         let ready=loop {
             if progress()["ready"]==true {break true;}
             if worker.is_finished() || Instant::now()>=deadline {break false;}
@@ -215,8 +358,17 @@ mod tests {
         }
         let stop=enqueue(Control::Stop);
         let closed=worker.join().expect("workbench owner");
-        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true,
-            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"editorVerified":false});
+        let extension_verified=vsix.as_ref().map(|_| {
+            closed["extensionInstalled"]==true &&
+                std::fs::read_dir(guest_path.join("root/nexus-vscode-extensions")).ok().is_some_and(|dirs|
+                    dirs.filter_map(Result::ok).any(|entry| {
+                        let name=entry.file_name();
+                        name.to_string_lossy().starts_with("nexus.fixture-0.0.1") &&
+                            entry.path().join("package.json").is_file()
+                    }))
+        });
+        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true),
+            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"extensionInstallVerified":extension_verified,"editorVerified":false,"lspVerified":false});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         println!("{report}");
         assert_eq!(report["ok"],true);

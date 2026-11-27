@@ -20,13 +20,25 @@ public struct AgentEditProposal: Identifiable, Sendable {
 
     /// Already correlated virtual-file result, not JSON embedded in model text.
     public init(snapshot: WorkspaceSnapshot, stagedReplacement: String?, credential: String) throws {
+        guard !credential.isEmpty else { throw Failure.credential }
+        try self.init(snapshot: snapshot, validatedStagedReplacement: stagedReplacement, knownCredential: credential)
+    }
+
+    /// Use only after a correlated Google-authenticated bridge response. The
+    /// bridge checks its known authorization code, not arbitrary OAuth tokens.
+    /// Native review is mandatory; this is not a credential-isolation guarantee.
+    public init(snapshot: WorkspaceSnapshot, googleStagedReplacement: String?, knownGeminiCredential: String?) throws {
+        try self.init(snapshot: snapshot, validatedStagedReplacement: googleStagedReplacement, knownCredential: knownGeminiCredential)
+    }
+
+    private init(snapshot: WorkspaceSnapshot, validatedStagedReplacement: String?, knownCredential: String?) throws {
         guard snapshot.text.utf8.count <= AgentFileContext.maxFileBytes else { throw Failure.tooLarge }
-        guard let text = stagedReplacement else { throw Failure.invalidResponse }
+        guard let text = validatedStagedReplacement else { throw Failure.invalidResponse }
         guard text.utf8.count <= 4096 else { throw Failure.tooLarge }
         guard text.unicodeScalars.allSatisfy({
             !CharacterSet.controlCharacters.contains($0) || $0.value == 10 || $0.value == 9
         }) else { throw Failure.invalidText }
-        guard !credential.isEmpty, !text.contains(credential) else { throw Failure.credential }
+        if let knownCredential, knownCredential.isEmpty || text.contains(knownCredential) { throw Failure.credential }
         guard Data(text.utf8) != Data(snapshot.text.utf8) else { throw Failure.unchanged }
         self.snapshot = snapshot
         self.replacement = text
