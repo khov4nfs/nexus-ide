@@ -26,6 +26,7 @@ struct LocalToolsView: View {
     @State private var frozenInput = ""
     @State private var token = ""
     @State private var workbenchShown = false
+    @State private var terminalShown = false
     @State private var webStatus = ""
     @State private var manifestPicker = false
     @State private var manifestName = ""
@@ -93,6 +94,7 @@ struct LocalToolsView: View {
                                 if LocalRunner.input(wire) { line = "" }
                                 else { report = "Input not accepted" }
                             }.disabled(!ready || line.isEmpty || line.utf8.count > 1023 || line.utf8.contains(0))
+                            Button("Open interactive ANSI terminal") { terminalShown = true }.disabled(!ready)
                             Button("Send Ctrl-C") { _ = LocalRunner.input("\u{3}") }.disabled(!ready)
                             Button("Resize to 111 × 33") { if !LocalRunner.resize() { report = "Resize not accepted" } }.disabled(!ready)
                         } else {
@@ -151,6 +153,9 @@ struct LocalToolsView: View {
                     output = p.output
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
+            }
+            .fullScreenCover(isPresented: $terminalShown) {
+                LiveTerminalScreen()
             }
             .sheet(isPresented: $workbenchShown) {
                 NavigationStack {

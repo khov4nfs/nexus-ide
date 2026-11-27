@@ -38,3 +38,5 @@ See [architecture](docs/architecture.md), [integration gates](docs/runtime-gates
 The embedded runtime is not a security sandbox. Agent uses an explicitly consented credential and selected context only; no unrestricted native file/tool grants. One guest boot per app process. Do not use production secrets or private code in the lab. Licensing, App Store eligibility, original AGY authentication, OpenVSCode compatibility, full VM/Docker and physical-device validation remain release gates.
 
 See [device hardening and Google sign-in candidate](docs/device-hardening.md) for device evidence and remaining acceptance gates.
+
+[Version 0.6.0 release candidate and acceptance gates](docs/production-acceptance.md).

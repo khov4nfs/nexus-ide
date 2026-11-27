@@ -40,5 +40,6 @@ stage=$(mktemp -d RuntimeAssets/ubuntu-stage.XXXXXX)
 trap 'rm -rf "$stage"' EXIT
 cp -a "$source" "$stage/ubuntu-fs"
 mv "$stage/ubuntu-fs" RuntimeAssets/ubuntu-fs
+bash scripts/prepare-swiftterm.sh
 xcodegen generate --spec project-glibc.yml
 echo "Generated local Ubuntu Lab target. Do not distribute AGY-containing builds."

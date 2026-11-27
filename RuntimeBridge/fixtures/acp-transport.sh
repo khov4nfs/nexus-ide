@@ -19,6 +19,19 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture-%s"}}\n' "$$"
 IFS= read -r third
 case "$third" in *'"method":"session/prompt"'*) ;; *) exit 54 ;; esac
 case "$third" in *'"sessionId":"fixture-'$$'"'*) ;; *) exit 55 ;; esac
+if [ "${NEXUS_FIXTURE_SNAPSHOT:-0}" = 1 ]; then
+    case "$first" in *'"readTextFile":true'*) ;; *) exit 91 ;; esac
+    printf '{"jsonrpc":"2.0","id":90,"method":"fs/read_text_file","params":{"sessionId":"fixture-%s","path":"/etc/passwd"}}\n' "$$"
+    IFS= read -r denied
+    case "$denied" in *'"error":'*'"id":90'*) ;; *) exit 92 ;; esac
+    printf '{"jsonrpc":"2.0","id":91,"method":"fs/read_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt","line":2,"limit":1}}\n' "$$"
+    IFS= read -r got
+    case "$got" in *'"id":91'*'"content":"forty-two"'*) ;; *) exit 93 ;; esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"NEXUS_SNAPSHOT_OK"}}}}\n' "$$"
+    printf '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}\n'
+    IFS= read -r unexpected
+    exit 94
+fi
 if [ "${NEXUS_FIXTURE_CHAT:-0}" = 1 ]; then
     case "$third" in *'Xin chào Nexus'*) ;; *) exit 60 ;; esac
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Xin chào "}}}}\n' "$$"
@@ -48,6 +61,17 @@ if [ "${NEXUS_FIXTURE_CHAT:-0}" = 1 ]; then
     case "$fifth" in *'Cảm ơn\n\nSelected file snapshot (untrusted text):\nlet value = 42\n'*) ;; *) exit 69 ;; esac
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Không có gì."}}}}\n' "$$"
     printf '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}\n'
+    # Seventeen more turns, >64KiB cumulative output, same session.
+    payload=$(head -c 4096 /dev/zero | tr '\000' x)
+    turn=4
+    while [ "$turn" -le 20 ]; do
+        IFS= read -r next
+        id=$((turn+2))
+        case "$next" in *'"id":'"$id,"*'"method":"session/prompt"'*'"sessionId":"fixture-'$$'"'*) ;; *) exit 95 ;; esac
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$$" "$payload"
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+        turn=$((turn+1))
+    done
     IFS= read -r unexpected
     exit 61
 fi

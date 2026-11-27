@@ -28,9 +28,11 @@ char *nexus_acp_connection_status(void);
 char *nexus_acp_new_session(const char *session_new_request);
 // Explicit model-network consent; one fixed prompt, no arbitrary content.
 char *nexus_acp_prompt_probe(void);
-// Up to three consented text turns (max 1024 UTF-8 bytes each); no project mount.
+// Up to twenty consented text turns (max 1024 UTF-8 bytes each); no project mount.
 // Smoke test and chat are mutually exclusive within one boot.
 char *nexus_acp_chat(const char *text);
+// Optional read-only capability: explicit one-turn virtual snapshot, no native path.
+char *nexus_acp_chat_snapshot(const char *text,const char *content);
 // Concurrent-safe status and cancel request; does not wait for completion.
 char *nexus_acp_prompt_progress(void);
 char *nexus_acp_cancel_prompt(void);
@@ -40,6 +42,9 @@ char *nexus_acp_close(void);
 char *nexus_local_run(const char *rootfs_data_path, uint8_t mode, const char *input);
 char *nexus_local_progress(void);
 char *nexus_local_input(const char *input);
+// Bounded raw bytes, monotonic absolute cursor, explicit gap on truncation.
+char *nexus_local_terminal_delta(uint64_t cursor);
+char *nexus_local_terminal_input(const char *base64_bytes);
 char *nexus_local_resize(uint16_t cols, uint16_t rows);
 char *nexus_local_stop(void);
 void nexus_guest_free(char *result);

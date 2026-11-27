@@ -25,7 +25,7 @@ jobs:
         run: python3 scripts/test-package-ipa.py
       - name: Build native Release for physical ARM64 iPhone
         run: |
-          xcodebuild -project NexusIDE.xcodeproj -scheme NexusIDE -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-native" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.5.2 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
+          xcodebuild -project NexusIDE.xcodeproj -scheme NexusIDE -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-native" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.6.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
           python3 scripts/package-ipa.py --app "$RUNNER_TEMP/nexus-native/Build/Products/Release-iphoneos/NexusIDE.app" --output "$RUNNER_TEMP/nexus-native-ipa" --variant native --commit "$GITHUB_SHA"
       - name: Upload native iPhone test IPA (unsigned)
         uses: actions/upload-artifact@v4

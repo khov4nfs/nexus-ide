@@ -38,7 +38,8 @@ if chat:
     require(r["followupProgress"].get("permissionDenials") == 1 and r["followupProgress"].get("toolUpdates") == 2, "Missing deny-only tool exchange evidence")
     require(r["thirdProgress"].get("permissionDenials") == 0 and r["thirdProgress"].get("toolUpdates") == 0, "Stale permission counters")
     require("Untrusted fixture title" not in json.dumps(r) and "opaque-deny" not in json.dumps(r), "Raw tool metadata leaked into evidence")
-    require(r["overLimit"].get("ok") is False and r["overLimit"].get("active") is True, "Fourth turn not rejected")
+    require(r.get("extraTurns") == 17, "Missing extended conversation evidence")
+    require(r["overLimit"].get("ok") is False and r["overLimit"].get("active") is True, "Twenty-first turn not rejected")
 elif cancel:
     require(r.get("progressSeen") is True and r["cancelRequest"].get("ok") is True and r["duplicateCancel"].get("ok") is False, "Missing live progress or cancel request")
     require(p.get("cancelled") is True and p.get("stopReason") == "cancelled" and p.get("chunkCount") == 1 and "marker" not in p, "Missing cancellation acknowledgement")

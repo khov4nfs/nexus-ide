@@ -16,7 +16,7 @@ const IDLE: Duration = Duration::from_secs(180);
 const REPLY: Duration = Duration::from_secs(300);
 const NEW_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\",\"mcpServers\":[]}}\n";
 type Reply = SyncSender<Value>;
-enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Reply), Close(Reply) }
+enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Option<String>, Reply), Close(Reply) }
 static ACTIVE: Mutex<Option<SyncSender<Command>>> = Mutex::new(None);
 static WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct ActiveGuard;
@@ -158,7 +158,7 @@ fn take_cancel(session: &str) -> Option<Vec<u8>> {
     Some(format!("{frame}\n").into_bytes())
 }
 
-const MAX_CHAT_TURNS: i64 = 3;
+const MAX_CHAT_TURNS: i64 = 20;
 const CHAT_INPUT_LIMIT: usize = 1024;
 const CHAT_OUTPUT_LIMIT: usize = 8192;
 
@@ -225,6 +225,27 @@ fn permission_reply(frame: &Value, session: &str, cancelled: bool) -> Result<Val
     Ok(json!({"jsonrpc":"2.0","id":id,"result":{"outcome":outcome}}))
 }
 
+const SNAPSHOT_PATH:&str="/nexus-selected.txt";
+fn valid_snapshot(s:&str)->bool {
+    !s.trim().is_empty() && s.len()<=768 && s.chars().all(|c| !c.is_control() || c=='\n' || c=='\t')
+}
+// Never opens a filesystem path. Only serves immutable bytes explicitly
+// provided by the user for the current turn, and only for one virtual path.
+fn read_snapshot_reply(frame:&Value,session:&str,snapshot:Option<&str>)->Result<Value,String> {
+    if frame["jsonrpc"]!="2.0" || frame["method"]!="fs/read_text_file" ||
+        frame.get("result").is_some() || frame.get("error").is_some() {return Err("Invalid read request".into());}
+    let id=frame.get("id").filter(|v|v.as_i64().is_some() || v.as_str().is_some_and(|s|!s.is_empty()&&s.len()<=256)).ok_or("Invalid read ID")?;
+    let deny=||json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"No matching snapshot grant"}});
+    let params=&frame["params"];
+    if params["sessionId"]!=session || params["path"]!=SNAPSHOT_PATH {return Ok(deny());}
+    let Some(text)=snapshot.filter(|s|valid_snapshot(s)) else {return Ok(deny());};
+    let line=match params.get("line") {None|Some(Value::Null)=>1,Some(v)=>match v.as_u64(){Some(n) if n>=1 && n<=769=>n as usize,_=>return Ok(deny())}};
+    let limit=match params.get("limit") {None|Some(Value::Null)=>769,Some(v)=>match v.as_u64(){Some(n) if n>=1 && n<=769=>n as usize,_=>return Ok(deny())}};
+    let content=if line==1 && params.get("limit").is_none() {text.to_owned()} else {
+        text.split('\n').skip(line-1).take(limit).collect::<Vec<_>>().join("\n")
+    };
+    Ok(json!({"jsonrpc":"2.0","id":id,"result":{"content":content}}))
+}
 #[derive(Default)]
 struct PromptEvidence {
     text: String,
@@ -349,6 +370,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     if matches!(&mode, Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_CHAT").as_deref() == Ok("1") {
         agent_env.insert("NEXUS_FIXTURE_CHAT".into(), "1".into());
     }
+    #[cfg(test)]
+    if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_SNAPSHOT").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_SNAPSHOT".into(),"1".into());}
     opts.envp = Some(agent_env.into_iter().collect());
     opts.pipe_stdin = true;
     let session = match guest.spawn(opts) {
@@ -358,6 +381,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
         }
     };
     let mut exchange = ACPExchange::new(session);
+    let snapshot_capability=process_probe::snapshot_initialize_request(&request);
     let init = rt.block_on(exchange.request(&request, 1));
     let response = match init {
         Ok(frame) => match &mode {
@@ -425,7 +449,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     }
                 }
             }
-            Ok(Command::Prompt(chat, reply)) => {
+            Ok(Command::Prompt(chat, snapshot, reply)) => {
                 let Some(id) = session_id.as_deref() else {
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Create a session first"}));
                     continue;
@@ -442,6 +466,11 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Invalid chat input or credential detected"}));
                     continue;
                 }
+                if snapshot.as_ref().is_some_and(|s| !snapshot_capability || chat.is_none() ||
+                    !valid_snapshot(s) || s.contains(key)) {
+                    let _=reply.send(json!({"ok":false,"active":true,"error":"Snapshot grant unavailable or invalid"}));
+                    continue;
+                }
                 let is_chat = chat.is_some();
                 let text = chat.as_deref().unwrap_or(SMOKE_PROMPT);
                 turns += 1;
@@ -454,6 +483,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                 let progress = ProgressGuard::begin(response_id);
                 let mut cancel_taken = false;
                 let mut permission_ids = std::collections::HashSet::new();
+                let mut snapshot_reads=0usize;
                 let result = rt.block_on(exchange.request_controlled(wire.as_bytes(), response_id,
                     |frame| {
                         evidence.update(frame, id)?;
@@ -482,7 +512,12 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                             return Err("Permission request limit exceeded".into());
                         }
                         let mut p = PROGRESS.lock().map_err(|_| "Permission status unavailable")?;
-                        let response = permission_reply(frame, id, p.cancel_requested)?;
+                        let response = if frame["method"]=="fs/read_text_file" && snapshot_capability {
+                            let granted=if p.cancel_requested || snapshot_reads>=4 {None} else {snapshot.as_deref()};
+                            let reply=read_snapshot_reply(frame,id,granted)?;
+                            if reply.get("result").is_some() {snapshot_reads+=1;}
+                            reply
+                        } else {permission_reply(frame, id, p.cancel_requested)?};
                         if !permission_ids.insert(response["id"].to_string()) {
                             return Err("Duplicate permission request ID".into());
                         }
@@ -508,7 +543,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         .is_ok_and(|s| !s.trim().is_empty()));
                 if chat_success {
                     if reply.send(json!({"ok":true,"active":true,"chatCompleted":true,
-                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn"})).is_err() {
+                        "responseId":response_id,"chunkCount":evidence.chunks,"stopReason":"end_turn","snapshotReads":snapshot_reads})).is_err() {
                         break None;
                     }
                     continue;
@@ -543,7 +578,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
 fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, google: bool) -> Value {
     if google && key.is_some() { return failure("Choose one authentication method"); }
     if key.as_deref().is_some_and(|s| !valid_key(s)) { return failure("Invalid credential shape"); }
-    if !process_probe::valid_initialize_request(&request) {
+    if !process_probe::valid_initialize_request(&request) && !process_probe::snapshot_initialize_request(&request) {
         return failure("Invalid initialize request");
     }
     if let Mode::Agy(sha) = &mode {
@@ -571,13 +606,13 @@ fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, googl
     }
 }
 
-enum Action { New(Vec<u8>), Prompt, Chat(String), Close }
+enum Action { New(Vec<u8>), Prompt, Chat(String), Snapshot(String,String), Close }
 
 fn command(action: Action) -> Value {
     let Ok(mut slot) = ACTIVE.lock() else { return failure("Connection lock failed"); };
     let Some(tx) = slot.as_ref() else { return failure("No active connection"); };
     let (reply, wait) = mpsc::sync_channel(1);
-    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(None, reply), Action::Chat(text) => Command::Prompt(Some(text), reply), Action::Close => Command::Close(reply) };
+    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(None, None, reply), Action::Chat(text) => Command::Prompt(Some(text), None, reply), Action::Snapshot(text,content) => Command::Prompt(Some(text),Some(content),reply), Action::Close => Command::Close(reply) };
     if tx.send(message).is_err() {
         *slot = None; return failure("Connection stopped or idle timeout");
     }
@@ -674,6 +709,17 @@ pub unsafe extern "C" fn nexus_acp_chat(text: *const c_char) -> *mut c_char {
     })
 }
 
+/// # Safety
+/// Both arguments are NUL-terminated UTF-8; caller must obtain explicit consent
+/// to share the selected snapshot with the agent and model on this turn only.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_acp_chat_snapshot(text:*const c_char,content:*const c_char)->*mut c_char {
+    ffi_result(||match (read_arg(text),read_arg(content)) {
+        (Some(t),Some(c)) if valid_chat(&t)&&valid_snapshot(&c)=>command(Action::Snapshot(t,c)),
+        _=>failure("Invalid snapshot request"),
+    })
+}
+
 // These two functions do not acquire the blocking command lock.
 #[no_mangle]
 pub extern "C" fn nexus_acp_prompt_progress() -> *mut c_char {
@@ -693,6 +739,20 @@ pub extern "C" fn nexus_acp_close() -> *mut c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn virtual_read_scope_and_line_bounds() {
+        let mut f=json!({"jsonrpc":"2.0","id":77,"method":"fs/read_text_file","params":{"sessionId":"s","path":SNAPSHOT_PATH,"line":2,"limit":1}});
+        assert_eq!(read_snapshot_reply(&f,"s",Some("one\nhai\nthree")).unwrap()["result"]["content"],"hai");
+        assert!(read_snapshot_reply(&f,"s",None).unwrap().get("error").is_some());
+        assert!(read_snapshot_reply(&f,"other",Some("one")).unwrap().get("error").is_some());
+        f["params"]["path"]=json!("/etc/passwd");
+        assert!(read_snapshot_reply(&f,"s",Some("one")).unwrap().get("error").is_some());
+        f["params"]["path"]=json!(SNAPSHOT_PATH);
+        f["params"]["line"]=json!(0);
+        assert!(read_snapshot_reply(&f,"s",Some("one")).unwrap().get("error").is_some());
+        f["method"]=json!("fs/write_text_file");
+        assert!(read_snapshot_reply(&f,"s",Some("one")).is_err());
+    }
     #[test]
     fn restricted_request_and_session_shape() {
         assert!(valid_key("NEXUS_TEST_ONLY_NOT_A_REAL_KEY"));
@@ -772,6 +832,25 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fresh Ubuntu fakefs; synthetic ACP snapshot peer only"]
+    fn real_snapshot_read_transport() {
+        let path=std::env::var_os("NEXUS_ACP_ROOTFS").expect("rootfs");
+        let file=std::env::var_os("NEXUS_ACP_EVIDENCE").expect("evidence");
+        let mut req:Value=serde_json::from_slice(process_probe::AGY_INITIALIZE_REQUEST).unwrap();
+        req["params"]["clientCapabilities"]=json!({"fs":{"readTextFile":true,"writeTextFile":false}});
+        let init=start(PathBuf::from(path),Mode::Fixture,format!("{req}\n").into_bytes(),Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()),false);
+        let new=command(Action::New(NEW_REQUEST.to_vec()));
+        let prompt=command(Action::Snapshot("Read /nexus-selected.txt".into(),"one\nforty-two\nthree".into()));
+        let response=prompt_progress()["text"]=="NEXUS_SNAPSHOT_OK";
+        let close=command(Action::Close);
+        let evidence=json!({"ok":init["ok"]==true && new["ok"]==true && prompt["chatCompleted"]==true &&
+            prompt["snapshotReads"]==1 && response && close["shutdownClean"]==true,
+            "fixtureOnly":true,"scopeVerified":response,"snapshotReads":prompt["snapshotReads"],"shutdownClean":close["shutdownClean"]});
+        std::fs::write(file,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        println!("{evidence}");
+        assert_eq!(evidence["ok"],true);
+    }
+    #[test]
     #[ignore = "requires separate fresh Ubuntu fakefs; synthetic Google login only"]
     fn real_google_login_transport() {
         let path=std::env::var_os("NEXUS_GOOGLE_ROOTFS").expect("rootfs");
@@ -840,15 +919,23 @@ mod tests {
         };
         let finished = prompt_progress();
         let duplicate_prompt = command(Action::Prompt);
-        let (followup, followup_progress, third, third_progress, over_limit) = if chat_mode {
+        let (followup, followup_progress, third, third_progress, extra_turns, over_limit) = if chat_mode {
             let second = command(Action::Chat("Bạn nhớ lời chào không?".into()));
             let second_progress = prompt_progress();
             let third = command(Action::Chat("Cảm ơn\n\nSelected file snapshot (untrusted text):\nlet value = 42\n".into()));
             let third_progress = prompt_progress();
-            let over_limit = command(Action::Chat("Fourth turn must be rejected".into()));
-            (second, second_progress, third, third_progress, over_limit)
+            let mut extra=0;
+            for turn in 4..=MAX_CHAT_TURNS {
+                let r=command(Action::Chat(format!("Fixture turn {turn}")));
+                let progress=prompt_progress();
+                if r["ok"]!=true || r["responseId"]!=turn+2 || progress["responseId"]!=turn+2 ||
+                    progress["text"].as_str().map(str::len)!=Some(4096) {break;}
+                extra+=1;
+            }
+            let over_limit = command(Action::Chat("Twenty-first turn must be rejected".into()));
+            (second, second_progress, third, third_progress, extra, over_limit)
         } else {
-            (Value::Null, Value::Null, Value::Null, Value::Null, Value::Null)
+            (Value::Null, Value::Null, Value::Null, Value::Null, 0, Value::Null)
         };
         let close = command(Action::Close);
         let after_close = command(Action::New(NEW_REQUEST.to_vec()));
@@ -866,7 +953,7 @@ mod tests {
                 third["ok"] == true && third["chatCompleted"] == true && third["responseId"] == 5 &&
                 third_progress["responseId"] == 5 && third_progress["text"] == "Không có gì." &&
                 third_progress["permissionDenials"] == 0 && third_progress["toolUpdates"] == 0 &&
-                over_limit["ok"] == false && over_limit["active"] == true
+                extra_turns==MAX_CHAT_TURNS-3 && over_limit["ok"] == false && over_limit["active"] == true
             } else if cancel_mode {
                 progress_seen && cancel_reply["ok"] == true && duplicate_cancel["ok"] == false &&
                 prompt["cancelled"] == true && prompt["stopReason"] == "cancelled" && prompt["chunkCount"] == 1
@@ -878,7 +965,7 @@ mod tests {
             "duplicate":duplicate,"beforeSession":before_session,"prompt":prompt,"duplicatePrompt":duplicate_prompt,"close":close,"afterClose":after_close,
             "cancelMode":cancel_mode,"chatMode":chat_mode,"progressSeen":progress_seen,"cancelRequest":cancel_reply,
             "duplicateCancel":duplicate_cancel,"idleCancel":idle_cancel,"finishedProgress":finished,
-            "followup":followup,"followupProgress":followup_progress,"third":third,"thirdProgress":third_progress,"overLimit":over_limit});
+            "followup":followup,"followupProgress":followup_progress,"third":third,"thirdProgress":third_progress,"extraTurns":extra_turns,"overLimit":over_limit});
         std::fs::write(evidence, serde_json::to_vec_pretty(&report).unwrap()).expect("completed evidence");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         assert!(ok, "{report}");
