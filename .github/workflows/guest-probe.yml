@@ -17,6 +17,7 @@ on:
       - 'scripts/stage-ubuntu-device.sh'
       - 'project-glibc.yml'
       - 'App/UbuntuLabApp.swift'
+      - 'App/NexusApp.swift'
       - 'App/GeminiKeychain.swift'
       - 'project-guest.yml'
       - 'App/GuestProbeView.swift'
