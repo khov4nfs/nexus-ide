@@ -265,7 +265,7 @@ jobs:
         env:
           VARIANT: ${{ inputs.variant || 'ubuntu' }}
         run: |
-          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.5.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
+          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.5.1 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
           python3 scripts/package-ipa.py --app "$RUNNER_TEMP/nexus-integrated/Build/Products/Release-iphoneos/NexusIDEUbuntuLab.app" --output "$RUNNER_TEMP/nexus-integrated-ipa" --variant "$VARIANT" --commit "$GITHUB_SHA"
       - name: Upload integrated unsigned IPA only after owner license review
         if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.license_reviewed
