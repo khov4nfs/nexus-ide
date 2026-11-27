@@ -72,3 +72,41 @@ extension CoreTests {
         XCTAssertEqual(listed, ["src/main.js"])
     }
 }
+
+extension CoreTests {
+    func testWorkspaceSnapshotApplyAndConflict() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let w = try Workspace(root: root)
+        try await w.write("note.txt", text: "Tiếng Việt\n")
+        let snap = try await w.snapshot("note.txt")
+        try await w.apply(snap, replacement: "guest edit\n")
+        let applied = try await w.read("note.txt")
+        XCTAssertEqual(applied, "guest edit\n")
+        do {
+            try await w.apply(snap, replacement: "stale")
+            XCTFail("stale snapshot accepted")
+        } catch { XCTAssertEqual(error as? WorkspaceError, .conflict) }
+        let retained = try await w.read("note.txt")
+        XCTAssertEqual(retained, "guest edit\n")
+    }
+
+    func testWorkspaceSnapshotRejectsDifferentRootAndByteConflict() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let a = try Workspace(root: root.appendingPathComponent("a"))
+        let b = try Workspace(root: root.appendingPathComponent("b"))
+        try await a.write("note.txt", text: "\u{00e9}")
+        try await b.write("note.txt", text: "\u{00e9}")
+        let snap = try await a.snapshot("note.txt")
+        do {
+            try await b.apply(snap, replacement: "wrong root")
+            XCTFail("cross-root snapshot accepted")
+        } catch { XCTAssertEqual(error as? WorkspaceError, .outsideWorkspace) }
+        try await a.write("note.txt", text: "e\u{0301}")
+        do {
+            try await a.apply(snap, replacement: "wrong bytes")
+            XCTFail("canonically equivalent but byte-different text accepted")
+        } catch { XCTAssertEqual(error as? WorkspaceError, .conflict) }
+    }
+}

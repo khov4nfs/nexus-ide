@@ -52,8 +52,8 @@ struct GuestProbeView: View {
 }
 
 #if NEXUS_EMBEDDED_LINUX && os(iOS) && !targetEnvironment(simulator)
-private enum GuestProbeRunner {
-    static func run(packages: Bool, toolchains: Bool) -> String {
+enum GuestProbeRunner {
+    static func run(packages: Bool, toolchains: Bool, workspaceText: String? = nil) -> String {
         do {
             let fm = FileManager.default
             guard let bundled = Bundle.main.url(forResource: "fs", withExtension: nil) else {
@@ -64,7 +64,13 @@ private enum GuestProbeRunner {
             let fs = trial.appendingPathComponent("fs", isDirectory: true)
             try fm.copyItem(at: bundled, to: fs)
             let data = fs.appendingPathComponent("data", isDirectory: true)
-            guard let result = data.path.withCString({ toolchains ? nexus_guest_probe_toolchains($0) : (packages ? nexus_guest_probe_packages($0) : nexus_guest_probe($0)) }) else {
+            let pointer = data.path.withCString { path in
+                if let workspaceText {
+                    return workspaceText.withCString { nexus_guest_probe_workspace(path, $0) }
+                }
+                return toolchains ? nexus_guest_probe_toolchains(path) : (packages ? nexus_guest_probe_packages(path) : nexus_guest_probe(path))
+            }
+            guard let result = pointer else {
                 return "Guest bridge returned no report."
             }
             defer { nexus_guest_free(result) }

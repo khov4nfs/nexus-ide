@@ -1,9 +1,18 @@
 import SwiftUI
+import Foundation
 import NexusCore
 
 @main struct NexusApp: App {
     var body: some Scene { WindowGroup { IDEView() } }
 }
+
+#if NEXUS_EMBEDDED_LINUX && os(iOS) && !targetEnvironment(simulator)
+struct GuestEditPreview: Identifiable {
+    let id = UUID()
+    let snapshot: WorkspaceSnapshot
+    let replacement: String
+}
+#endif
 
 @MainActor final class IDEModel: ObservableObject {
     @Published var files: [String] = []
@@ -14,6 +23,10 @@ import NexusCore
     @Published var output = "Native utilities only: ls, cat, echo, pwd.\n"
     @Published var status = "Initializing workspace"
     @Published var ready = false
+#if NEXUS_EMBEDDED_LINUX && os(iOS) && !targetEnvironment(simulator)
+    @Published var guestPreview: GuestEditPreview?
+    @Published var guestBusy = false
+#endif
     private var workspace: Workspace?
     private var runtime: NativeRuntime?
 
@@ -45,6 +58,57 @@ import NexusCore
             try await workspace.write(name, text: ""); files = try await workspace.list(); newPath = ""; await open(name)
         } catch { status = String(describing: error) }
     }
+#if NEXUS_EMBEDDED_LINUX && os(iOS) && !targetEnvironment(simulator)
+    func previewGuestEdit(_ file: String) async {
+        guard let workspace, !guestBusy, path == file else { return }
+        guestBusy = true
+        defer { guestBusy = false }
+        do {
+            let snap = try await workspace.snapshot(file)
+            guard path == file, Data(source.utf8) == Data(snap.text.utf8) else {
+                status = "Save the file before sharing a snapshot."; return
+            }
+            guard snap.text.utf8.count <= 2048, !snap.text.utf8.contains(0) else {
+                status = "Guest text limit: 2048 UTF-8 bytes, no NUL."; return
+            }
+            status = "Running offline guest text roundtrip"
+            let raw = await Task.detached(priority: .userInitiated) {
+                GuestProbeRunner.run(packages: false, toolchains: false, workspaceText: snap.text)
+            }.value
+            guard let report = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+                  report["ok"] as? Bool == true, report["shutdownError"] is NSNull,
+                  let rows = report["checks"] as? [[String: Any]],
+                  let row = rows.first(where: { $0["name"] as? String == "workspace_roundtrip" }),
+                  row["passed"] as? Bool == true,
+                  let evidence = row["evidence"] as? [String: Any],
+                  let updated = evidence["stdout"] as? String,
+                  Data(updated.utf8) == Data((snap.text + "\n[Nexus guest workspace probe]\n").utf8) else {
+                status = "Guest preview failed. Restart app for another boot."; return
+            }
+            guestPreview = GuestEditPreview(snapshot: snap, replacement: updated)
+            status = "Guest edit ready for review"
+        } catch { status = String(describing: error) }
+    }
+
+    func applyGuestEdit(_ preview: GuestEditPreview) async {
+        guard let workspace, !guestBusy else { return }
+        guard path == preview.snapshot.path,
+              Data(source.utf8) == Data(preview.snapshot.text.utf8) else {
+            status = "Editor changed; guest edit not applied."; guestPreview = nil; return
+        }
+        guestBusy = true
+        defer { guestBusy = false }
+        do {
+            try await workspace.apply(preview.snapshot, replacement: preview.replacement)
+            if path == preview.snapshot.path,
+               Data(source.utf8) == Data(preview.snapshot.text.utf8) {
+                source = preview.replacement
+            }
+            status = "Applied guest text edit"
+        } catch { status = "Guest edit rejected: \(error)" }
+        guestPreview = nil
+    }
+#endif
     func run() async {
         guard let runtime else { return }
         let input = command
@@ -57,6 +121,9 @@ import NexusCore
 
 struct IDEView: View {
     @StateObject private var model = IDEModel()
+#if NEXUS_EMBEDDED_LINUX && os(iOS) && !targetEnvironment(simulator)
+    @State private var confirmGuestEdit = false
+#endif
     var body: some View {
         TabView {
             NavigationStack {
@@ -103,7 +170,43 @@ struct IDEView: View {
             .autocorrectionDisabled().textInputAutocapitalization(.never)
             .disabled(model.path != file)
             .navigationTitle(file).navigationBarTitleDisplayMode(.inline)
-            .toolbar { Button("Save") { Task { await model.save() } }.disabled(model.path != file) }
+            .toolbar {
+                Button("Save") { Task { await model.save() } }.disabled(model.path != file)
+#if NEXUS_EMBEDDED_LINUX && os(iOS) && !targetEnvironment(simulator)
+                Button("Guest preview") { confirmGuestEdit = true }
+                    .disabled(model.path != file || model.guestBusy)
+#endif
+            }
+#if NEXUS_EMBEDDED_LINUX && os(iOS) && !targetEnvironment(simulator)
+            .disabled(model.guestBusy)
+            .safeAreaInset(edge: .bottom) { Text(model.status).font(.caption).padding(6) }
+            .confirmationDialog("Send saved text to local Linux guest?", isPresented: $confirmGuestEdit) {
+                Button("Preview fixed offline edit") { Task { await model.previewGuestEdit(file) } }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Only this saved text (up to 2048 bytes) is copied into a disposable guest. No project mount or network. The emulator is not a security sandbox. One boot per app process. The fixed edit appends a marker; it does not execute your file.")
+            }
+            .sheet(item: $model.guestPreview) { preview in
+                NavigationStack {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Original").font(.headline)
+                            Text(preview.snapshot.text).textSelection(.enabled)
+                            Text("Proposed").font(.headline)
+                            Text(preview.replacement).textSelection(.enabled)
+                        }.font(.system(.body, design: .monospaced)).padding()
+                    }
+                    .navigationTitle("Review guest edit")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) { Button("Discard") { model.guestPreview = nil } }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Apply") { Task { await model.applyGuestEdit(preview) } }.disabled(model.guestBusy)
+                        }
+                    }
+                    .interactiveDismissDisabled(model.guestBusy)
+                }
+            }
+#endif
             .task { await model.open(file) }
     }
 }
