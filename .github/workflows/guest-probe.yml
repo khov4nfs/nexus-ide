@@ -294,6 +294,26 @@ jobs:
           name: acp-terminal-fixture-evidence
           path: ${{ runner.temp }}/nexus-terminal.json
           if-no-files-found: error
+      - name: Verify local PTY lifecycle hooks
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for phase in success failure main_failure; do
+            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-hooks-$phase"
+            export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-hooks-$phase/data"
+            export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-hooks-$phase.json"
+            export NEXUS_HOOK_PHASE="$phase"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_local_hooks -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["shutdownClean"] is True' "$NEXUS_LOCAL_EVIDENCE"
+          done
+      - name: Upload local hook evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-hook-evidence
+          path: ${{ runner.temp }}/nexus-hooks-*.json
+          if-no-files-found: error
       - name: Verify persisted guest across independent runtime processes
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"

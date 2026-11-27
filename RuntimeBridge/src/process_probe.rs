@@ -868,6 +868,29 @@ fn terminal_command_scope() {
     assert!(terminal_command("uname; cat /etc/passwd").is_none());
 }
 
+// Run only an explicitly reviewed local lifecycle hook, never an agent string.
+pub(crate) async fn local_hook(guest:&IshInstance,env:&HashMap<String,String>,command:&str)->bool {
+    if crate::local_jobs::stop_requested() {return false;}
+    let mut opts=shell(command,env);
+    opts.cwd=Some(Path::new("/tmp").to_path_buf());
+    opts.pipe_stdin=false;
+    let Ok(session)=guest.spawn(opts) else {return false;};
+    let mut capture=Capture::default();
+    let deadline=Instant::now()+Duration::from_secs(30);
+    let result:Result<(),String>=async {
+        while !capture.closed {
+            if crate::local_jobs::stop_requested() {return Err("Hook cancelled".into());}
+            capture.poll(&session,deadline).await?;
+        }
+        Ok(())
+    }.await;
+    if result.is_err() {
+        let _=session.terminate().await;
+        let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
+    }
+    result.is_ok() && capture.closed && capture.exited && capture.code==Some(0) && capture.signal.unwrap_or(0)==0 && !crate::local_jobs::stop_requested()
+}
+
 // User-initiated local jobs in a separate disposable Ubuntu boot. No host
 // workspace, native tool callbacks, provider credential or remote executor.
 pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,String>, command: &str, workbench: bool) -> Value {

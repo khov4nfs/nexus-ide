@@ -12,6 +12,10 @@ struct LocalToolsView: View {
     @State private var mode: UInt8 = 1
     @State private var keepGuest = false
     @State private var frozenKeep = false
+    @State private var enableHooks = false
+    @State private var beforeHook = ""
+    @State private var afterHook = ""
+    @State private var frozenHooks = false
     @State private var confirmReset = false
     @State private var command = "exec /bin/sh -i"
     @State private var toolName = ""
@@ -60,6 +64,14 @@ struct LocalToolsView: View {
                         Text(stagedWorkbench ? "Pinned workbench archive staged; runtime unverified." : "No workbench staged. See build instructions.")
                         Text("Separate guest workspace, not native Files. Token-protected loopback only.").font(.caption)
                     }
+                    if mode == 1 {
+                        Toggle("Run reviewed lifecycle hooks", isOn: $enableHooks).disabled(model.guestClaimed)
+                        if enableHooks {
+                            TextField("Before command (optional)", text: $beforeHook, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
+                            TextField("After successful command (optional)", text: $afterHook, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
+                            Text("Hooks execute automatically only within this confirmed PTY job. Each runs in its own guest process. No provider key; no hook on app launch or file save.").font(.caption)
+                        }
+                    }
                     if mode != 3 {
                         Toggle("Keep Linux files across launches", isOn: $keepGuest).disabled(model.guestClaimed)
                         Text("Local tools only; never shared with Agent. Unclean shutdown blocks reuse. Reset deletes saved Linux files, not native Files.").font(.caption)
@@ -68,7 +80,12 @@ struct LocalToolsView: View {
                     Button("Review and start local job") {
                         frozenKeep = keepGuest && mode != 3
                         frozenMode = mode
-                        if mode == 4 {
+                        frozenHooks = mode == 1 && enableHooks
+                        if frozenHooks {
+                            do {
+                                frozenInput = try LocalHookPlan(command: command, before: beforeHook, after: afterHook).wire()
+                            } catch { report = "Invalid or empty lifecycle hook plan"; return }
+                        } else if mode == 4 {
                             guard let args = try? JSONSerialization.jsonObject(with: Data(toolArguments.utf8)) as? [String: Any],
                                   let wire = try? JSONSerialization.data(withJSONObject: ["command":command,"name":toolName,"arguments":args],options:[.sortedKeys]),
                                   wire.count <= 8192, toolArguments.utf8.count <= 4096,
@@ -117,7 +134,7 @@ struct LocalToolsView: View {
                     Text(verbatim: report).font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
                 }
                 Section("Unavailable until verified") {
-                    Text("Manual MCP calls are separate from the agent. ACP native tool grants, automatic hooks, extension compatibility, additional agent harnesses and Docker VM remain disabled.")
+                    Text("Manual MCP calls and PTY lifecycle hooks are separate from the agent. Extension compatibility, additional agent harnesses and Docker VM remain unverified or disabled.")
                 }
             }
             .navigationTitle("Local tools")
@@ -142,9 +159,9 @@ struct LocalToolsView: View {
             } message: { Text("This permanently deletes the saved local-tools guest, including installed packages and guest files. Native editor files and Agent are separate.") }
             .confirmationDialog("Execute in local Linux?", isPresented: $confirm) {
                 Button("Start") { start() }
-                Button("Cancel", role: .cancel) { frozenInput = "" }
+                Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false }
             } message: {
-                Text(frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
             .task(id: running) {
                 while running && !Task.isCancelled {
@@ -178,7 +195,7 @@ struct LocalToolsView: View {
             input = generated
         } else { input = frozenInput }
         guard model.claimGuest() else { return }
-        let selectedMode = frozenMode
+        let selectedMode: UInt8 = frozenHooks ? 5 : frozenMode
         let persistent = frozenKeep
         running = true
         report = "Starting local guest"

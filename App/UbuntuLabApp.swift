@@ -54,7 +54,7 @@ struct UbuntuLabView: View {
     @State private var enableSnapshotWrite = false
     @State private var enableTerminal = false
     @State private var terminalChoice = ""
-    @State private var customTerminal = "[\"/usr/bin/printf\",\"%s\\n\",\"hello\"]"
+    @State private var customTerminal = #"["/usr/bin/printf","%s","hello"]"#
     @State private var pendingTerminal: String?
     @State private var snapshotReadThisTurn = false
     @State private var pendingReadContent: String?
