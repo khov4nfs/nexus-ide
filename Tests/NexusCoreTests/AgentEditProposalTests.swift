@@ -21,6 +21,21 @@ final class AgentEditProposalTests: XCTestCase {
         catch { XCTAssertEqual(error as? WorkspaceError, .conflict) }
     }
 
+    func testGoogleStagedProposalWithoutGeminiKey() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let w = try Workspace(root: root)
+        try await w.write("a.txt", text: "old")
+        let snap = try await w.snapshot("a.txt")
+        let p = try AgentEditProposal(snapshot: snap, googleStagedReplacement: "new", knownGeminiCredential: nil)
+        XCTAssertEqual(p.replacement, "new")
+        let before = try await w.read("a.txt")
+        XCTAssertEqual(before, "old")
+        XCTAssertThrowsError(try AgentEditProposal(snapshot: snap, googleStagedReplacement: nil, knownGeminiCredential: nil))
+        XCTAssertThrowsError(try AgentEditProposal(snapshot: snap, googleStagedReplacement: "secret", knownGeminiCredential: "secret"))
+        XCTAssertThrowsError(try AgentEditProposal(snapshot: snap, stagedReplacement: "new", credential: ""))
+    }
+
     func testProposalRejectsUntrustedFieldsAndDecodedCredential() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

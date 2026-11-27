@@ -176,7 +176,7 @@ struct UbuntuLabView: View {
                             TextField("Ask the agent", text: $chatInput, axis: .vertical)
                                 .lineLimit(2...6).disabled(running || smokeUsed || turnCount >= maxTurns)
                             Button("Attach saved editor file for edit") { attachEditor() }
-                                .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || model.path.isEmpty || model.reviewBusy || proposal != nil || useGoogle)
+                                .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || model.path.isEmpty || model.reviewBusy || proposal != nil || (useGoogle && !enableSnapshotWrite))
                             Button("Choose text file") { pickingContext = true }
                                 .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns)
                             if importingContext { ProgressView("Reading selected file") }
@@ -369,7 +369,7 @@ struct UbuntuLabView: View {
                 }
                 Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil; pendingTerminal = nil; terminalChoice = "" }
             } message: {
-                Text(pendingTerminal != nil ? "Allow this exact guest command once?\n" + Self.terminalDescription(pendingTerminal ?? "") + "\nIts output may be sent to the model. Commands may modify guest files, access guest credentials or use the network. No security sandbox." : pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Do not share secrets." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
+                Text(pendingTerminal != nil ? "Allow this exact guest command once?\n" + Self.terminalDescription(pendingTerminal ?? "") + "\nIts output may be sent to the model. Commands may modify guest files, access guest credentials or use the network. No security sandbox." : pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Google-mode edits filter the known login code, not all OAuth tokens. Do not share secrets; review the full replacement." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
             }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
@@ -413,7 +413,7 @@ struct UbuntuLabView: View {
     private func run(sha: String?, gemini: Bool = false, google: Bool = false) {
         guard !attempted, !importingAGY, model.claimGuest() else { return }
         let selected = sha == nil ? nil : importedAGY
-        let writeSnapshot = enableSnapshotWrite && gemini
+        let writeSnapshot = enableSnapshotWrite && (gemini || google)
         let readSnapshot = enableSnapshotRead || writeSnapshot
         let terminal = enableTerminal && gemini
         attempted = true
@@ -431,7 +431,7 @@ struct UbuntuLabView: View {
     }
 
     private func attachEditor() {
-        guard !running, !importingContext, active, created, proposal == nil else { return }
+        guard !running, !importingContext, active, created, proposal == nil, !useGoogle || enableSnapshotWrite else { return }
         importingContext = true
         fileContext = nil; editSnapshot = nil
         Task {
@@ -439,7 +439,7 @@ struct UbuntuLabView: View {
             do {
                 let snapshot = try await model.selectedSnapshot()
                 let context = try AgentFileContext(data: Data(snapshot.text.utf8))
-                guard let key = try GeminiKeychain.load(), !snapshot.text.contains(key) else {
+                guard try credentialAllows(snapshot.text) else {
                     contextStatus = "Credential detected or unavailable"; return
                 }
                 fileContext = context
@@ -502,10 +502,13 @@ struct UbuntuLabView: View {
             if let editSnapshot {
                 guard proposal == nil else { contextStatus = "Review or discard the previous proposal"; return }
                 if enableSnapshotWrite {
-                    guard useGemini, !chatInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, try credentialAllows(editSnapshot.text) else { contextStatus = "Credential detected"; return }
+                    guard (useGemini || useGoogle), !chatInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, try credentialAllows(editSnapshot.text) else { contextStatus = "Credential detected"; return }
                     wire = chatInput + "\nRead /nexus-selected.txt and stage one complete replacement via fs/write_text_file. Native user will review before applying."
                     pendingReadContent = editSnapshot.text
-                } else { wire = try AgentEditProposal.prompt(snapshot: editSnapshot, question: chatInput) }
+                } else {
+                    guard !useGoogle else { contextStatus = "Google mode requires staged ACP editing"; return }
+                    wire = try AgentEditProposal.prompt(snapshot: editSnapshot, question: chatInput)
+                }
             } else if enableSnapshotRead, snapshotReadThisTurn, let context = fileContext {
                 guard try credentialAllows(context.text) else { contextStatus = "Credential detected"; return }
                 wire = chatInput + "\nRead the selected text via fs/read_text_file at /nexus-selected.txt if needed."
@@ -578,10 +581,20 @@ struct UbuntuLabView: View {
                 transcript.append(ChatTurn(id: expectedID, user: display ?? chat, response: text,
                     status: matches ? result.status : "Turn failed or response mismatch"))
                 if let edit {
-                    if result.ok && matches && result.status == "Chat turn completed", let key = try? GeminiKeychain.load(),
-                       let candidate = try? (readContent != nil
-                           ? AgentEditProposal(snapshot: edit, stagedReplacement: result.stagedResponse, credential: key)
-                           : AgentEditProposal(snapshot: edit, response: text, credential: key)) {
+                    var candidate: AgentEditProposal?
+                    if result.ok && matches && result.status == "Chat turn completed", !cancelRequested {
+                        do {
+                            let key = try GeminiKeychain.load()
+                            if useGoogle && readContent != nil {
+                                candidate = try AgentEditProposal(snapshot: edit, googleStagedReplacement: result.stagedResponse, knownGeminiCredential: key)
+                            } else if let key {
+                                candidate = readContent != nil
+                                    ? try AgentEditProposal(snapshot: edit, stagedReplacement: result.stagedResponse, credential: key)
+                                    : try AgentEditProposal(snapshot: edit, response: text, credential: key)
+                            }
+                        } catch { candidate = nil }
+                    }
+                    if let candidate {
                         proposal = candidate
                         editStatus = "Untrusted proposal ready for explicit review"
                     } else { editStatus = "No valid complete replacement returned; nothing written" }

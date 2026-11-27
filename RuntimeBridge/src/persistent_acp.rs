@@ -392,6 +392,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_SNAPSHOT").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_SNAPSHOT".into(),"1".into());}
     #[cfg(test)]
     if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_TERMINAL").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_TERMINAL".into(),"1".into());}
+    #[cfg(test)]
+    if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_GOOGLE_EDIT").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_GOOGLE_EDIT".into(),"1".into());}
     opts.envp = Some(agent_env.into_iter().collect());
     opts.pipe_stdin = true;
     let session = match guest.spawn(opts) {
@@ -943,6 +945,34 @@ mod tests {
         println!("{evidence}");
         assert_eq!(evidence["ok"],true);
     }
+    #[test]
+    #[ignore = "requires fresh Ubuntu fakefs; synthetic Google login and staged ACP edit"]
+    fn real_google_edit_transport() {
+        let path=std::env::var_os("NEXUS_GOOGLE_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_GOOGLE_EVIDENCE").expect("evidence");
+        let mut req:Value=serde_json::from_slice(process_probe::AGY_INITIALIZE_REQUEST).unwrap();
+        req["params"]["clientCapabilities"]=json!({"fs":{"readTextFile":true,"writeTextFile":true}});
+        let worker=thread::spawn(move||start(PathBuf::from(path),Mode::Fixture,format!("{req}\n").into_bytes(),None,true));
+        let deadline=std::time::Instant::now()+Duration::from_secs(15);
+        let offered=loop {
+            if login_progress()["url"].as_str().is_some_and(|s| s.starts_with("https://accounts.google.com/o/oauth2/")) {break true;}
+            if worker.is_finished() || std::time::Instant::now()>=deadline {break false;}
+            thread::sleep(Duration::from_millis(20));
+        };
+        let submitted=submit_login_code("NEXUS_FIXTURE_AUTH_CODE".into());
+        if !offered || submitted["ok"]!=true {let _=cancel_login();}
+        let init=worker.join().expect("worker");
+        let new=command(Action::New(NEW_REQUEST.to_vec()));
+        let edit=command(Action::Edit("Review staged update".into(),"old".into()));
+        let verified=edit["chatCompleted"]==true && edit["stagedReplacement"]=="updated";
+        let close=command(Action::Close);
+        let evidence=json!({"ok":offered && submitted["ok"]==true && init["ok"]==true && init["credentialMode"]=="google-terminal-login" && new["sessionCreated"]==true && verified && close["shutdownClean"]==true,
+            "fixtureOnly":true,"googleStagedWriteVerified":verified,"shutdownClean":close["shutdownClean"]});
+        std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        println!("{evidence}");
+        assert_eq!(evidence["ok"],true);
+    }
+
     #[test]
     #[ignore = "requires separate fresh Ubuntu fakefs; synthetic Google login only"]
     fn real_google_login_transport() {

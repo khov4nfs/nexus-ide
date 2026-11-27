@@ -258,6 +258,27 @@ jobs:
           name: google-login-fixture-evidence
           path: ${{ runner.temp }}/nexus-google.json
           if-no-files-found: error
+      - name: Verify Google-mode ACP staged edit (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-google-edit-fs"
+          export NEXUS_GOOGLE_ROOTFS="$RUNNER_TEMP/nexus-google-edit-fs/data"
+          export NEXUS_GOOGLE_EVIDENCE="$RUNNER_TEMP/nexus-google-edit.json"
+          export NEXUS_ACP_TEST_GOOGLE_EDIT=1
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_google_edit_transport -- --ignored --nocapture --test-threads=1 >"$RUNNER_TEMP/nexus-google-edit-log" 2>&1 || { echo "Google edit fixture failed; raw log withheld"; exit 1; }
+          if grep -q NEXUS_FIXTURE_AUTH_CODE "$RUNNER_TEMP/nexus-google-edit-log"; then echo "Fixture code leaked"; exit 1; fi
+          cat "$RUNNER_TEMP/nexus-google-edit-log"
+          rm "$RUNNER_TEMP/nexus-google-edit-log"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","googleStagedWriteVerified","shutdownClean"])' "$NEXUS_GOOGLE_EVIDENCE"
+      - name: Upload Google staged edit evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: google-staged-edit-evidence
+          path: ${{ runner.temp }}/nexus-google-edit.json
+          if-no-files-found: error
       - name: Verify ACP virtual snapshot scope (synthetic peer)
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"

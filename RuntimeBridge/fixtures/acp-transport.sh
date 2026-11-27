@@ -19,6 +19,19 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture-%s"}}\n' "$$"
 IFS= read -r third
 case "$third" in *'"method":"session/prompt"'*) ;; *) exit 54 ;; esac
 case "$third" in *'"sessionId":"fixture-'$$'"'*) ;; *) exit 55 ;; esac
+if [ "${NEXUS_FIXTURE_GOOGLE_EDIT:-0}" = 1 ]; then
+    test "${NEXUS_FIXTURE_GOOGLE:-0}" = 1
+    case "$first" in *'"writeTextFile":true'*) ;; *) exit 111 ;; esac
+    printf '{"jsonrpc":"2.0","id":71,"method":"fs/write_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt","content":"NEXUS_FIXTURE_AUTH_CODE"}}\n' "$$"
+    IFS= read -r got
+    case "$got" in *'"error":'*'"id":71'*) ;; *) exit 112 ;; esac
+    printf '{"jsonrpc":"2.0","id":72,"method":"fs/write_text_file","params":{"sessionId":"fixture-%s","path":"/nexus-selected.txt","content":"updated"}}\n' "$$"
+    IFS= read -r got
+    case "$got" in *'"id":72'*'"result":{}'*) ;; *) exit 113 ;; esac
+    printf '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}\n'
+    IFS= read -r unexpected
+    exit 114
+fi
 if [ "${NEXUS_FIXTURE_TERMINAL:-0}" = 1 ]; then
     case "$first" in *'"terminal":true'*) ;; *) exit 101 ;; esac
     printf '{"jsonrpc":"2.0","id":80,"method":"terminal/create","params":{"sessionId":"fixture-%s","command":"uname","args":["-m"]}}\n' "$$"
