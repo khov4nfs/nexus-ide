@@ -121,6 +121,23 @@ fn parse_cli(input:&str)->Option<(String,String,String,Option<String>,Option<Nat
     }else{None};
     Some((kind.into(),digest.into(),action.into(),prompt,session))
 }
+pub(crate) struct LspInput {pub argv:Vec<String>,pub language:String,pub uri:String,pub text:String}
+fn parse_lsp(input:&str)->Option<LspInput>{
+    if input.len()>65536{return None;}
+    let v:Value=serde_json::from_str(input).ok()?;
+    if v.as_object()?.len()!=4{return None;}
+    let argv=v["argv"].as_array()?;
+    if !(1..=17).contains(&argv.len())||v["argv"].to_string().len()>2048{return None;}
+    let argv=argv.iter().map(|a|a.as_str().filter(|s|s.len()<=512&&!s.chars().any(char::is_control)).map(str::to_owned)).collect::<Option<Vec<_>>>()?;
+    let exe=argv.first()?;
+    if exe.len()>256||!exe.starts_with('/')||!exe[1..].split('/').all(|p|!p.is_empty()&&p!="."&&p!=".."&&p.bytes().all(|b|b.is_ascii_alphanumeric()||b"._+-".contains(&b))){return None;}
+    let language=v["language"].as_str()?;
+    let ext=v["extension"].as_str()?;
+    if language.is_empty()||language.len()>32||!language.bytes().all(|b|b.is_ascii_alphanumeric()||b"-_".contains(&b))||ext.is_empty()||ext.len()>12||!ext.bytes().all(|b|b.is_ascii_alphanumeric()){return None;}
+    let text=v["text"].as_str()?;
+    if text.len()>8192||text.contains('\0'){return None;}
+    Some(LspInput{argv,language:language.into(),uri:format!("file:///tmp/nexus-lsp.{ext}"),text:text.into()})
+}
 fn progress() -> Value {
     STATE.lock().map(|s| json!({"ok":true,"running":s.running,"ready":s.ready,"output":s.output,"stopRequested":s.stop,"agentWaiting":s.agent.as_ref().is_some_and(|a|a.waiting&&!s.stop),"agentTurns":s.agent.as_ref().map(|a|&a.turns),"agentHandle":s.agent.as_ref().and_then(|a|a.handle.as_deref())}))
         .unwrap_or_else(|_| fail("Local status unavailable"))
@@ -161,7 +178,8 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let hooks=if mode==5 {match parse_hooks(input) {Some(v)=>Some(v),None=>return fail("Invalid hook plan")}} else {None};
     let workbench=if mode==3 {match parse_workbench(input) {Some(v)=>Some(v),None=>return fail("Invalid workbench launch")}} else {None};
     let cli=if mode==6 {match parse_cli(input) {Some(v)=>Some(v),None=>return fail("Invalid CLI launch")}} else {None};
-    if !matches!(mode,1..=6) ||
+    let lsp=if mode==8 {match parse_lsp(input){Some(v)=>Some(v),None=>return fail("Invalid LSP snapshot request")}}else{None};
+    if !matches!(mode,1..=6|8) ||
         (matches!(mode,1|2) && !valid_command(input)) { return fail("Invalid local job"); }
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
@@ -188,6 +206,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         ("TERM".into(),if matches!(mode,1|5|6) {"xterm-256color".into()} else {"dumb".into()}),("NODE_OPTIONS".into(),"--jitless".into())]);
     let libc = rt.block_on(process_probe::glibc_compat(&guest,&env));
     let mut result = if libc["passed"] != true { fail("Ubuntu compatibility failed") }
+        else if let Some(request)=lsp.as_ref(){rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}
         else if let Some(plan)=hooks.as_ref() {
             let before=plan["before"].as_str();
             let after=plan["after"].as_str();
@@ -421,6 +440,31 @@ mod tests {
         let evidence=json!({"ok":ok,"fixtureOnly":true,"kind":kind,"phase":phase,"turnsCompleted":r["turnsCompleted"],"shutdownClean":clean});
         std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
         assert!(ok,"conversation fixture failed: {r}");
+    }
+    #[test]
+    fn lsp_input_bounds(){
+        let valid=json!({"argv":["/usr/bin/server","--stdio"],"language":"python","extension":"py","text":"x = 1"});
+        assert!(parse_lsp(&valid.to_string()).is_some());
+        let mut v=valid.clone();v["argv"]=json!(["../../server"]);assert!(parse_lsp(&v.to_string()).is_none());
+        let mut v=valid.clone();v["extension"]=json!("../py");assert!(parse_lsp(&v.to_string()).is_none());
+        let mut v=valid.clone();v["text"]=json!("x".repeat(8193));assert!(parse_lsp(&v.to_string()).is_none());
+    }
+    #[test]
+    #[ignore = "requires fresh Ubuntu fakefs; synthetic LSP Content-Length peer"]
+    fn real_lsp_diagnostic_fixture(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_LSP_PHASE").expect("phase");
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin".into()),("HOME".into(),"/root".into()),("NEXUS_LSP_PHASE".into(),phase.clone())]);
+        let input=parse_lsp(&json!({"argv":["/usr/bin/server"],"language":"python","extension":"py","text":"x = 1\n"}).to_string()).unwrap();
+        let r=rt.block_on(process_probe::lsp_diagnostics(&guest,&env,&input,true));
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        let ok=if phase=="success"{r["ok"]==true&&r["diagnostics"][0]["message"]=="fixture diagnostic"&&r["diagnostics"][0]["range"]["end"]["character"]==1}else{r["ok"]==false&&r.get("diagnostics").is_none()};
+        let evidence=json!({"ok":ok&&clean,"fixtureOnly":true,"phase":phase,"shutdownClean":clean});
+        std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        assert!(ok&&clean,"LSP fixture failed: {r}");
     }
     #[test]
     fn native_session_request_bounds(){

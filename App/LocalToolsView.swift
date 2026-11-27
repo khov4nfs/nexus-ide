@@ -48,6 +48,10 @@ struct LocalToolsView: View {
     @State private var cliImport: LocalCLIImport?
     @State private var frozenCLI: LocalCLIImport?
     @State private var importingCLI = false
+    @State private var lspArgv = ""
+    @State private var lspLanguage = "python"
+    @State private var lspSnapshot: WorkspaceSnapshot?
+    @State private var lspLoading = false
     @State private var cliAction = "shell"
     @State private var cliPrompt = ""
     @State private var cliResume = ""
@@ -74,8 +78,23 @@ struct LocalToolsView: View {
                         Text("MCP manual call").tag(UInt8(4))
                         Text("OpenVSCode").tag(UInt8(3))
                         Text("Original agent CLI").tag(UInt8(6))
+                        Text("Native LSP diagnostics").tag(UInt8(8))
                     }.disabled(model.guestClaimed)
-                    if mode == 6 {
+                    if mode == 8 {
+                        TextField("Reviewed absolute guest argv (JSON array)", text: $lspArgv, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
+                        TextField("LSP language ID", text: $lspLanguage).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
+                        Button("Attach saved editor snapshot") {
+                            lspLoading = true
+                            Task {
+                                defer { lspLoading = false }
+                                do { let snapshot = try await model.selectedSnapshot(); guard snapshot.text.utf8.count <= 8192 else { throw WorkspaceError.tooLarge }; lspSnapshot = snapshot; report = "Snapshot selected; not yet sent" }
+                                catch { lspSnapshot = nil; report = "Save and select an editor file, max 8192 bytes" }
+                            }
+                        }.disabled(model.guestClaimed || lspLoading || model.path.isEmpty)
+                        if let snapshot = lspSnapshot { Text(snapshot.path + " · " + String(snapshot.text.utf8.count) + " bytes").font(.caption); Button("Remove snapshot") { lspSnapshot = nil }.disabled(model.guestClaimed) }
+                        Text("One local stdio language server already installed in the guest. Snapshot-only push diagnostics, UTF-16 positions; no native file path, workspace mount or edits. Server may use network or retain the snapshot.").font(.caption)
+                        Toggle("Use saved local-tools guest", isOn: $keepGuest).disabled(model.guestClaimed)
+                    } else if mode == 6 {
                         Picker("Official executable", selection: $cliKind) {
                             Text("Codex CLI").tag("codex")
                             Text("Claude Code").tag("claude")
@@ -159,7 +178,12 @@ struct LocalToolsView: View {
                         frozenVSIX = mode == 3 ? selectedVSIX : nil
                         frozenCLI = mode == 6 ? cliImport : nil
                         frozenHooks = mode == 1 && enableHooks
-                        if mode == 6 {
+                        if mode == 8 {
+                            guard let snapshot = lspSnapshot, let approved = try? ACPTerminalApproval.parse(Data(lspArgv.utf8)) else { report = "Select a saved snapshot and valid argv"; return }
+                            let ext = (snapshot.path as NSString).pathExtension.lowercased()
+                            guard let wire = try? JSONSerialization.data(withJSONObject: ["argv":approved.arguments,"language":lspLanguage,"extension":ext,"text":snapshot.text], options: [.sortedKeys]), wire.count <= 65536 else { report = "Invalid LSP snapshot"; return }
+                            frozenInput = String(decoding: wire, as: UTF8.self)
+                        } else if mode == 6 {
                             guard let frozenCLI else { report = "Select reviewed executable"; return }
                             var request: [String: Any] = ["kind":frozenCLI.kind,"sha256":frozenCLI.digest,"action":cliAction]
                             if ["appServerChat","claudeChat","codexSession","claudeSession"].contains(cliAction) {
@@ -188,7 +212,7 @@ struct LocalToolsView: View {
                             frozenInput = String(decoding: wire,as: UTF8.self)
                         } else { frozenInput = command }
                         confirm = true
-                    }.disabled(model.guestClaimed || importingVSIX || importingCLI || (mode == 6 ? cliImport == nil : mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
+                    }.disabled(model.guestClaimed || importingVSIX || importingCLI || (mode == 8 ? lspLoading || lspSnapshot == nil || lspArgv.isEmpty : mode == 6 ? cliImport == nil : mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
                     Text("No provider key or native workspace injected. Commands and extensions may use the network and are not sandboxed. Restart app for another boot.").font(.caption)
                 }
                 if running && frozenMode != 2 && frozenMode != 4 {
@@ -211,7 +235,7 @@ struct LocalToolsView: View {
                             Button("Open interactive ANSI terminal") { terminalShown = true }.disabled(!ready)
                             Button("Send Ctrl-C") { _ = LocalRunner.input("\u{3}") }.disabled(!ready)
                             Button("Resize to 111 × 33") { if !LocalRunner.resize() { report = "Resize not accepted" } }.disabled(!ready)
-                        } else {
+                        } else if frozenMode == 3 {
                             Button("Open local workbench") { webStatus = "Opening verified bind endpoint…"; workbenchShown = true }.disabled(!ready || token.isEmpty)
                             Text("Server launch requested; web view may fail until ready.").font(.caption)
                         }
@@ -297,7 +321,7 @@ struct LocalToolsView: View {
                 Button("Start") { start() }
                 Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false; frozenVSIX = nil; frozenCLI = nil }
             } message: {
-                Text(frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(frozenMode == 8 ? "Send this reviewed snapshot to the specified local LSP server?\n" + frozenInput + "\nNo native write grant. Server may use network or retain data." : frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
             .confirmationDialog("Send reviewed message to model?", isPresented: $confirmFollowup) {
                 Button("Send") { if LocalRunner.agentSend(reviewedFollowup) { followup = ""; agentWaiting = false }; reviewedFollowup = "" }
