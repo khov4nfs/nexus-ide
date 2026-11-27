@@ -51,3 +51,6 @@ permission handling and real ACP session. Only after these gates attempt
 official AGY login or OpenVSCode. No Docker or extension compatibility claims.
 Boot itself may block inside upstream; fixed command timeout does not bound
 boot. A stuck boot requires app termination. Do not run on production data.
+
+## CI troubleshooting
+Run 45946162960 failed during host Meson setup after successful rootfs checksum verification. Upstream suppressed stdout, so the exact configuration error was not visible. The build now explicitly selects Apple clang and the macOS SDK for the host converter, sets host-only pkg-config paths, puts Homebrew lld on PATH, and prints/uploads Meson diagnostics on failure. This is a targeted remediation, not a verified root-cause diagnosis. Device cross-build must still pass independently.
