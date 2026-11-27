@@ -521,6 +521,15 @@ pub fn valid_initialize_request(bytes: &[u8]) -> bool {
     frame == expected
 }
 
+// Only the persistent transport can advertise this read-only, virtual file capability.
+pub(crate) fn snapshot_initialize_request(bytes:&[u8])->bool {
+    if bytes.len()>4096 || bytes.last()!=Some(&b'\n') || bytes[..bytes.len()-1].contains(&b'\n') {return false;}
+    let Ok(frame)=serde_json::from_slice::<Value>(bytes) else {return false;};
+    let mut expected:Value=serde_json::from_slice(AGY_INITIALIZE_REQUEST).expect("fixed request");
+    expected["params"]["clientCapabilities"]=json!({"fs":{"readTextFile":true,"writeTextFile":false}});
+    frame==expected
+}
+
 // Project only the bounded protocol fields Swift needs. Never expose raw agent
 // notifications, authentication data, stderr or arbitrary error messages.
 pub(crate) fn initialize_projection(frame: &Value) -> Option<Value> {

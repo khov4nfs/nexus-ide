@@ -50,6 +50,9 @@ struct UbuntuLabView: View {
     @State private var keyStatus = ""
     @State private var useGemini = false
     @State private var useGoogle = false
+    @State private var enableSnapshotRead = false
+    @State private var snapshotReadThisTurn = false
+    @State private var pendingReadContent: String?
     @State private var loginURL = ""
     @State private var loginCode = ""
     @State private var loginSubmitted = false
@@ -102,6 +105,9 @@ struct UbuntuLabView: View {
                         }
                         Text(importStatus).font(.caption)
                     }
+                    Toggle("Enable read-only ACP attachment tool", isOn: $enableSnapshotRead)
+                        .disabled(attempted || model.guestClaimed)
+                    Text("Optional: only a selected immutable text snapshot can be read, for one confirmed turn. No iOS path or write access.").font(.caption)
                     Button("Run offline libc checks") { run(sha: nil) }.disabled(attempted || model.guestClaimed || importingAGY)
                     Button("Initialize imported AGY (no key)") { useGemini = false; useGoogle = false; confirm = true }.disabled(attempted || model.guestClaimed || importingAGY || digest == nil)
                     Button("Connect with saved Gemini API key") { useGemini = true; useGoogle = false; confirm = true }
@@ -152,7 +158,7 @@ struct UbuntuLabView: View {
                 }
                 Section("Native ACP client") {
                     Text(agentStatus)
-                    Text("ACP tool permissions: deny only. No native tool access. Agent internal actions are not sandboxed.").font(.caption)
+                    Text("ACP permissions deny by default. Optional selected snapshot is read-only. Agent internal actions are not sandboxed.").font(.caption)
                     if active {
                         Text("Connection closes after 180 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
                         Button("Create empty guest session") { act(close: false) }.disabled(running || created)
@@ -172,6 +178,9 @@ struct UbuntuLabView: View {
                                         .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                                 }.frame(maxHeight: 160)
                                 if let editSnapshot { Text("Edit target: " + editSnapshot.path).font(.caption) }
+                                if enableSnapshotRead && editSnapshot == nil {
+                                    Toggle("Share via read-only ACP tool", isOn: $snapshotReadThisTurn).disabled(running)
+                                }
                                 Button("Remove attachment") { fileContext = nil; editSnapshot = nil; contextStatus = "" }
                                     .disabled(running || importingContext)
                             }
@@ -329,10 +338,11 @@ struct UbuntuLabView: View {
                     let wire = pendingChat
                     let display = pendingDisplay
                     let edit = pendingEdit
-                    pendingChat = ""; pendingDisplay = ""; pendingEdit = nil
-                    runPrompt(chat: wire, display: display, edit: edit)
+                    let content = pendingReadContent
+                    pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil
+                    runPrompt(chat: wire, display: display, edit: edit, readContent: content)
                 }
-                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil }
+                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil }
             } message: {
                 Text("Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
             }
@@ -378,11 +388,12 @@ struct UbuntuLabView: View {
     private func run(sha: String?, gemini: Bool = false, google: Bool = false) {
         guard !attempted, !importingAGY, model.claimGuest() else { return }
         let selected = sha == nil ? nil : importedAGY
+        let readSnapshot = enableSnapshotRead
         attempted = true
         running = true
         loginURL = ""; loginCode = ""; loginSubmitted = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected, readSnapshot: readSnapshot) }.value
             loginURL = ""; loginCode = ""; loginRunning = false
             // Keep the separately reviewed binary; never persist OAuth tokens with it.
             report = result.report
@@ -451,9 +462,14 @@ struct UbuntuLabView: View {
         guard !running, !importingContext, active, created, !smokeUsed, turnCount < maxTurns else { return }
         do {
             let wire: String
+            pendingReadContent = nil
             if let editSnapshot {
                 guard proposal == nil else { contextStatus = "Review or discard the previous proposal"; return }
                 wire = try AgentEditProposal.prompt(snapshot: editSnapshot, question: chatInput)
+            } else if enableSnapshotRead, snapshotReadThisTurn, let context = fileContext {
+                guard try credentialAllows(context.text) else { contextStatus = "Credential detected"; return }
+                wire = chatInput + "\nRead the selected text via fs/read_text_file at /nexus-selected.txt if needed."
+                pendingReadContent = context.text
             } else { wire = try fileContext?.prompt(question: chatInput) ?? chatInput }
             guard UbuntuRunner.validChat(wire) else {
                 contextStatus = "Question and snapshot must fit 1024 UTF-8 bytes"; return
@@ -470,14 +486,14 @@ struct UbuntuLabView: View {
         }
     }
 
-    private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil) {
+    private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil, readContent: String? = nil) {
         guard active, created, (useGemini || useGoogle), !running, !importingContext, !smokeUsed, turnCount < maxTurns,
               chat != nil || turnCount == 0 else { return }
         if let chat {
             guard UbuntuRunner.validChat(chat) else { return }
             // Do not display or send a prompt containing the stored literal key.
             do {
-                guard try credentialAllows(chat) else {
+                guard try credentialAllows(chat), try readContent.map({ try credentialAllows($0) }) ?? true else {
                     chatInput = ""; agentStatus = "Credential unavailable or detected in message"; return
                 }
             } catch { chatInput = ""; agentStatus = "Keychain unavailable"; return }
@@ -498,7 +514,7 @@ struct UbuntuLabView: View {
         toolUpdates = 0
         cancelRequested = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent) }.value
             let snapshot = UbuntuRunner.progress()
             if snapshot.responseID == expectedID {
                 permissionDenials = snapshot.permissionDenials
@@ -561,7 +577,7 @@ private enum UbuntuRunner {
             do { try FileManager.default.removeItem(at: trial); activeTrial = nil } catch { /* leave for next launch */ }
         }
     }
-    static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?) -> (report: String, status: String, active: Bool) {
+    static func run(sha: String?, gemini: Bool, google: Bool, imported: LocalAGYImport?, readSnapshot: Bool) -> (report: String, status: String, active: Bool) {
         var client = ACPInitializeClient()
         func failed(_ reason: String) -> (String, String, Bool) { (reason, "Not initialized", false) }
         do {
@@ -594,7 +610,7 @@ private enum UbuntuRunner {
                 }
             }
             let data = trial.appendingPathComponent("data", isDirectory: true)
-            let request = sha == nil ? nil : String(decoding: try client.request(), as: UTF8.self)
+            let request = sha == nil ? nil : String(decoding: try client.request(readSnapshot: readSnapshot), as: UTF8.self)
             let pointer = data.path.withCString { path in
                 if let sha, let request {
                     return sha.withCString { digest in
@@ -679,10 +695,11 @@ private enum UbuntuRunner {
         controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
     }
 
-    static func action(close: Bool, prompt: Bool = false, chat: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int) {
+    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
+            else if let chat, let readContent { pointer = chat.withCString { t in readContent.withCString { nexus_acp_chat_snapshot(t,$0) } } }
             else if let chat { pointer = chat.withCString { nexus_acp_chat($0) } }
             else if prompt { pointer = nexus_acp_prompt_probe() }
             else {

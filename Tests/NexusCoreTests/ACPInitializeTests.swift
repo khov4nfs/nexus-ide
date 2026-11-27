@@ -19,6 +19,17 @@ final class ACPInitializeTests: XCTestCase {
         XCTAssertEqual(client.state, .initialized(name: "Antigravity", version: "fixture"))
     }
 
+    func testReadOnlySnapshotCapabilityIsExplicit() throws {
+        var client = ACPInitializeClient()
+        let data = try client.request(readSnapshot: true)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let params = try XCTUnwrap(object["params"] as? [String: Any])
+        let caps = try XCTUnwrap(params["clientCapabilities"] as? [String: Any])
+        let fs = try XCTUnwrap(caps["fs"] as? [String: Bool])
+        XCTAssertEqual(fs, ["readTextFile": true, "writeTextFile": false])
+        XCTAssertNil(caps["terminal"])
+    }
+
     func testAuthenticationIsNotSuccess() throws {
         var client = ACPInitializeClient()
         _ = try client.request()

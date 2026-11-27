@@ -31,6 +31,8 @@ char *nexus_acp_prompt_probe(void);
 // Up to three consented text turns (max 1024 UTF-8 bytes each); no project mount.
 // Smoke test and chat are mutually exclusive within one boot.
 char *nexus_acp_chat(const char *text);
+// Optional read-only capability: explicit one-turn virtual snapshot, no native path.
+char *nexus_acp_chat_snapshot(const char *text,const char *content);
 // Concurrent-safe status and cancel request; does not wait for completion.
 char *nexus_acp_prompt_progress(void);
 char *nexus_acp_cancel_prompt(void);
