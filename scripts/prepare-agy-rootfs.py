@@ -5,6 +5,7 @@ The supplied digest is an integrity pin, not proof of publisher identity.
 """
 import argparse
 import hashlib
+import io
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -20,6 +21,7 @@ UBUNTU = BUILD / "ubuntu-base-24.04.5-base-arm64.tar.gz"
 UBUNTU_SHA = "a91d5a93010193712d346d761372b7c9db6dfcf093893161c64ca107f05914f2"
 PIN = "c8e9dcb954963b0d9f359b3ad9da871f19b28652"
 IMPORT_SLOT = b"NEXUS_AGY_IMPORT_SLOT_V1\n"
+CLI_SLOTS = {"codex": b"NEXUS_CODEX_IMPORT_SLOT_V1\n", "claude": b"NEXUS_CLAUDE_IMPORT_SLOT_V1\n"}
 
 def digest(path):
     with path.open("rb") as stream:
@@ -71,6 +73,11 @@ def overlay_archive(original, binary, output):
         info.size = binary.stat().st_size
         with binary.open("rb") as stream:
             dst.addfile(info, stream)
+        for name, marker in CLI_SLOTS.items():
+            slot = tarfile.TarInfo("./opt/nexus/" + name)
+            slot.mode = 0o755
+            slot.size = len(marker)
+            dst.addfile(slot, io.BytesIO(marker))
 
 def overlay_import_slot(original, output):
     # A non-executable-content marker in a guest executable metadata slot.

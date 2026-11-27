@@ -334,6 +334,28 @@ jobs:
           name: acp-terminal-fixture-evidence
           path: ${{ runner.temp }}/nexus-terminal.json
           if-no-files-found: error
+      - name: Verify original CLI import slots (Ubuntu ELF fixture only)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for kind in codex claude; do
+            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-cli-$kind"
+            export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-cli-$kind/data"
+            export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-cli-$kind.json"
+            export NEXUS_CLI_KIND="$kind"
+            cat "$NEXUS_LOCAL_ROOTFS/usr/bin/true" > "$NEXUS_LOCAL_ROOTFS/opt/nexus/$kind"
+            export NEXUS_CLI_SHA="$(shasum -a 256 "$NEXUS_LOCAL_ROOTFS/usr/bin/true" | awk '{print $1}')"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_cli_import_slot -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["shutdownClean"] is True and r["fixture"] == "Ubuntu true, not Codex or Claude"' "$NEXUS_LOCAL_EVIDENCE"
+          done
+      - name: Upload CLI import slot evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-cli-import-fixture-evidence
+          path: ${{ runner.temp }}/nexus-cli-*.json
+          if-no-files-found: error
       - name: Verify local PTY lifecycle hooks
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"

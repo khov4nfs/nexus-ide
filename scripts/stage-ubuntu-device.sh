@@ -34,6 +34,10 @@ if [[ "${1:-}" == --workbench ]]; then
 else
   test ! -e "$source/workbench.sha256"
 fi
+for cli in codex claude; do
+  if [[ "$cli" == codex ]]; then marker=NEXUS_CODEX_IMPORT_SLOT_V1; else marker=NEXUS_CLAUDE_IMPORT_SLOT_V1; fi
+  printf '%s\n' "$marker" | cmp - "$source/data/opt/nexus/$cli"
+done
 # Source must be fresh and stopped. No copying an active fakefs database.
 test ! -e "$source/meta.db-wal"
 test ! -e "$source/meta.db-shm"

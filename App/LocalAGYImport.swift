@@ -91,7 +91,7 @@ struct LocalAGYImport: Sendable {
         try Self.transfer(from: file, to: target, expected: digest)
     }
 
-    private static func transfer(from source: URL, to target: URL, expected: String) throws {
+    static func transfer(from source: URL, to target: URL, expected: String) throws {
         let values = try source.resourceValues(forKeys: [.isRegularFileKey,.isSymbolicLinkKey,.fileSizeKey])
         guard values.isRegularFile == true, values.isSymbolicLink != true,
               let length = values.fileSize, length >= 64, UInt64(length) <= AGYImportFormat.maxBytes else { throw Failure.invalid }
@@ -114,5 +114,44 @@ struct LocalAGYImport: Sendable {
         guard count == UInt64(length), digest == expected else { throw Failure.invalid }
         try writer.synchronize()
     }
+}
+
+/// Separate, disposable original CLI import. No login or token mediation.
+struct LocalCLIImport: Sendable {
+    enum Failure: Error { case invalid }
+    let file: URL
+    let digest: String
+    let kind: String
+    var name: String { kind == "codex" ? "Codex CLI" : "Claude Code" }
+
+    private static func marker(_ kind: String) throws -> Data {
+        guard ["codex","claude"].contains(kind) else { throw Failure.invalid }
+        return Data(("NEXUS_" + kind.uppercased() + "_IMPORT_SLOT_V1\n").utf8)
+    }
+    static func select(_ url: URL, kind: String, expected: String) throws -> Self {
+        _ = try marker(kind)
+        guard url.isFileURL, AGYImportFormat.validDigest(expected) else { throw Failure.invalid }
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("NexusReviewedCLI-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let file = root.appendingPathComponent("reviewed.elf")
+        do {
+            guard fm.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600]) else { throw Failure.invalid }
+            try LocalAGYImport.transfer(from: url, to: file, expected: expected)
+            try fm.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: file.path)
+            return Self(file: file, digest: expected, kind: kind)
+        } catch { try? fm.removeItem(at: root); throw error }
+    }
+    func install(in data: URL) throws {
+        let target = data.appendingPathComponent("opt/nexus/" + kind)
+        let v = try target.resourceValues(forKeys: [.isRegularFileKey,.isSymbolicLinkKey,.fileSizeKey])
+        let marker = try Self.marker(kind)
+        guard v.isRegularFile == true, v.isSymbolicLink != true, v.fileSize == marker.count,
+              try Data(contentsOf: target) == marker else { throw Failure.invalid }
+        try LocalAGYImport.transfer(from: file, to: target, expected: digest)
+    }
+    func remove() { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
 }
 #endif
