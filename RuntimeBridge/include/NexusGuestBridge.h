@@ -7,6 +7,8 @@ extern "C" {
 char *nexus_guest_probe(const char *rootfs_data_path);
 // Explicit network opt-in: fixed signed Alpine jq package installation probe.
 char *nexus_guest_probe_packages(const char *rootfs_data_path);
+// Explicit consent for larger fixed development toolchain downloads.
+char *nexus_guest_probe_toolchains(const char *rootfs_data_path);
 void nexus_guest_free(char *result);
 #ifdef __cplusplus
 }

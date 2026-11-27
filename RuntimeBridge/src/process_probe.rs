@@ -248,9 +248,59 @@ fn package_output_ok(bytes: &[u8]) -> bool {
         !revision.is_empty() && revision.bytes().all(|c| c.is_ascii_digit())
 }
 
+const TOOLCHAIN_SCRIPT: &str = include_str!("../fixtures/toolchains.sh");
+
+pub async fn toolchain_install(guest: &IshInstance, env: &HashMap<String,String>) -> Value {
+    let name = "development_toolchains";
+    let mut opts = shell(TOOLCHAIN_SCRIPT, env);
+    opts.pipe_stdin = false;
+    let session = match guest.spawn(opts) {
+        Ok(s) => s,
+        Err(e) => return json!({"name":name,"passed":false,"error":e.to_string()}),
+    };
+    let mut capture = Capture::default();
+    let result = drain(&session, &mut capture, Instant::now() + Duration::from_secs(600)).await;
+    if result.is_err() { let _ = session.terminate().await; }
+    let passed = result.is_ok() && capture.code == Some(0) &&
+        capture.signal == Some(0) && capture.closed && capture.pty.is_empty() &&
+        toolchain_output_ok(&capture.stdout);
+    json!({"name":name,"passed":passed,"evidence":capture.evidence(),"error":result.err()})
+}
+
+fn toolchain_output_ok(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() != 13 || lines[0] != "NEXUS_TOOLCHAINS_ABSENT" ||
+        lines[9] != "NEXUS_NODE_DEPENDENCY_OK" ||
+        lines[10] != "NEXUS_PYTHON_TEST_OK" ||
+        lines[12] != "NEXUS_TOOLCHAINS_OK" { return false; }
+    for (line, name) in lines[1..5].iter().zip(["nodejs", "npm", "python3", "git"]) {
+        let prefix = format!("NEXUS_TOOLCHAIN_APK={name}-");
+        let Some(rest) = line.strip_prefix(prefix.as_str()) else { return false; };
+        let Some((version, revision)) = rest.rsplit_once("-r") else { return false; };
+        if !version.as_bytes().first().map_or(false, |c| c.is_ascii_digit()) ||
+           !version.bytes().all(|c| c.is_ascii_alphanumeric() || b"._+-".contains(&c)) ||
+           revision.is_empty() || !revision.bytes().all(|c| c.is_ascii_digit()) { return false; }
+    }
+    for (line, prefix) in lines[5..9].iter().zip(["NEXUS_NODE_VERSION=v", "NEXUS_NPM_VERSION=", "NEXUS_PYTHON_VERSION=Python ", "NEXUS_GIT_VERSION=git version "]) {
+        let Some(version) = line.strip_prefix(prefix) else { return false; };
+        if !version.as_bytes().first().map_or(false, |c| c.is_ascii_digit()) { return false; }
+    }
+    let Some(hash) = lines[11].strip_prefix("NEXUS_GIT_COMMIT=") else { return false; };
+    hash.len() == 40 && hash.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn toolchain_evidence_requires_all_workflow_steps() {
+        let good = "NEXUS_TOOLCHAINS_ABSENT\nNEXUS_TOOLCHAIN_APK=nodejs-22.1.0-r0\nNEXUS_TOOLCHAIN_APK=npm-10.1.0-r0\nNEXUS_TOOLCHAIN_APK=python3-3.12.0-r0\nNEXUS_TOOLCHAIN_APK=git-2.47.0-r0\nNEXUS_NODE_VERSION=v22.1.0\nNEXUS_NPM_VERSION=10.1.0\nNEXUS_PYTHON_VERSION=Python 3.12.0\nNEXUS_GIT_VERSION=git version 2.47.0\nNEXUS_NODE_DEPENDENCY_OK\nNEXUS_PYTHON_TEST_OK\nNEXUS_GIT_COMMIT=0123456789abcdef0123456789abcdef01234567\nNEXUS_TOOLCHAINS_OK\n";
+        assert!(toolchain_output_ok(good.as_bytes()));
+        assert!(!toolchain_output_ok(good.replace("NEXUS_PYTHON_TEST_OK\n", "").as_bytes()));
+        assert!(!toolchain_output_ok(good.replace("NEXUS_GIT_COMMIT=0", "NEXUS_GIT_COMMIT=z").as_bytes()));
+        assert!(!toolchain_output_ok(good.replace("npm-10.1.0-r0", "npm-10.1.0").as_bytes()));
+    }
     #[test]
     fn package_evidence_requires_install_and_execution() {
         let good = b"NEXUS_PACKAGE_ABSENT\nNEXUS_DNS_FALLBACK\nNEXUS_PACKAGE_INSTALLED\nNEXUS_APK_VERSION=jq-1.8.2-r0\nNEXUS_BINARY_VERSION=jq-1.8.2\nNEXUS_JQ_OK\n";

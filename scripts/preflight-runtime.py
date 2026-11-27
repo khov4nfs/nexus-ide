@@ -18,6 +18,7 @@ scripts = re.findall(r'const PACKAGE_SCRIPT: &str = r#"(.*?)"#;', probe, re.S)
 if len(scripts) != 1:
     raise SystemExit("Expected exactly one package shell fixture")
 subprocess.run(["sh", "-n"], input=scripts[0], text=True, check=True)
+subprocess.run(["sh", "-n", str(root / "RuntimeBridge/fixtures/toolchains.sh")], check=True)
 subprocess.run(["bash", "-n", str(root / "scripts/build-guest-device.sh")], check=True)
 for script in sorted((root / "scripts").glob("*.py")):
     compile(script.read_bytes(), str(script), "exec")
