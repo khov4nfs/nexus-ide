@@ -1,5 +1,13 @@
 name: Core and unsigned iOS build
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish_prerelease:
+        description: Publish native-only unsigned IPA to GitHub Releases (main only)
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -7,7 +15,40 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: swift test
       - run: brew install xcodegen
       - run: xcodegen generate
       - run: xcodebuild -project NexusIDE.xcodeproj -scheme NexusIDE -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+      - name: Verify IPA packaging rules
+        run: python3 scripts/test-package-ipa.py
+      - name: Build native Release for physical ARM64 iPhone
+        run: |
+          xcodebuild -project NexusIDE.xcodeproj -scheme NexusIDE -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-native" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.5.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
+          python3 scripts/package-ipa.py --app "$RUNNER_TEMP/nexus-native/Build/Products/Release-iphoneos/NexusIDE.app" --output "$RUNNER_TEMP/nexus-native-ipa" --variant native --commit "$GITHUB_SHA"
+      - name: Upload native iPhone test IPA (unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          name: NexusIDE-native-unsigned
+          path: ${{ runner.temp }}/nexus-native-ipa/*
+          if-no-files-found: error
+          retention-days: 14
+  publish-native:
+    needs: ios
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish_prerelease
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: NexusIDE-native-unsigned
+          path: release
+      - name: Publish unique prerelease (not a production release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release
+          sha256sum -c SHA256SUMS
+          gh release create "ios-native-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE native iPhone test" --notes "Unsigned native-only ARM64 test build. Re-sign using your own legitimate sideloading setup. No embedded Linux or AGY. Physical iPhone not verified." *.ipa SHA256SUMS build.json

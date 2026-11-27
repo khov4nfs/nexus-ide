@@ -12,7 +12,13 @@ Independent prototype, not affiliated with Google. iOS 17+; all project executio
 
 Previous PR #17 CI passed native tests, both unsigned ARM64 device builds, real macOS-hosted guest process/toolchain tests and ACP fixtures. No physical iPhone or original AGY execution has been verified. This integration PR adds edit proposals, actual local PTY and MCP discovery paths, optional workbench launcher; new CI is required. No signed IPA or production release.
 
-## Build on Apple Silicon macOS
+## Download a test IPA — no personal Mac required
+
+Use [GitHub Actions](https://github.com/khov4nfs/nexus-ide/actions) or [Releases](https://github.com/khov4nfs/nexus-ide/releases) after a successful packaging run. GitHub-hosted macOS runners build real ARM64 iPhoneOS Release binaries; they are build infrastructure only, not an execution backend. The native-only unsigned IPA is uploaded automatically after tests. The integrated Ubuntu/workbench IPA is built and checked by CI but is distributed only after the repository owner reviews redistribution rights and explicitly runs the workflow on main. No public AGY binary or Apple credential is bundled. The integrated app can import a separately obtained reviewed official ARM64 AGY ELF from Files before boot; actual execution remains a device gate.
+
+See [iPhone installation and distribution](docs/iphone-install.md). An unsigned IPA cannot be installed directly by Safari; use an already configured legitimate sideloading app, or properly signed Apple distribution. This is a test candidate, not a production release.
+
+## Optional local build on Apple Silicon macOS
 
 Use Xcode and XcodeGen. For the native target:
 
