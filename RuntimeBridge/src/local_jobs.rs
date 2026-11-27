@@ -7,12 +7,58 @@ use std::{collections::{HashMap,VecDeque}, ffi::{c_char,CStr,CString}, path::Pat
     sync::{Mutex,atomic::Ordering}};
 
 pub(crate) enum Control { Input(Vec<u8>), Resize(u16,u16), Stop }
+const AGENT_LIMIT:usize=10;
+#[derive(Default)]
+struct AgentMailbox {waiting:bool, pending:Option<String>, finish:bool, turns:Vec<Value>, handle:Option<String>}
+#[derive(Clone)]
+pub(crate) struct NativeSession {pub retain:bool,pub resume:Option<String>}
+pub(crate) enum AgentNext {Prompt(String),Finish,Stop}
+fn valid_agent_text(s:&str)->bool {valid_command(s)&&s.chars().all(|c|!c.is_control()||c=='\n'||c=='\t')}
+pub(crate) fn valid_handle(s:&str)->bool {!s.is_empty()&&s.len()<=128&&s.bytes().all(|b|b.is_ascii_alphanumeric()||b"-_".contains(&b))}
+pub(crate) fn valid_uuid(s:&str)->bool {
+    s.len()==36&&s.bytes().enumerate().all(|(i,b)|if matches!(i,8|13|18|23){b==b'-'}else{b.is_ascii_hexdigit()})
+}
+pub(crate) fn agent_complete(prompt:&str,response:&str,handle:Option<&str>)->bool{
+    let Ok(mut s)=STATE.lock()else{return false;};
+    if s.stop||!s.running{return false;}
+    let Some(a)=s.agent.as_mut()else{return false;};
+    if a.turns.len()>=AGENT_LIMIT{return false;}
+    a.turns.push(json!({"prompt":prompt,"response":response}));
+    a.handle=handle.map(str::to_owned);
+    a.waiting=a.turns.len()<AGENT_LIMIT;
+    true
+}
+pub(crate) async fn agent_next()->AgentNext{
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(180);
+    loop{
+        {
+            let Ok(mut s)=STATE.lock()else{return AgentNext::Stop;};
+            if s.stop||!s.running{return AgentNext::Stop;}
+            let Some(a)=s.agent.as_mut()else{return AgentNext::Stop;};
+            if let Some(p)=a.pending.take(){a.waiting=false;return AgentNext::Prompt(p);}
+            if a.finish||a.turns.len()>=AGENT_LIMIT||std::time::Instant::now()>=deadline{a.waiting=false;return AgentNext::Finish;}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+fn agent_send(text:Option<String>)->Value{
+    let Ok(mut s)=STATE.lock()else{return fail("Agent status unavailable");};
+    if !s.running||s.stop{return fail("No active agent session");}
+    let Some(a)=s.agent.as_mut()else{return fail("No native agent session");};
+    if !a.waiting||a.pending.is_some()||a.finish{return fail("Agent is not waiting");}
+    if let Some(text)=text{
+        if !valid_agent_text(&text){return fail("Invalid message");}
+        a.pending=Some(text);
+    }else{a.finish=true;}
+    a.waiting=false;
+    json!({"ok":true})
+}
 struct State {
     running: bool, ready: bool, mode: u8, output: String, raw: Vec<u8>, total: u64,
-    controls: VecDeque<Control>, stop: bool,
+    controls: VecDeque<Control>, stop: bool, agent:Option<AgentMailbox>,
 }
 static STATE: Mutex<State> = Mutex::new(State {
-    running:false, ready:false, mode:0, output:String::new(), raw:Vec::new(), total:0, controls:VecDeque::new(), stop:false,
+    running:false, ready:false, mode:0, output:String::new(), raw:Vec::new(), total:0, controls:VecDeque::new(), stop:false, agent:None,
 });
 const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
 fn fail(message: &str) -> Value { json!({"ok":false,"error":message}) }
@@ -53,23 +99,30 @@ fn parse_workbench(input:&str)->Option<(String,Option<String>)> {
     Some((token,Some(digest)))
 }
 const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
-fn parse_cli(input:&str)->Option<(String,String,String,Option<String>)> {
+fn parse_cli(input:&str)->Option<(String,String,String,Option<String>,Option<NativeSession>)> {
     if input.len()>8192 {return None;}
     let v:Value=serde_json::from_str(input).ok()?;
     let fields=v.as_object()?.len();
     let kind=v["kind"].as_str()?;
     let digest=v["sha256"].as_str()?;
     let action=v["action"].as_str()?;
-    if !matches!(kind,"codex"|"claude") || !process_probe::agy_digest_ok(digest) || !matches!(action,"shell"|"version"|"appServer"|"appServerChat"|"claudeAuth"|"claudeChat") || (matches!(action,"appServer"|"appServerChat") && kind!="codex") || (matches!(action,"claudeAuth"|"claudeChat")&&kind!="claude") {return None;}
-    let prompt=if matches!(action,"appServerChat"|"claudeChat") {
+    if !matches!(kind,"codex"|"claude") || !process_probe::agy_digest_ok(digest) || !matches!(action,"shell"|"version"|"appServer"|"appServerChat"|"claudeAuth"|"claudeChat"|"codexSession"|"claudeSession") || (matches!(action,"appServer"|"appServerChat"|"codexSession") && kind!="codex") || (matches!(action,"claudeAuth"|"claudeChat"|"claudeSession")&&kind!="claude") {return None;}
+    let interactive=matches!(action,"codexSession"|"claudeSession");
+    let prompt=if interactive||matches!(action,"appServerChat"|"claudeChat") {
         let p=v["prompt"].as_str()?;
-        if fields!=4||!valid_command(p)||p.chars().any(|c|c.is_control()&&c!='\n'&&c!='\t'){return None;}
+        if fields!=if interactive{6}else{4} || !valid_agent_text(p){return None;}
         Some(p.to_owned())
     }else{if fields!=3{return None;}None};
-    Some((kind.into(),digest.into(),action.into(),prompt))
+    let session=if interactive{
+        let retain=v["retain"].as_bool()?;
+        let resume=v["resume"].as_str()?;
+        if !resume.is_empty()&&(!retain||!valid_handle(resume)||(kind=="claude"&&!valid_uuid(resume))){return None;}
+        Some(NativeSession{retain,resume:if resume.is_empty(){None}else{Some(resume.to_owned())}})
+    }else{None};
+    Some((kind.into(),digest.into(),action.into(),prompt,session))
 }
 fn progress() -> Value {
-    STATE.lock().map(|s| json!({"ok":true,"running":s.running,"ready":s.ready,"output":s.output,"stopRequested":s.stop}))
+    STATE.lock().map(|s| json!({"ok":true,"running":s.running,"ready":s.ready,"output":s.output,"stopRequested":s.stop,"agentWaiting":s.agent.as_ref().is_some_and(|a|a.waiting&&!s.stop),"agentTurns":s.agent.as_ref().map(|a|&a.turns),"agentHandle":s.agent.as_ref().and_then(|a|a.handle.as_deref())}))
         .unwrap_or_else(|_| fail("Local status unavailable"))
 }
 pub(crate) fn publish_output(bytes: &[u8], ready: bool, truncated: bool, total: u64) {
@@ -100,7 +153,7 @@ fn enqueue(control: Control) -> Value {
 struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Ok(mut s) = STATE.lock() { s.running = false; s.ready = false; s.controls.clear(); }
+        if let Ok(mut s) = STATE.lock() { s.running = false; s.ready = false; s.controls.clear(); if let Some(a)=s.agent.as_mut(){a.waiting=false;a.pending=None;} }
     }
 }
 fn run(path: &Path, mode: u8, input: &str) -> Value {
@@ -120,7 +173,8 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     }
     let Ok(mut s) = STATE.lock() else { return fail("Local job lock failed"); };
     if s.running || ATTEMPTED.swap(true,Ordering::AcqRel) { return fail("Restart app before another guest boot"); }
-    *s = State { running:true,ready:false,mode:if matches!(mode,5|6) {1}else{mode},output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false };
+    let native=cli.as_ref().is_some_and(|c|c.4.is_some());
+    *s = State { running:true,ready:false,mode:if native{7}else if matches!(mode,5|6) {1}else{mode},output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false,agent:if native{Some(AgentMailbox::default())}else{None} };
     drop(s);
     let _guard = Guard;
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -154,14 +208,18 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         }
         else if let Some(call)=call.as_ref() {rt.block_on(process_probe::mcp_job(&guest,&env,call["command"].as_str().unwrap(),Some((call["name"].as_str().unwrap(),&call["arguments"]))))}
         else if mode == 2 { rt.block_on(process_probe::mcp_discover(&guest,&env,input)) }
-        else if let Some((kind,digest,action,prompt))=cli.as_ref() {
+        else if let Some((kind,digest,action,prompt,native_session))=cli.as_ref() {
             let executable=if kind=="codex" {"/opt/nexus/codex"}else{"/opt/nexus/claude"};
             let verified=rt.block_on(process_probe::guest_file_digest(&guest,&env,executable,digest))["passed"]==true;
             let mut r=if verified && !stop_requested() {
                 // Only fixed paths/actions; no user-provided shell interpolation,
                 // no CLI flags that disable the original harness safeguards.
                 env.insert("PATH".into(),"/opt/nexus:/usr/bin:/bin:/usr/sbin:/sbin".into());
-                if matches!(action.as_str(),"appServer"|"appServerChat") {rt.block_on(process_probe::codex_app_server_probe(&guest,&env,false,prompt.as_deref()))}
+                if let Some(config)=native_session {
+                    if kind=="codex"{rt.block_on(process_probe::codex_session(&guest,&env,prompt.as_deref().unwrap_or(""),config,false))}
+                    else{rt.block_on(process_probe::claude_session(&guest,&env,prompt.as_deref().unwrap_or(""),config,false))}
+                }
+                else if matches!(action.as_str(),"appServer"|"appServerChat") {rt.block_on(process_probe::codex_app_server_probe(&guest,&env,false,prompt.as_deref()))}
                 else if action=="claudeAuth"{rt.block_on(process_probe::claude_auth_probe(&guest,&env,false))}
                 else if action=="claudeChat"{rt.block_on(process_probe::claude_text_turn(&guest,&env,prompt.as_deref().unwrap_or(""),false))}
                 else {
@@ -249,6 +307,14 @@ pub extern "C" fn nexus_local_resize(cols:u16,rows:u16) -> *mut c_char {
         enqueue(Control::Resize(cols,rows))
     } else { fail("Invalid PTY size") })
 }
+/// # Safety
+/// Valid NUL-terminated UTF-8 message. Never interpreted as terminal input.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_local_agent_send(text:*const c_char)->*mut c_char{
+    ffi(||match arg(text){Some(s)=>agent_send(Some(s)),None=>fail("Missing message")})
+}
+#[no_mangle]
+pub extern "C" fn nexus_local_agent_finish()->*mut c_char{ffi(||agent_send(None))}
 #[no_mangle]
 pub extern "C" fn nexus_local_stop() -> *mut c_char { ffi(|| enqueue(Control::Stop)) }
 

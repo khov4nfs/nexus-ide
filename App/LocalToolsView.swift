@@ -50,6 +50,14 @@ struct LocalToolsView: View {
     @State private var importingCLI = false
     @State private var cliAction = "shell"
     @State private var cliPrompt = ""
+    @State private var cliResume = ""
+    @State private var nativeChat = false
+    @State private var agentWaiting = false
+    @State private var agentTurns: [NativeAgentTurn] = []
+    @State private var agentHandle = ""
+    @State private var followup = ""
+    @State private var reviewedFollowup = ""
+    @State private var confirmFollowup = false
     @State private var keepCLIGuest = false
     @State private var confirmResetCLI = false
     private var stagedWorkbench: Bool {
@@ -86,16 +94,22 @@ struct LocalToolsView: View {
                             if cliKind == "codex" {
                                 Text("Native app-server account probe").tag("appServer")
                                 Text("Native Codex text turn").tag("appServerChat")
+                                Text("Native Codex conversation").tag("codexSession")
                             } else {
                                 Text("Native Claude account probe").tag("claudeAuth")
                                 Text("Native Claude text turn").tag("claudeChat")
+                                Text("Native Claude conversation").tag("claudeSession")
                             }
                         }.disabled(model.guestClaimed)
-                        if ["appServerChat","claudeChat"].contains(cliAction) {
+                        if ["appServerChat","claudeChat","codexSession","claudeSession"].contains(cliAction) {
                             TextField("Message to agent (max 2048 bytes)", text: $cliPrompt, axis: .vertical).disabled(model.guestClaimed)
                             Text("One text turn; requires CLI-owned sign-in. Model request may incur charges. Codex requests read-only policy; Claude disables customizations and tools. No native grants. Output is untrusted and may contain guest secrets.").font(.caption)
                         }
                         Toggle("Keep separate agent guest and CLI login", isOn: $keepCLIGuest).disabled(model.guestClaimed || importingCLI)
+                        if ["codexSession","claudeSession"].contains(cliAction) {
+                            Text("Up to 10 reviewed turns. Claude stores history inside the guest during conversation. Saved guests retain history after shutdown.").font(.caption)
+                            if keepCLIGuest { TextField("Saved session ID (optional)", text: $cliResume).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed) }
+                        }
                         Text("Optional: persists CLI-owned login state and project files for this exact binary digest. May retain secrets. Exit the shell cleanly before restarting. No backup, no sharing with other guests, no native token collection.").font(.caption)
                         Button("Reset saved CLI guest", role: .destructive) { confirmResetCLI = true }.disabled(model.guestClaimed || importingCLI || !AGYImportFormat.validDigest(cliDigest))
                         Text("Account probes read status only. Use the original CLI login inside the terminal. Linux sandbox/syscall compatibility remains unverified; do not disable agent safeguards.").font(.caption)
@@ -147,10 +161,15 @@ struct LocalToolsView: View {
                         frozenHooks = mode == 1 && enableHooks
                         if mode == 6 {
                             guard let frozenCLI else { report = "Select reviewed executable"; return }
-                            var request = ["kind":frozenCLI.kind,"sha256":frozenCLI.digest,"action":cliAction]
-                            if ["appServerChat","claudeChat"].contains(cliAction) {
+                            var request: [String: Any] = ["kind":frozenCLI.kind,"sha256":frozenCLI.digest,"action":cliAction]
+                            if ["appServerChat","claudeChat","codexSession","claudeSession"].contains(cliAction) {
                                 guard !cliPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, cliPrompt.utf8.count <= 2048, !cliPrompt.utf8.contains(0) else { report = "Invalid message"; return }
                                 request["prompt"] = cliPrompt
+                            }
+                            if ["codexSession","claudeSession"].contains(cliAction) {
+                                let handle = frozenKeep ? cliResume : ""
+                                guard handle.utf8.count <= 128, handle.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45,95].contains($0) }), cliKind != "claude" || handle.isEmpty || UUID(uuidString: handle) != nil else { report = "Invalid session ID"; return }
+                                request["retain"] = frozenKeep; request["resume"] = handle
                             }
                             guard let wire = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), wire.count <= 8192 else { report = "Invalid request"; return }
                             frozenInput = String(decoding: wire, as: UTF8.self)
@@ -174,7 +193,12 @@ struct LocalToolsView: View {
                 }
                 if running && frozenMode != 2 && frozenMode != 4 {
                     Section("Process controls") {
-                        if frozenMode == 1 || frozenMode == 6 {
+                        if nativeChat {
+                            Text(agentWaiting ? "Ready for a reviewed follow-up" : "Agent processing or closing").font(.caption)
+                            TextField("Next message", text: $followup, axis: .vertical).disabled(!agentWaiting)
+                            Button("Review next message") { reviewedFollowup = followup; confirmFollowup = true }.disabled(!agentWaiting || followup.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || followup.utf8.count > 2048 || followup.utf8.contains(0))
+                            Button("Finish conversation") { if LocalRunner.agentFinish() { agentWaiting = false } }.disabled(!agentWaiting)
+                        } else if frozenMode == 1 || frozenMode == 6 {
                             Text("Paste commands on separate lines. Smart quotes and dashes are disabled.").font(.caption)
                             TerminalInput(text: $line)
                                 .frame(minHeight: 84, maxHeight: 140)
@@ -197,7 +221,17 @@ struct LocalToolsView: View {
                         }
                     }
                 }
-                if frozenMode == 1 || frozenMode == 6 {
+                if nativeChat {
+                    Section("Native conversation · untrusted text") {
+                        ForEach(agentTurns.indices, id: \.self) { i in
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("You").font(.caption); Text(verbatim: agentTurns[i].prompt)
+                                Text("Agent").font(.caption); Text(verbatim: agentTurns[i].response).textSelection(.enabled)
+                            }
+                        }
+                        if !agentHandle.isEmpty { Text("Save this session ID for a clean restart").font(.caption); Text(verbatim: agentHandle).textSelection(.enabled) }
+                    }
+                } else if frozenMode == 1 || frozenMode == 6 {
                     Section("PTY output · plain text") {
                         Text(verbatim: output).font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
                     }
@@ -265,11 +299,16 @@ struct LocalToolsView: View {
             } message: {
                 Text(frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
+            .confirmationDialog("Send reviewed message to model?", isPresented: $confirmFollowup) {
+                Button("Send") { if LocalRunner.agentSend(reviewedFollowup) { followup = ""; agentWaiting = false }; reviewedFollowup = "" }
+                Button("Cancel", role: .cancel) { reviewedFollowup = "" }
+            } message: { Text(reviewedFollowup + "\nMay incur provider charges. No native grants.") }
             .task(id: running) {
                 while running && !Task.isCancelled {
                     let p = LocalRunner.progress()
                     ready = p.ready
                     output = p.output
+                    if nativeChat { agentWaiting = p.agentWaiting; agentTurns = p.turns; agentHandle = p.handle }
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
             }
@@ -308,13 +347,17 @@ struct LocalToolsView: View {
         selectedVSIX = nil
         frozenCLI = nil
         if cli != nil { cliImport = nil }
+        nativeChat = selectedMode == 6 && ["codexSession","claudeSession"].contains(cliAction)
+        agentWaiting = false; agentTurns = []; agentHandle = ""; followup = ""
         running = true
         report = "Starting local guest"
         Task {
             report = await Task.detached(priority: .userInitiated) {
                 LocalRunner.run(mode: selectedMode, input: input, persistent: persistent, vsix: vsix, cli: cli)
             }.value
-            output = LocalRunner.progress().output
+            let progress = LocalRunner.progress()
+            output = progress.output
+            if nativeChat { agentTurns = progress.turns; agentHandle = progress.handle; agentWaiting = false }
             ready = false
             running = false
             token = ""
@@ -353,6 +396,8 @@ private struct TerminalInput: UIViewRepresentable {
     }
 }
 
+private struct NativeAgentTurn: Decodable { let prompt: String; let response: String }
+
 private enum LocalRunner {
     static func token() -> String? {
         var data = [UInt8](repeating: 0, count: 32)
@@ -364,10 +409,17 @@ private enum LocalRunner {
         defer { nexus_guest_free(pointer) }
         return (try? JSONSerialization.jsonObject(with: Data(String(cString: pointer).utf8)) as? [String: Any]) ?? [:]
     }
-    static func progress() -> (ready: Bool, output: String) {
+    static func progress() -> (ready: Bool, output: String, agentWaiting: Bool, turns: [NativeAgentTurn], handle: String) {
         let object = decode(nexus_local_progress())
-        return (object["ready"] as? Bool == true, object["output"] as? String ?? "")
+        let rows = object["agentTurns"] as? [[String: Any]] ?? []
+        let turns = rows.compactMap { row -> NativeAgentTurn? in
+            guard let prompt = row["prompt"] as? String, let response = row["response"] as? String else { return nil }
+            return NativeAgentTurn(prompt: prompt, response: response)
+        }
+        return (object["ready"] as? Bool == true, object["output"] as? String ?? "", object["agentWaiting"] as? Bool == true, turns, object["agentHandle"] as? String ?? "")
     }
+    static func agentSend(_ text: String) -> Bool { text.withCString { decode(nexus_local_agent_send($0))["ok"] as? Bool == true } }
+    static func agentFinish() -> Bool { decode(nexus_local_agent_finish())["ok"] as? Bool == true }
     static func input(_ text: String) -> Bool {
         text.withCString { decode(nexus_local_input($0))["ok"] as? Bool == true }
     }

@@ -947,17 +947,29 @@ fn codex_id(v:&Value)->Result<&str,String>{v.as_str().filter(|s|!s.is_empty()&&s
 fn codex_readonly(result:&Value)->bool{
     result["approvalPolicy"]=="never"&&result["sandbox"]["type"]=="readOnly"&&result["sandbox"]["networkAccess"]==false
 }
-async fn codex_text_turn(session:&IshSession,capture:&mut Capture,prompt:&str,deadline:Instant)->Result<String,String>{
+async fn codex_open_thread(session:&IshSession,capture:&mut Capture,config:Option<&crate::local_jobs::NativeSession>,deadline:Instant)->Result<String,String>{
     let mut early=Vec::new();
-    let start=json!({"id":3,"method":"thread/start","params":{"cwd":"/tmp","ephemeral":true,"sandbox":"read-only","approvalPolicy":"never"}});
+    let start=if let Some(handle)=config.and_then(|c|c.resume.as_deref()){
+        json!({"id":3,"method":"thread/resume","params":{"threadId":handle,"cwd":"/tmp","sandbox":"read-only","approvalPolicy":"never"}})
+    }else{
+        json!({"id":3,"method":"thread/start","params":{"cwd":"/tmp","ephemeral":!config.is_some_and(|c|c.retain),"sandbox":"read-only","approvalPolicy":"never"}})
+    };
     write_ready(session,format!("{start}\n").as_bytes(),deadline).await?;
     let result=codex_read(session,capture,3,deadline,&mut early).await?;
     if !codex_readonly(&result){return Err("Effective thread policy not confirmed".into());}
     let thread=codex_id(&result["thread"]["id"])?.to_owned();
-    early.clear();
-    let start=json!({"id":4,"method":"turn/start","params":{"threadId":thread,"input":[{"type":"text","text":prompt,"text_elements":[]}] }});
+    if config.and_then(|c|c.resume.as_deref()).is_some_and(|h|h!=thread){return Err("Resumed thread mismatch".into());}
+    Ok(thread)
+}
+async fn codex_text_turn(session:&IshSession,capture:&mut Capture,prompt:&str,deadline:Instant)->Result<String,String>{
+    let thread=codex_open_thread(session,capture,None,deadline).await?;
+    codex_turn(session,capture,&thread,4,prompt,deadline).await
+}
+async fn codex_turn(session:&IshSession,capture:&mut Capture,thread:&str,id:i64,prompt:&str,deadline:Instant)->Result<String,String>{
+    let mut early=Vec::new();
+    let start=json!({"id":id,"method":"turn/start","params":{"threadId":thread,"input":[{"type":"text","text":prompt,"text_elements":[]}] }});
     write_ready(session,format!("{start}\n").as_bytes(),deadline).await?;
-    let result=codex_read(session,capture,4,deadline,&mut early).await?;
+    let result=codex_read(session,capture,id,deadline,&mut early).await?;
     let turn=codex_id(&result["turn"]["id"])?.to_owned();
     let mut queue=std::collections::VecDeque::from(early);
     let mut output=String::new();
@@ -990,6 +1002,12 @@ async fn codex_text_turn(session:&IshSession,capture:&mut Capture,prompt:&str,de
     Err("Turn event limit exceeded".into())
 }
 pub(crate) async fn codex_app_server_probe(guest:&IshInstance,env:&HashMap<String,String>,fixture:bool,prompt:Option<&str>)->Value{
+    codex_run(guest,env,fixture,prompt,None).await
+}
+pub(crate) async fn codex_session(guest:&IshInstance,env:&HashMap<String,String>,prompt:&str,config:&crate::local_jobs::NativeSession,fixture:bool)->Value{
+    codex_run(guest,env,fixture,Some(prompt),Some(config)).await
+}
+async fn codex_run(guest:&IshInstance,env:&HashMap<String,String>,fixture:bool,prompt:Option<&str>,config:Option<&crate::local_jobs::NativeSession>)->Value{
     let mut opts=SpawnOpts::cmd(["/opt/nexus/codex","app-server"]);
     #[cfg(test)]
     if fixture{opts=shell(include_str!("../fixtures/codex-app-server.sh"),env);}
@@ -1016,9 +1034,29 @@ pub(crate) async fn codex_app_server_probe(guest:&IshInstance,env:&HashMap<Strin
         let mut r=json!({"ok":true,"initializeVerified":true,"accountReadVerified":true,"accountPresent":present,"requiresOpenaiAuth":requires});
         if let Some(prompt)=prompt{
             if !present{return Err("CLI sign-in required before native chat".into());}
-            let text=codex_text_turn(&session,&mut capture,prompt,deadline).await?;
-            r["turnCompleted"]=json!(true);
-            r["response"]=json!(text);
+            if let Some(config)=config{
+                use crate::local_jobs::{agent_complete,agent_next,AgentNext,valid_handle};
+                let thread=codex_open_thread(&session,&mut capture,Some(config),deadline).await?;
+                if config.retain&&!valid_handle(&thread){return Err("Invalid saved thread handle".into());}
+                let mut message=prompt.to_owned();
+                let mut completed=0i64;
+                loop{
+                    let text=codex_turn(&session,&mut capture,&thread,4+completed,&message,Instant::now()+Duration::from_secs(120)).await?;
+                    if !agent_complete(&message,&text,if config.retain{Some(thread.as_str())}else{None}){return Err("Session cancelled".into());}
+                    completed+=1;
+                    match agent_next().await{
+                        AgentNext::Prompt(next)=>message=next,
+                        AgentNext::Finish=>break,
+                        AgentNext::Stop=>return Err("Session stopped".into()),
+                    }
+                }
+                r["turnsCompleted"]=json!(completed);
+                r["sessionFinished"]=json!(true);
+            }else{
+                let text=codex_text_turn(&session,&mut capture,prompt,deadline).await?;
+                r["turnCompleted"]=json!(true);
+                r["response"]=json!(text);
+            }
         }
         Ok(r)
     }.await;
@@ -1080,6 +1118,32 @@ pub(crate) async fn claude_text_turn(guest:&IshInstance,env:&HashMap<String,Stri
             json!({"ok":true,"turnCompleted":true,"response":text})
         },
         _=>json!({"ok":false,"error":"Claude text turn rejected, timed out or failed"}),
+    }
+}
+
+pub(crate) async fn claude_session(guest:&IshInstance,env:&HashMap<String,String>,prompt:&str,config:&crate::local_jobs::NativeSession,fixture:bool)->Value{
+    use crate::local_jobs::{agent_complete,agent_next,AgentNext,valid_uuid};
+    if !fixture&&claude_auth_probe(guest,env,false).await["accountPresent"]!=true{return json!({"ok":false,"error":"Use official CLI sign-in first"});}
+    let mut handle=config.resume.clone();
+    let mut message=prompt.to_owned();
+    let mut completed=0;
+    loop{
+        let mut argv=vec!["/opt/nexus/claude","--safe-mode","--print","--output-format","json","--tools","","--disallowedTools","mcp__*","--strict-mcp-config","--mcp-config","{\"mcpServers\":{}}","--permission-mode","dontAsk","--max-turns","1","--no-chrome"];
+        if let Some(id)=handle.as_deref(){argv.extend(["--resume",id]);}
+        argv.extend(["--",message.as_str()]);
+        let Ok((frame,0))=claude_json(guest,env,argv,fixture,120).await else{return json!({"ok":false,"error":"Claude session failed or cancelled"});};
+        if frame["type"]!="result"||frame["subtype"]!="success"||frame["is_error"]!=false{return json!({"ok":false,"error":"Claude turn rejected"});}
+        let Some(id)=frame["session_id"].as_str().filter(|id|valid_uuid(id))else{return json!({"ok":false,"error":"Missing valid Claude session ID"});};
+        if handle.as_deref().is_some_and(|h|h!=id){return json!({"ok":false,"error":"Claude session mismatch"});}
+        let Some(text)=frame["result"].as_str().filter(|s|!s.trim().is_empty()&&s.len()<=8192&&s.chars().all(|c|!c.is_control()||c=='\n'||c=='\t'))else{return json!({"ok":false,"error":"Invalid Claude text result"});};
+        handle=Some(id.to_owned());
+        if !agent_complete(&message,text,if config.retain{handle.as_deref()}else{None}){return json!({"ok":false,"error":"Session stopped"});}
+        completed+=1;
+        match agent_next().await{
+            AgentNext::Prompt(next)=>message=next,
+            AgentNext::Finish=>return json!({"ok":true,"turnsCompleted":completed,"sessionFinished":true}),
+            AgentNext::Stop=>return json!({"ok":false,"error":"Session stopped"}),
+        }
     }
 }
 
