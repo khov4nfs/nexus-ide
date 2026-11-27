@@ -474,9 +474,27 @@ pub(crate) async fn prepare_gemini_provider(guest: &IshInstance, env: &HashMap<S
     let script = r#"
 set -eu
 umask 077
-test ! -e /root/.gemini
-mkdir -p /root/.gemini/antigravity-cli
-printf '%s\n' '{"modelProvider":"gemini"}' > /root/.gemini/antigravity-cli/settings.json
+# Fresh guest: create only the known provider config. Reopened guest:
+# accept identical config, never overwrite changed files or follow symlinks.
+base=/root/.gemini
+dir="$base/antigravity-cli"
+settings="$dir/settings.json"
+test ! -L /root
+test ! -L "$base"
+test ! -L "$dir"
+test ! -L "$settings"
+if [ -e "$base" ]; then
+    test -d "$base"
+    test -d "$dir"
+    test -f "$settings"
+    test "$(wc -c < "$settings")" -le 8192
+    expected=$(printf '%s\n' '{"modelProvider":"gemini"}' | /usr/bin/sha256sum)
+    actual=$(/usr/bin/sha256sum "$settings")
+    test "${expected%% *}" = "${actual%% *}"
+else
+    mkdir -p "$dir"
+    (set -C; printf '%s\n' '{"modelProvider":"gemini"}' > "$settings")
+fi
 "#;
     let mut opts = shell(script, env);
     opts.pipe_stdin = false;
@@ -895,6 +913,174 @@ pub(crate) async fn local_hook_with_timeout(guest:&IshInstance,env:&HashMap<Stri
         let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
     }
     result.is_ok() && capture.closed && capture.exited && capture.code==Some(0) && capture.signal.unwrap_or(0)==0 && !crate::local_jobs::stop_requested()
+}
+
+// Codex app-server JSONL intentionally does not use ACP's JSON-RPC version
+// requirement. Only the fixed initialize/account read sequence is exposed.
+async fn codex_next(session:&IshSession,capture:&mut Capture,deadline:Instant)->Result<Value,String>{
+    loop {
+        if crate::local_jobs::stop_requested()||Instant::now()>=deadline{return Err("App-server cancelled or timed out".into());}
+        if let Some(end)=capture.stdout.iter().position(|b|*b==b'\n'){
+            let line=capture.stdout.drain(..=end).collect::<Vec<_>>();
+            let frame:Value=serde_json::from_slice(&line).map_err(|_|"Invalid app-server frame")?;
+            if !frame.is_object(){return Err("Invalid app-server message".into());}
+            if frame.get("method").is_some() && frame.get("id").is_some(){return Err("Unexpected app-server request; no approval granted".into());}
+            return Ok(frame);
+        }
+        if capture.exited||capture.closed||!capture.pty.is_empty(){return Err("App-server stopped".into());}
+        capture.stderr.clear();
+        capture.poll(session,deadline).await?;
+    }
+}
+async fn codex_read(session:&IshSession,capture:&mut Capture,id:i64,deadline:Instant,early:&mut Vec<Value>)->Result<Value,String>{
+    loop{
+        let frame=codex_next(session,capture,deadline).await?;
+        if frame["method"].is_string(){
+            if early.len()>=64{return Err("Too many app-server notifications".into());}
+            early.push(frame);continue;
+        }
+        if frame["id"].as_i64()!=Some(id)||frame.get("error").is_some()||!frame["result"].is_object(){return Err("App-server response rejected".into());}
+        return Ok(frame["result"].clone());
+    }
+}
+fn codex_id(v:&Value)->Result<&str,String>{v.as_str().filter(|s|!s.is_empty()&&s.len()<=256&&!s.chars().any(char::is_control)).ok_or("Invalid app-server identifier".into())}
+fn codex_readonly(result:&Value)->bool{
+    result["approvalPolicy"]=="never"&&result["sandbox"]["type"]=="readOnly"&&result["sandbox"]["networkAccess"]==false
+}
+async fn codex_text_turn(session:&IshSession,capture:&mut Capture,prompt:&str,deadline:Instant)->Result<String,String>{
+    let mut early=Vec::new();
+    let start=json!({"id":3,"method":"thread/start","params":{"cwd":"/tmp","ephemeral":true,"sandbox":"read-only","approvalPolicy":"never"}});
+    write_ready(session,format!("{start}\n").as_bytes(),deadline).await?;
+    let result=codex_read(session,capture,3,deadline,&mut early).await?;
+    if !codex_readonly(&result){return Err("Effective thread policy not confirmed".into());}
+    let thread=codex_id(&result["thread"]["id"])?.to_owned();
+    early.clear();
+    let start=json!({"id":4,"method":"turn/start","params":{"threadId":thread,"input":[{"type":"text","text":prompt,"text_elements":[]}] }});
+    write_ready(session,format!("{start}\n").as_bytes(),deadline).await?;
+    let result=codex_read(session,capture,4,deadline,&mut early).await?;
+    let turn=codex_id(&result["turn"]["id"])?.to_owned();
+    let mut queue=std::collections::VecDeque::from(early);
+    let mut output=String::new();
+    for _ in 0..512{
+        let frame=match queue.pop_front(){Some(f)=>f,None=>codex_next(session,capture,deadline).await?};
+        let p=&frame["params"];
+        let method=frame["method"].as_str().ok_or("Unexpected turn response")?;
+        match method{
+            "item/agentMessage/delta"=>{
+                if p["threadId"]!=thread||p["turnId"]!=turn{return Err("Turn delta mismatch".into());}
+                let text=p["delta"].as_str().ok_or("Invalid delta")?;
+                if output.len()+text.len()>8192||text.chars().any(|c|c.is_control()&&c!='\n'&&c!='\t'){return Err("Unsupported turn output".into());}
+                output.push_str(text);
+            },
+            "item/started"|"item/completed"=>{
+                if p["threadId"]!=thread||p["turnId"]!=turn{return Err("Turn item mismatch".into());}
+                if !matches!(p["item"]["type"].as_str(),Some("userMessage"|"agentMessage"|"reasoning"|"plan")){return Err("Non-text item observed; stopping turn".into());}
+            },
+            "turn/completed"=>{
+                if p["threadId"]!=thread||p["turn"]["id"]!=turn||p["turn"]["status"]!="completed"||output.trim().is_empty(){return Err("Turn not successfully completed".into());}
+                return Ok(output);
+            },
+            "turn/started"=>{
+                if p["threadId"]!=thread||p["turn"]["id"]!=turn{return Err("Turn start mismatch".into());}
+            },
+            // Do not expose unrelated metadata or treat it as approval.
+            _=>{}
+        }
+    }
+    Err("Turn event limit exceeded".into())
+}
+pub(crate) async fn codex_app_server_probe(guest:&IshInstance,env:&HashMap<String,String>,fixture:bool,prompt:Option<&str>)->Value{
+    let mut opts=SpawnOpts::cmd(["/opt/nexus/codex","app-server"]);
+    #[cfg(test)]
+    if fixture{opts=shell(include_str!("../fixtures/codex-app-server.sh"),env);}
+    #[cfg(not(test))]
+    if fixture{return json!({"ok":false});}
+    opts.cwd=Some(Path::new("/tmp").to_path_buf());
+    opts.envp=Some(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect());
+    opts.pipe_stdin=true;
+    let Ok(session)=guest.spawn(opts) else{return json!({"ok":false,"error":"App-server spawn failed"});};
+    let mut capture=Capture::default();
+    let deadline=Instant::now()+Duration::from_secs(if prompt.is_some(){120}else{30});
+    let result:Result<Value,String>=async{
+        let init=json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"nexus-ios","version":"0.6.0"}}});
+        let mut early=Vec::new();
+        write_ready(&session,format!("{init}\n").as_bytes(),deadline).await?;
+        let init=codex_read(&session,&mut capture,1,deadline,&mut early).await?;
+        if !init["userAgent"].as_str().is_some_and(|s|!s.is_empty()){return Err("Unsupported initialize response".into());}
+        early.clear();
+        write_ready(&session,b"{\"method\":\"initialized\"}\n",deadline).await?;
+        write_ready(&session,b"{\"id\":2,\"method\":\"account/read\",\"params\":{\"refreshToken\":false}}\n",deadline).await?;
+        let account=codex_read(&session,&mut capture,2,deadline,&mut early).await?;
+        let requires=account["requiresOpenaiAuth"].as_bool().ok_or("Unsupported account response")?;
+        let present=match account.get("account"){Some(Value::Null)=>false,Some(Value::Object(_))=>true,_=>return Err("Unsupported account shape".into())};
+        let mut r=json!({"ok":true,"initializeVerified":true,"accountReadVerified":true,"accountPresent":present,"requiresOpenaiAuth":requires});
+        if let Some(prompt)=prompt{
+            if !present{return Err("CLI sign-in required before native chat".into());}
+            let text=codex_text_turn(&session,&mut capture,prompt,deadline).await?;
+            r["turnCompleted"]=json!(true);
+            r["response"]=json!(text);
+        }
+        Ok(r)
+    }.await;
+    let stopped=session.terminate().await.is_ok();
+    let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;
+    match result{
+        Ok(mut r)=>{r["ok"]=json!(stopped&&closed);r["transportClosed"]=json!(closed);if !stopped||!closed{r.as_object_mut().unwrap().remove("response");}r},
+        Err(_)=>json!({"ok":false,"error":"App-server operation rejected, sign-in needed, timed out or cancelled","transportClosed":closed}),
+    }
+}
+
+// Official Claude CLI JSON mode. Never parse or export account identity,
+// arbitrary stderr or auth tokens; the harness owns its authentication.
+async fn claude_json(guest:&IshInstance,env:&HashMap<String,String>,argv:Vec<&str>,fixture:bool,seconds:u64)->Result<(Value,i32),String>{
+    let mut opts=SpawnOpts::cmd(argv);
+    #[cfg(test)]
+    if fixture{opts=shell(include_str!("../fixtures/claude-json.sh"),env);}
+    #[cfg(not(test))]
+    if fixture{return Err("Fixture unavailable".into());}
+    opts.cwd=Some(Path::new("/tmp").to_path_buf());
+    opts.envp=Some(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect());
+    opts.pipe_stdin=false;
+    let session=guest.spawn(opts).map_err(|_|"Claude spawn failed")?;
+    let mut capture=Capture::default();
+    let deadline=Instant::now()+Duration::from_secs(seconds);
+    let result:Result<(),String>=async{
+        while !capture.closed {
+            if crate::local_jobs::stop_requested(){return Err("Cancelled".into());}
+            capture.poll(&session,deadline).await?;
+        }
+        Ok(())
+    }.await;
+    if result.is_err(){let _=session.terminate().await;let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;return Err("Claude operation cancelled or timed out".into());}
+    if !capture.exited||capture.signal.unwrap_or(0)!=0||!capture.pty.is_empty(){return Err("Claude process did not exit normally".into());}
+    let frame:Value=serde_json::from_slice(&capture.stdout).map_err(|_|"Invalid Claude JSON")?;
+    if !frame.is_object(){return Err("Invalid Claude result".into());}
+    Ok((frame,capture.code.ok_or("No exit code")?))
+}
+pub(crate) async fn claude_auth_probe(guest:&IshInstance,env:&HashMap<String,String>,fixture:bool)->Value{
+    match claude_json(guest,env,vec!["/opt/nexus/claude","auth","status"],fixture,30).await{
+        Ok((frame,code)) if matches!(code,0|1)=>{
+            let auth=frame["authMethod"].as_str().unwrap_or("");
+            let valid=matches!(auth,"none"|"claude.ai"|"oauth_token"|"api_key"|"api_key_helper"|"third_party");
+            let logged=code==0;
+            if valid && (logged==(auth!="none")) && frame.get("loggedIn").is_none_or(|v|v.as_bool()==Some(logged)){
+                json!({"ok":true,"accountReadVerified":true,"accountPresent":logged})
+            }else{json!({"ok":false,"error":"Unsupported Claude authentication response"})}
+        },
+        _=>json!({"ok":false,"error":"Claude authentication status unavailable"}),
+    }
+}
+pub(crate) async fn claude_text_turn(guest:&IshInstance,env:&HashMap<String,String>,prompt:&str,fixture:bool)->Value{
+    if !fixture && claude_auth_probe(guest,env,false).await["accountPresent"]!=true{return json!({"ok":false,"error":"Use official CLI sign-in first"});}
+    // No shell interpolation, no custom hooks/plugins, no bypass permissions.
+    let argv=vec!["/opt/nexus/claude","--safe-mode","--print","--output-format","json","--tools","","--disallowedTools","mcp__*","--strict-mcp-config","--mcp-config","{\"mcpServers\":{}}","--permission-mode","dontAsk","--no-session-persistence","--",prompt];
+    match claude_json(guest,env,argv,fixture,120).await{
+        Ok((frame,0)) if frame["type"]=="result"&&frame["subtype"]=="success"&&frame["is_error"]==false=>{
+            let Some(text)=frame["result"].as_str().filter(|s|!s.trim().is_empty()&&s.len()<=8192&&s.chars().all(|c|!c.is_control()||c=='\n'||c=='\t')) else{return json!({"ok":false,"error":"Invalid Claude text result"});};
+            json!({"ok":true,"turnCompleted":true,"response":text})
+        },
+        _=>json!({"ok":false,"error":"Claude text turn rejected, timed out or failed"}),
+    }
 }
 
 // User-initiated local jobs in a separate disposable Ubuntu boot. No host
