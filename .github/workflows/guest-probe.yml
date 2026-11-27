@@ -477,9 +477,13 @@ jobs:
           export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
           export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
           export CC="$(xcrun --sdk macosx --find clang)"
-          for phase in success unexpectedCallback; do
-            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-adapter-$phase"
-            export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-adapter-$phase/data"
+          for phase in success resume unexpectedCallback unsupportedResume; do
+            if [ "$phase" = resume ]; then
+              export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-adapter-success/data"
+            else
+              cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-adapter-$phase"
+              export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-adapter-$phase/data"
+            fi
             export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-adapter-$phase.json"
             export NEXUS_ADAPTER_PHASE="$phase"
             cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_local_adapter_fixture -- --ignored --nocapture --test-threads=1

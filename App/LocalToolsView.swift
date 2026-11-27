@@ -51,6 +51,7 @@ struct LocalToolsView: View {
     @State private var adapterArgv = #"["/usr/local/bin/claude-agent-acp"]"#
     @State private var adapterDigest = ""
     @State private var adapterPrompt = ""
+    @State private var adapterResume = ""
     @State private var transferName = ""
     @State private var transferAction = "push"
     @State private var transferSnapshot: WorkspaceSnapshot?
@@ -104,7 +105,8 @@ struct LocalToolsView: View {
                         TextField("Reviewed absolute adapter argv (JSON)", text: $adapterArgv, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
                         TextField("Adapter executable SHA-256", text: $adapterDigest).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
                         TextField("First message", text: $adapterPrompt, axis: .vertical).disabled(model.guestClaimed)
-                        Text("Use an upstream ACP v1 adapter installed and authenticated in the saved local-tools guest. Review its executable and dependencies. No native grants, no automatic install/login, permissions denied, no saved session resume. Agent may access guest data and network.").font(.caption)
+                        TextField("Saved session handle (optional)", text: $adapterResume).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
+                        Text("Use an upstream ACP v1 adapter installed and authenticated in the saved local-tools guest. Review its executable and dependencies. Resume only when the adapter advertises loadSession; old replay is not displayed. No native grants, no automatic install/login. Permission requests denied. Agent may access guest data and network.").font(.caption)
                     } else if mode == 9 {
                         Picker("Direction", selection: $transferAction) { Text("Export native file").tag("push"); Text("Import Linux file").tag("pull") }.disabled(model.guestClaimed)
                         TextField("Guest filename", text: $transferName).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
@@ -228,7 +230,10 @@ struct LocalToolsView: View {
                         frozenCLI = mode == 6 ? cliImport : nil
                         frozenHooks = mode == 1 && enableHooks
                         if mode == 10 {
-                            guard let argv = try? ACPTerminalApproval.parse(Data(adapterArgv.utf8)), AGYImportFormat.validDigest(adapterDigest), !adapterPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, adapterPrompt.utf8.count <= 2048, !adapterPrompt.utf8.contains(0), let wire = try? JSONSerialization.data(withJSONObject: ["argv":argv.arguments,"sha256":adapterDigest,"prompt":adapterPrompt], options: [.sortedKeys]), wire.count <= 8192 else { report = "Invalid reviewed adapter request"; return }
+                            guard let argv = try? ACPTerminalApproval.parse(Data(adapterArgv.utf8)), AGYImportFormat.validDigest(adapterDigest), !adapterPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, adapterPrompt.utf8.count <= 2048, !adapterPrompt.utf8.contains(0), adapterResume.utf8.count <= 128, adapterResume.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45,95].contains($0) }) else { report = "Invalid reviewed adapter request"; return }
+                            var request: [String: Any] = ["argv":argv.arguments,"sha256":adapterDigest,"prompt":adapterPrompt]
+                            if !adapterResume.isEmpty { request["resume"] = adapterResume }
+                            guard let wire = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), wire.count <= 8192 else { report = "Invalid reviewed adapter request"; return }
                             frozenInput = String(decoding: wire, as: UTF8.self)
                         } else if mode == 9 {
                             guard let snap = transferSnapshot, !transferName.isEmpty, transferName.utf8.count <= 128, !transferName.hasPrefix("."), transferName.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45,46,95].contains($0) }) else { report = "Invalid guest filename or snapshot"; return }

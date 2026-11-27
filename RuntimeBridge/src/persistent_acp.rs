@@ -832,9 +832,23 @@ pub(crate) async fn local_adapter_session(guest:&IshInstance,env:&HashMap<String
     let result:Result<Value,String>=async{
         let init=exchange.request(process_probe::AGY_INITIALIZE_REQUEST,1).await?;
         if init["result"]["protocolVersion"]!=1||init.get("error").is_some(){return Err("Unsupported ACP version or login required".into());}
-        let created=exchange.request(NEW_REQUEST,2).await?;
-        if !session_created(&created){return Err("Session creation rejected; use upstream login first".into());}
-        let id=created["result"]["sessionId"].as_str().filter(|s|valid_session_handle(s)).ok_or("Invalid ACP session handle")?;
+        let supports_load=init["result"]["agentCapabilities"]["loadSession"]==true;
+        let mut replay=0usize;
+        let id=if let Some(handle)=input.resume.as_deref(){
+            if !supports_load{return Err("Adapter does not advertise session load".into());}
+            let wire=format!("{}\n",json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":handle,"cwd":"/tmp","mcpServers":[]}}));
+            let loaded=exchange.request_updates(wire.as_bytes(),2,|f|{
+                if f["method"]!="session/update"||f["params"]["sessionId"]!=handle||!f["params"]["update"].is_object()||replay>=128{return Err("Invalid or excessive adapter replay".into());}
+                replay+=1;Ok(())
+            }).await?;
+            if loaded.get("error").is_some()||!loaded["result"].is_object(){return Err("Adapter session load rejected".into());}
+            handle.to_owned()
+        }else{
+            let created=exchange.request(NEW_REQUEST,2).await?;
+            if !session_created(&created){return Err("Session creation rejected; use upstream login first".into());}
+            created["result"]["sessionId"].as_str().filter(|s|valid_session_handle(s)).ok_or("Invalid ACP session handle")?.to_owned()
+        };
+        let id=id.as_str();
         let mut message=input.prompt.clone();
         let mut turns=0i64;
         let mut denials=0usize;
@@ -864,7 +878,7 @@ pub(crate) async fn local_adapter_session(guest:&IshInstance,env:&HashMap<String
                     Ok(reply)
                 },None).await?;
             if stop_requested()||r.get("error").is_some()||r["result"]["stopReason"]!="end_turn"||evidence.text.trim().is_empty()||evidence.text.len()>8192{return Err("Adapter turn rejected".into());}
-            if !agent_complete(&message,&evidence.text,None){return Err("Session stopped".into());}
+            if !agent_complete(&message,&evidence.text,if supports_load&&crate::local_jobs::valid_handle(id){Some(id)}else{None}){return Err("Session stopped".into());}
             turns+=1;
             match agent_next().await{
                 AgentNext::Prompt(p)=>message=p,
@@ -872,7 +886,7 @@ pub(crate) async fn local_adapter_session(guest:&IshInstance,env:&HashMap<String
                 AgentNext::Stop=>return Err("Session stopped".into()),
             }
         }
-        Ok(json!({"ok":true,"turnsCompleted":turns,"permissionDenials":denials,"sessionFinished":true}))
+        Ok(json!({"ok":true,"turnsCompleted":turns,"permissionDenials":denials,"sessionFinished":true,"sessionLoaded":input.resume.is_some(),"replayUpdates":replay,"replayWithheld":true}))
     }.await;
     let closed=exchange.close().await;
     let mut r=result.unwrap_or_else(|_|json!({"ok":false,"error":"ACP adapter rejected, stopped, unsupported or authentication required"}));

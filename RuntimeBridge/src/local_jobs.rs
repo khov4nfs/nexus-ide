@@ -124,17 +124,19 @@ fn parse_cli(input:&str)->Option<(String,String,String,Option<String>,Option<Nat
     }else{None};
     Some((kind.into(),digest.into(),action.into(),prompt,session))
 }
-pub(crate) struct AdapterInput {pub argv:Vec<String>,pub digest:String,pub prompt:String}
+pub(crate) struct AdapterInput {pub argv:Vec<String>,pub digest:String,pub prompt:String,pub resume:Option<String>}
 fn parse_adapter(input:&str)->Option<AdapterInput>{
     if input.len()>8192{return None;}
     let v:Value=serde_json::from_str(input).ok()?;
-    if v.as_object()?.len()!=3||!v["argv"].is_array(){return None;}
+    let fields=v.as_object()?.len();
+    if !matches!(fields,3|4)||!v["argv"].is_array(){return None;}
     let argv=process_probe::terminal_command(&v["argv"].to_string())?;
     let digest=v["sha256"].as_str()?;
     if !process_probe::agy_digest_ok(digest){return None;}
     let prompt=v["prompt"].as_str()?;
     if !valid_agent_text(prompt){return None;}
-    Some(AdapterInput{argv,digest:digest.into(),prompt:prompt.into()})
+    let resume=if fields==4{let s=v["resume"].as_str()?;if !valid_handle(s){return None;}Some(s.to_owned())}else{None};
+    Some(AdapterInput{argv,digest:digest.into(),prompt:prompt.into(),resume})
 }
 pub(crate) struct TransferInput {pub name:String,pub text:Option<String>}
 fn parse_transfer(input:&str)->Option<TransferInput>{
@@ -518,7 +520,9 @@ mod tests {
         let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
         let report=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
         let phase=std::env::var("NEXUS_ADAPTER_PHASE").expect("phase");
-        let input=parse_adapter(&json!({"argv":["/usr/bin/true"],"sha256":"a".repeat(64),"prompt":"First adapter prompt"}).to_string()).unwrap();
+        let mut request=json!({"argv":["/usr/bin/true"],"sha256":"a".repeat(64),"prompt":"First adapter prompt"});
+        if matches!(phase.as_str(),"resume"|"unsupportedResume"){request["resume"]=json!("adapter-fixture");}
+        let input=parse_adapter(&request.to_string()).unwrap();
         {
             let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=7;s.agent=Some(AgentMailbox::default());
         }
@@ -545,7 +549,7 @@ mod tests {
         let clean=rt.block_on(guest.shutdown()).is_ok();
         STATE.lock().unwrap().running=false;
         let driven=driver.join().unwrap();
-        let ok=if phase=="success"{driven&&r["ok"]==true&&r["turnsCompleted"]==2&&r["permissionDenials"]==1&&p["agentTurns"][1]["response"]=="Second adapter reply"}else{r["ok"]==false&&p["agentTurns"].as_array().is_some_and(|a|a.is_empty())};
+        let ok=if matches!(phase.as_str(),"success"|"resume"){driven&&r["ok"]==true&&r["turnsCompleted"]==2&&r["permissionDenials"]==1&&p["agentHandle"]=="adapter-fixture"&&p["agentTurns"][1]["response"]=="Second adapter reply"&&r["sessionLoaded"]==json!(phase=="resume")}else{r["ok"]==false&&p["agentTurns"].as_array().is_some_and(|a|a.is_empty())};
         std::fs::write(report,serde_json::to_vec_pretty(&json!({"ok":ok&&clean,"fixtureOnly":true,"phase":phase,"shutdownClean":clean})).unwrap()).unwrap();
         assert!(ok&&clean,"ACP adapter fixture failed: {r}");
     }
