@@ -56,6 +56,11 @@ struct UbuntuLabView: View {
     @State private var terminalChoice = ""
     @State private var customTerminal = #"["/usr/bin/printf","%s","hello"]"#
     @State private var pendingTerminal: String?
+    @State private var enableSessionMCP = false
+    @State private var mcpServerName = ""
+    @State private var mcpServerArgv = ""
+    @State private var pendingMCP: ACPStdioServer?
+    @State private var confirmMCP = false
     @State private var snapshotReadThisTurn = false
     @State private var pendingReadContent: String?
     @State private var loginURL = ""
@@ -170,7 +175,19 @@ struct UbuntuLabView: View {
                     Text("ACP permissions deny by default. Selected virtual file edits require native review. Agent internal actions are not sandboxed.").font(.caption)
                     if active {
                         Text("Connection closes after 180 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
-                        Button("Create empty guest session") { act(close: false) }.disabled(running || created)
+                        if useGemini && !created {
+                            Toggle("Register one reviewed local MCP server", isOn: $enableSessionMCP).disabled(running)
+                            if enableSessionMCP {
+                                TextField("Server name", text: $mcpServerName).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(running)
+                                TextField("JSON argv (existing guest executable)", text: $mcpServerArgv, axis: .vertical)
+                                    .font(.system(.body, design: .monospaced)).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(running)
+                                Text("The executable must already exist in the agent guest. Registration may start it immediately. AGY controls its lifecycle and may pass guest credentials; do not register untrusted servers. No HTTP transport or automatic install.").font(.caption)
+                            }
+                        }
+                        Button(enableSessionMCP && useGemini ? "Review MCP session" : "Create empty guest session") {
+                            if enableSessionMCP && useGemini { prepareMCP() }
+                            else { act(close: false) }
+                        }.disabled(running || created)
                         if created && (useGemini || useGoogle) {
                             Button("Test model response") { confirmPrompt = true }.disabled(running || importingContext || turnCount != 0)
                             TextField("Ask the agent", text: $chatInput, axis: .vertical)
@@ -355,6 +372,16 @@ struct UbuntuLabView: View {
                     if state.submitted { loginSubmitted = true }
                     try? await Task.sleep(nanoseconds: 200_000_000)
                 }
+            }
+            .confirmationDialog("Register this local MCP server for the entire agent session?", isPresented: $confirmMCP) {
+                Button("Register and create session") {
+                    let server = pendingMCP
+                    pendingMCP = nil
+                    if let server { act(close: false, mcp: server) }
+                }
+                Button("Cancel", role: .cancel) { pendingMCP = nil }
+            } message: {
+                Text((pendingMCP?.display ?? "") + "\nAGY may launch the executable and invoke tools internally, with side effects or network access. The bridge injects no MCP environment variables but cannot isolate guest secrets. Native permission requests remain deny-only. Only approve trusted code.")
             }
             .confirmationDialog("Send your message to the model?", isPresented: $confirmChat) {
                 Button("Send message") {
@@ -616,11 +643,23 @@ struct UbuntuLabView: View {
         }
     }
 
-    private func act(close: Bool) {
+    private func prepareMCP() {
+        guard active, !created, !running, useGemini else { return }
+        do {
+            let server = try ACPStdioServer(name: mcpServerName, argv: ACPTerminalApproval.parse(Data(mcpServerArgv.utf8)))
+            guard try credentialAllows(server.name), try server.argv.arguments.allSatisfy({ try credentialAllows($0) }) else {
+                agentStatus = "Credential detected in MCP descriptor"; return
+            }
+            pendingMCP = server
+            confirmMCP = true
+        } catch { agentStatus = "Invalid MCP name or JSON argv" }
+    }
+
+    private func act(close: Bool, mcp: ACPStdioServer? = nil) {
         guard active, !running else { return }
         running = true
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: close) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: close, mcp: mcp) }.value
             report = result.report
             agentStatus = result.status
             active = result.active
@@ -762,7 +801,7 @@ private enum UbuntuRunner {
         controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
     }
 
-    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false, terminal: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
+    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false, terminal: String? = nil, mcp: ACPStdioServer? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
@@ -771,7 +810,7 @@ private enum UbuntuRunner {
             else if let chat { pointer = chat.withCString { nexus_acp_chat($0) } }
             else if prompt { pointer = nexus_acp_prompt_probe() }
             else {
-                let request = String(decoding: try ACPRequest.newSession(id: 2, cwd: "/tmp"), as: UTF8.self)
+                let request = String(decoding: try ACPRequest.newSession(id: 2, cwd: "/tmp", mcp: mcp), as: UTF8.self)
                 pointer = request.withCString { nexus_acp_new_session($0) }
             }
             guard let pointer else {
@@ -797,7 +836,7 @@ private enum UbuntuRunner {
             } else if prompt && ok && active && object["promptVerified"] as? Bool == true && object["marker"] as? String == "NEXUS_ACP_OK" {
                 status = "Fixed model response verified"
             } else if !close && !prompt && ok && active && object["sessionCreated"] as? Bool == true && object["responseId"] as? Int == 2 {
-                status = "Empty guest session created; fixed test available in credential mode"
+                status = object["mcpConfigured"] as? Bool == true ? "Session accepted with MCP descriptor; server operation not verified" : "Empty guest session created; fixed test available in credential mode"
             } else if object["authenticationRequired"] as? Bool == true {
                 status = "Authentication required; connection stopped"
             } else {

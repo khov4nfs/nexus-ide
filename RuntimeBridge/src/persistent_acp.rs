@@ -85,7 +85,29 @@ fn valid_new(bytes: &[u8]) -> bool {
     if bytes.len() > 4096 || bytes.last() != Some(&b'\n') ||
         bytes[..bytes.len()-1].contains(&b'\n') { return false; }
     let Ok(frame) = serde_json::from_slice::<Value>(bytes) else { return false; };
-    frame == serde_json::from_slice::<Value>(NEW_REQUEST).expect("fixed new request")
+    let mut expected=serde_json::from_slice::<Value>(NEW_REQUEST).expect("fixed new request");
+    let Some(servers)=frame["params"]["mcpServers"].as_array() else {return false;};
+    if servers.is_empty() {return frame==expected;}
+    if servers.len()!=1 {return false;}
+    let server=&servers[0];
+    let Some(obj)=server.as_object() else {return false;};
+    if obj.len()!=4 || server["env"]!=json!([]) {return false;}
+    let Some(name)=server["name"].as_str() else {return false;};
+    if name.is_empty() || name.len()>64 || !name.bytes().all(|b|b.is_ascii_alphanumeric()||b"_.-".contains(&b)) {return false;}
+    let Some(program)=server["command"].as_str() else {return false;};
+    let Some(args)=server["args"].as_array() else {return false;};
+    let mut argv=vec![json!(program)];
+    argv.extend(args.iter().cloned());
+    if process_probe::terminal_command(&json!(argv).to_string()).is_none() {return false;}
+    expected["params"]["mcpServers"]=servers.clone().into();
+    frame==expected
+}
+fn session_mcp(bytes:&[u8])->Option<Value> {
+    serde_json::from_slice::<Value>(bytes).ok()?.get("params")?.get("mcpServers")?.as_array()?.first().cloned()
+}
+fn mcp_contains_credential(server:&Value,key:&str)->bool {
+    key.is_empty() || ["name","command"].iter().any(|f|server[*f].as_str().is_none_or(|s|s.contains(key))) ||
+        server["args"].as_array().is_none_or(|args|args.iter().any(|v|v.as_str().is_none_or(|s|s.contains(key))))
 }
 
 fn auth_error(frame: &Value) -> bool {
@@ -394,6 +416,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_TERMINAL").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_TERMINAL".into(),"1".into());}
     #[cfg(test)]
     if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_GOOGLE_EDIT").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_GOOGLE_EDIT".into(),"1".into());}
+    #[cfg(test)]
+    if matches!(&mode,Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_MCP_SESSION").as_deref()==Ok("1") {agent_env.insert("NEXUS_FIXTURE_MCP_SESSION".into(),"1".into());}
     opts.envp = Some(agent_env.into_iter().collect());
     opts.pipe_stdin = true;
     let session = match guest.spawn(opts) {
@@ -446,11 +470,17 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     let mut session_id: Option<String> = None;
     let mut turns: i64 = 0;
     let mut smoke_used = false;
+    let mut mcp_configured=false;
     let final_reply = loop {
         match commands.recv_timeout(IDLE) {
             Ok(Command::New(bytes, reply)) => {
                 if session_id.is_some() || !valid_new(&bytes) {
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Only one fixed session/new is allowed"}));
+                    continue;
+                }
+                let mcp=session_mcp(&bytes);
+                if mcp.as_ref().is_some_and(|s|!keyed || google || credential_filter.as_deref().is_none_or(|k|mcp_contains_credential(s,k))) {
+                    let _=reply.send(json!({"ok":false,"active":true,"error":"MCP descriptor requires reviewed Gemini-key session with no literal credential"}));
                     continue;
                 }
                 let result = rt.block_on(exchange.request(&bytes, 2));
@@ -463,7 +493,8 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                             break None;
                         }
                         session_id = frame["result"]["sessionId"].as_str().map(str::to_owned);
-                        if reply.send(json!({"ok":true,"active":true,"sessionCreated":true,"responseId":2})).is_err() {
+                        mcp_configured=mcp.is_some();
+                        if reply.send(json!({"ok":true,"active":true,"sessionCreated":true,"responseId":2,"mcpConfigured":mcp_configured})).is_err() {
                             break None;
                         }
                     }
@@ -507,7 +538,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                 let request = json!({"jsonrpc":"2.0","id":response_id,"method":"session/prompt",
                     "params":{"sessionId":id,"prompt":[{"type":"text","text":text}]}});
                 let wire = format!("{request}\n");
-                let mut evidence = PromptEvidence {observe_granted_tools:edit || terminal_choice.is_some(),..Default::default()};
+                let mut evidence = PromptEvidence {observe_granted_tools:edit || terminal_choice.is_some() || mcp_configured,..Default::default()};
                 let progress = ProgressGuard::begin(response_id);
                 let mut cancel_taken = false;
                 let mut permission_ids = std::collections::HashSet::new();
@@ -905,6 +936,38 @@ mod tests {
         assert!(!valid_login_code(&"a".repeat(2049)));
     }
 
+    #[test]
+    fn mcp_descriptor_validation() {
+        let mut frame:Value=serde_json::from_slice(NEW_REQUEST).unwrap();
+        frame["params"]["mcpServers"]=json!([{"name":"test-server","command":"/usr/bin/printf","args":["%s","test"],"env":[]}]);
+        assert!(valid_new(format!("{frame}\n").as_bytes()));
+        let server=session_mcp(format!("{frame}\n").as_bytes()).unwrap();
+        assert!(mcp_contains_credential(&server,"test"));
+        assert!(!mcp_contains_credential(&server,"SECRET"));
+        frame["params"]["mcpServers"][0]["env"]=json!([{"name":"SECRET","value":"x"}]);
+        assert!(!valid_new(format!("{frame}\n").as_bytes()));
+        frame["params"]["mcpServers"][0]["env"]=json!([]);
+        frame["params"]["mcpServers"][0]["command"]=json!("https://example.com");
+        assert!(!valid_new(format!("{frame}\n").as_bytes()));
+    }
+    #[test]
+    #[ignore = "fresh Ubuntu fakefs; synthetic session MCP registration only"]
+    fn real_acp_mcp_session_transport() {
+        let path=std::env::var_os("NEXUS_ACP_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_ACP_EVIDENCE").expect("evidence");
+        let init=start(PathBuf::from(path),Mode::Fixture,process_probe::AGY_INITIALIZE_REQUEST.to_vec(),Some("NEXUS_TEST_ONLY_NOT_A_REAL_KEY".into()),false);
+        let mut frame:Value=serde_json::from_slice(NEW_REQUEST).unwrap();
+        frame["params"]["mcpServers"]=json!([{"name":"fixture","command":"/usr/bin/printf","args":["%s","NEXUS_MCP_DESCRIPTOR"],"env":[]}]);
+        let new=command(Action::New(format!("{frame}\n").into_bytes()));
+        let prompt=command(Action::Chat("Confirm registration fixture".into()));
+        let verified=prompt_progress()["text"]=="NEXUS_MCP_SESSION_OK";
+        let close=command(Action::Close);
+        let evidence=json!({"ok":init["ok"]==true && new["mcpConfigured"]==true && prompt["chatCompleted"]==true && verified && close["shutdownClean"]==true,
+            "fixtureOnly":true,"descriptorVerified":verified,"serverExecutionVerified":false,"shutdownClean":close["shutdownClean"]});
+        std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        println!("{evidence}");
+        assert_eq!(evidence["ok"],true);
+    }
     #[test]
     #[ignore = "fresh Ubuntu fakefs; synthetic ACP terminal peer only"]
     fn real_acp_terminal_transport() {

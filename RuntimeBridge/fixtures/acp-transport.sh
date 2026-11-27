@@ -15,10 +15,19 @@ printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name
 printf 'fixture diagnostic, not ACP stdout\n' >&2
 IFS= read -r second
 case "$second" in *'"method":"session/new"'*) ;; *) exit 52 ;; esac
+if [ "${NEXUS_FIXTURE_MCP_SESSION:-0}" = 1 ]; then
+    case "$second" in *'"args":["%s","NEXUS_MCP_DESCRIPTOR"]'*'"command":"/usr/bin/printf"'*'"env":[]'*'"name":"fixture"'*) ;; *) exit 115 ;; esac
+fi
 printf '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture-%s"}}\n' "$$"
 IFS= read -r third
 case "$third" in *'"method":"session/prompt"'*) ;; *) exit 54 ;; esac
 case "$third" in *'"sessionId":"fixture-'$$'"'*) ;; *) exit 55 ;; esac
+if [ "${NEXUS_FIXTURE_MCP_SESSION:-0}" = 1 ]; then
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"NEXUS_MCP_SESSION_OK"}}}}\n' "$$"
+    printf '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}\n'
+    IFS= read -r unexpected
+    exit 116
+fi
 if [ "${NEXUS_FIXTURE_GOOGLE_EDIT:-0}" = 1 ]; then
     test "${NEXUS_FIXTURE_GOOGLE:-0}" = 1
     case "$first" in *'"writeTextFile":true'*) ;; *) exit 111 ;; esac

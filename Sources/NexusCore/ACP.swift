@@ -33,8 +33,8 @@ public enum ACPRequest {
         if terminal { capabilities["terminal"] = true }
         return try encode(id: id, method: "initialize", params: ["protocolVersion": 1, "clientCapabilities": capabilities, "clientInfo": ["name": "nexus-ios", "version": "0.3.2"]])
     }
-    public static func newSession(id: Int, cwd: String) throws -> Data {
-        try encode(id: id, method: "session/new", params: ["cwd": cwd, "mcpServers": []])
+    public static func newSession(id: Int, cwd: String, mcp: ACPStdioServer? = nil) throws -> Data {
+        try encode(id: id, method: "session/new", params: ["cwd": cwd, "mcpServers": mcp.map { [$0.descriptor] } ?? []])
     }
     public static func prompt(id: Int, sessionID: String, text: String) throws -> Data {
         try encode(id: id, method: "session/prompt", params: ["sessionId": sessionID, "prompt": [["type": "text", "text": text]]])
