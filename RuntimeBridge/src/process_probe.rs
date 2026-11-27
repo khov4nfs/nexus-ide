@@ -15,6 +15,8 @@ struct Capture {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     pty: Vec<u8>,
+    rolling_pty: bool,
+    truncated_pty: bool,
     closed: bool,
     exited: bool,
     code: Option<i32>,
@@ -24,6 +26,16 @@ impl Capture {
     fn append(&mut self, seq: u64, stream: Stream, data: &[u8]) -> Result<(), String> {
         if seq <= self.cursor {
             return Err("nonmonotonic output sequence".into());
+        }
+        if self.rolling_pty && matches!(stream, Stream::Pty) {
+            let skip = data.len().saturating_sub(LIMIT);
+            let tail = &data[skip..];
+            let remove = (self.pty.len()+tail.len()).saturating_sub(LIMIT);
+            if skip > 0 || remove > 0 { self.truncated_pty = true; }
+            self.pty.drain(..remove);
+            self.pty.extend_from_slice(tail);
+            self.cursor = seq;
+            return Ok(());
         }
         if self.stdout.len() + self.stderr.len() + self.pty.len() + data.len() > LIMIT {
             return Err("probe output exceeded 64 KiB".into());
@@ -698,7 +710,8 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
         Ok(s) => s, Err(_) => return json!({"ok":false,"error":"Local process spawn failed"}),
     };
     let mut capture = Capture::default();
-    let deadline = Instant::now() + Duration::from_secs(300);
+    capture.rolling_pty = !workbench;
+    let deadline = Instant::now() + Duration::from_secs(if workbench {300} else {1800});
     let mut stopped = false;
     let result: Result<(),String> = async {
         loop {
@@ -720,13 +733,13 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
             capture.poll(&session, deadline).await?;
             // A stopped or failed process may have descendants. Only a clean
             // guest shutdown is final evidence of cleanup.
-            if !workbench { publish_output(&capture.pty, !capture.exited && !capture.closed); }
+            if !workbench { publish_output(&capture.pty, !capture.exited && !capture.closed, capture.truncated_pty); }
             else {
                 // Do not expose the server URL/token. Only a matching bind log
                 // from the reviewed process permits the native loopback view.
                 let bound = contains(&capture.stdout,b"Server bound to 127.0.0.1:18765") ||
                     contains(&capture.stderr,b"Server bound to 127.0.0.1:18765");
-                publish_output(&[], bound && !capture.exited && !capture.closed);
+                publish_output(&[], bound && !capture.exited && !capture.closed, false);
             }
             if capture.closed { break; }
         }
@@ -737,7 +750,7 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
         let _ = drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
     }
     json!({"ok":result.is_ok() && capture.closed && capture.exited,
-        "stopped":stopped,"exitCode":capture.code,"termSignal":capture.signal,
+        "stopped":stopped,"exitCode":capture.code,"termSignal":capture.signal,"outputTruncated":capture.truncated_pty,
         "closed":capture.closed,"error":if result.is_err() { Some("Local process deadline, output limit or transport failure") } else { None }})
 }
 

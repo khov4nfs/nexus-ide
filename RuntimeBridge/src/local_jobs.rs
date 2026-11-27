@@ -21,12 +21,13 @@ fn progress() -> Value {
     STATE.lock().map(|s| json!({"ok":true,"running":s.running,"ready":s.ready,"output":s.output,"stopRequested":s.stop}))
         .unwrap_or_else(|_| fail("Local status unavailable"))
 }
-pub(crate) fn publish_output(bytes: &[u8], ready: bool) {
+pub(crate) fn publish_output(bytes: &[u8], ready: bool, truncated: bool) {
     if let Ok(mut s) = STATE.lock() {
         // A plain-text PTY display, not an ANSI interpreter.
         if s.mode == 1 {
             s.output = String::from_utf8_lossy(bytes).chars()
                 .map(|c| if c.is_control() && !matches!(c,'\n'|'\r'|'\t') {'�'} else {c}).collect();
+            if truncated { s.output.insert_str(0,"[Older terminal output discarded]\n"); }
         }
         s.ready = ready && !s.stop;
     }
@@ -131,6 +132,26 @@ mod tests {
         assert!(!valid_command(&"x".repeat(2049)));
         assert!(valid_token(&"a".repeat(64)));
         assert!(!valid_token("token"));
+    }
+    #[test]
+    #[ignore = "requires separate process per persisted guest boot"]
+    fn real_persistent_local_guest() {
+        let path=std::env::var_os("NEXUS_PERSIST_ROOTFS").expect("rootfs");
+        let phase=std::env::var("NEXUS_PERSIST_PHASE").expect("phase");
+        let cmd=match phase.as_str() {
+            "write"=>"mkdir -p /root/nexus-test && printf 42 >/root/nexus-test/value && printf 'NEXUS_PERSIST_WRITTEN\\n'",
+            "read"=>"test \"$(cat /root/nexus-test/value)\" = 42 && printf 'NEXUS_PERSIST_READ\\n'",
+            "scroll"=>"head -c 100000 /dev/zero | tr '\\000' x; printf '\\nNEXUS_SCROLL_TAIL\\n'",
+            _=>panic!("invalid phase"),
+        };
+        let mut result=run(Path::new(&path),1,cmd);
+        let output=progress()["output"].as_str().unwrap_or("").to_owned();
+        let expected=match phase.as_str() {"write"=>"NEXUS_PERSIST_WRITTEN","read"=>"NEXUS_PERSIST_READ",_=>"NEXUS_SCROLL_TAIL"};
+        result["verified"]=json!(output.contains(expected) && (phase!="scroll" || (result["outputTruncated"]==true && output.contains("[Older terminal output discarded]"))));
+        result["ok"]=json!(result["ok"]==true && result["verified"]==true && result["exitCode"]==0);
+        println!("{result}");
+        std::fs::write(std::env::var_os("NEXUS_PERSIST_EVIDENCE").expect("evidence"),serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+        assert_eq!(result["ok"],true);
     }
     #[test]
     #[ignore = "requires fresh Ubuntu fakefs in a separate process"]

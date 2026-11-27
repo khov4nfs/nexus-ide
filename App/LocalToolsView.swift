@@ -10,6 +10,9 @@ import UniformTypeIdentifiers
 struct LocalToolsView: View {
     @ObservedObject var model: IDEModel
     @State private var mode: UInt8 = 1
+    @State private var keepGuest = false
+    @State private var frozenKeep = false
+    @State private var confirmReset = false
     @State private var command = "exec /bin/sh -i"
     @State private var line = ""
     @State private var running = false
@@ -31,7 +34,7 @@ struct LocalToolsView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Disposable local Ubuntu · one boot") {
+                Section("Local Ubuntu · one boot per app launch") {
                     Picker("Mode", selection: $mode) {
                         Text("PTY terminal").tag(UInt8(1))
                         Text("MCP discovery").tag(UInt8(2))
@@ -47,7 +50,13 @@ struct LocalToolsView: View {
                         Text(stagedWorkbench ? "Pinned workbench archive staged; runtime unverified." : "No workbench staged. See build instructions.")
                         Text("Separate guest workspace, not native Files. Token-protected loopback only.").font(.caption)
                     }
+                    if mode != 3 {
+                        Toggle("Keep Linux files across launches", isOn: $keepGuest).disabled(model.guestClaimed)
+                        Text("Local tools only; never shared with Agent. Unclean shutdown blocks reuse. Reset deletes saved Linux files, not native Files.").font(.caption)
+                        Button("Reset saved Linux environment", role: .destructive) { confirmReset = true }.disabled(model.guestClaimed)
+                    }
                     Button("Review and start local job") {
+                        frozenKeep = keepGuest && mode != 3
                         frozenMode = mode
                         frozenInput = command
                         confirm = true
@@ -104,11 +113,18 @@ struct LocalToolsView: View {
                     report = "Profile loaded; no execution until confirmed"
                 } catch { report = "Invalid local tool profile" }
             }
-            .confirmationDialog("Execute in disposable local Linux?", isPresented: $confirm) {
+            .alert("Delete saved Linux environment?", isPresented: $confirmReset) {
+                Button("Delete saved Linux files", role: .destructive) {
+                    guard !model.guestClaimed else { return }
+                    report = LocalRunner.resetSaved()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { Text("This permanently deletes the saved local-tools guest, including installed packages and guest files. Native editor files and Agent are separate.") }
+            .confirmationDialog("Execute in local Linux?", isPresented: $confirm) {
                 Button("Start") { start() }
                 Button("Cancel", role: .cancel) { frozenInput = "" }
             } message: {
-                Text(frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution.")
+                Text(frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
             .task(id: running) {
                 while running && !Task.isCancelled {
@@ -140,11 +156,12 @@ struct LocalToolsView: View {
         } else { input = frozenInput }
         guard model.claimGuest() else { return }
         let selectedMode = frozenMode
+        let persistent = frozenKeep
         running = true
         report = "Starting local guest"
         Task {
             report = await Task.detached(priority: .userInitiated) {
-                LocalRunner.run(mode: selectedMode, input: input)
+                LocalRunner.run(mode: selectedMode, input: input, persistent: persistent)
             }.value
             output = LocalRunner.progress().output
             ready = false
@@ -205,17 +222,46 @@ private enum LocalRunner {
     }
     static func resize() -> Bool { decode(nexus_local_resize(111, 33))["ok"] as? Bool == true }
     static func stop() -> Bool { decode(nexus_local_stop())["ok"] as? Bool == true }
-    static func run(mode: UInt8, input: String) -> String {
+    static func savedStore() throws -> LocalGuestStore {
+        let parent = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        var container = parent.appendingPathComponent("NexusLocalTools", isDirectory: true)
+        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try container.setResourceValues(values)
+        return LocalGuestStore(directory: container.appendingPathComponent("guest-v1", isDirectory: true))
+    }
+    static func resetSaved() -> String {
+        do { try savedStore().reset(); return "Saved Linux environment deleted" }
+        catch { return "Saved environment reset failed" }
+    }
+    static func run(mode: UInt8, input: String, persistent: Bool) -> String {
         do {
             guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else { return "Missing Ubuntu assets" }
-            let trial = FileManager.default.temporaryDirectory.appendingPathComponent("NexusLocal-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.copyItem(at: root, to: trial)
-            let result = trial.appendingPathComponent("data").path.withCString { path in
+            let fm = FileManager.default
+            let store = persistent ? try savedStore() : nil
+            let trial = fm.temporaryDirectory.appendingPathComponent("NexusLocal-\(UUID().uuidString)", isDirectory: true)
+            let dataPath: URL
+            if let store {
+                dataPath = try store.prepare(from: root)
+            } else {
+                try fm.copyItem(at: root, to: trial)
+                dataPath = trial.appendingPathComponent("data")
+            }
+            var result = dataPath.path.withCString { path in
                 input.withCString { decode(nexus_local_run(path, mode, $0)) }
             }
+            if result["shutdownClean"] as? Bool == true {
+                if let store {
+                    do { try store.markClean(); result["savedGuestReusable"] = true }
+                    catch { result["savedGuestReusable"] = false }
+                } else { try? fm.removeItem(at: trial) }
+            } else if persistent { result["savedGuestReusable"] = false }
             guard let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted,.sortedKeys]) else { return "Invalid local report" }
             return String(decoding: data, as: UTF8.self)
-        } catch { return "Local guest preparation failed" }
+        } catch LocalGuestStore.Failure.dirty { return "Saved guest was not cleanly shut down. Reset explicitly or use disposable mode." }
+        catch LocalGuestStore.Failure.incompatible { return "Saved guest belongs to a different rootfs. Reset explicitly or use disposable mode." }
+        catch { return "Local guest preparation failed" }
     }
 }
 
