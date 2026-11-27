@@ -15,6 +15,10 @@ char *nexus_guest_probe_workspace(const char *rootfs_data_path, const char *text
 char *nexus_guest_probe_glibc(const char *rootfs_data_path, const char *expected_agy_sha256);
 // Native initialize request only; requires non-NULL digest and request.
 char *nexus_guest_probe_glibc_acp(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request);
+// Blocking calls: serialize off the main thread. Idle timeout: 60 seconds.
+char *nexus_acp_start(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request);
+char *nexus_acp_new_session(const char *session_new_request);
+char *nexus_acp_close(void);
 void nexus_guest_free(char *result);
 #ifdef __cplusplus
 }

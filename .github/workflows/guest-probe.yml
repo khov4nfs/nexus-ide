@@ -10,6 +10,8 @@ on:
       - 'scripts/preflight-runtime.py'
       - 'scripts/build-glibc-rootfs.sh'
       - 'scripts/verify-glibc-evidence.py'
+      - 'scripts/verify-acp-transport.py'
+      - 'Sources/NexusCore/**'
       - 'scripts/prepare-agy-rootfs.py'
       - 'scripts/test-agy-import.py'
       - 'scripts/stage-ubuntu-device.sh'
@@ -96,6 +98,27 @@ jobs:
         with:
           name: glibc-compatibility-evidence
           path: ${{ runner.temp }}/nexus-glibc-evidence.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Real multi-request ACP transport fixture (not AGY)
+        env:
+          NEXUS_ACP_ROOTFS: ${{ runner.temp }}/nexus-acp-fs/data
+          NEXUS_ACP_EVIDENCE: ${{ runner.temp }}/nexus-acp-evidence.json
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-acp-fs"
+          rm -f "$NEXUS_ACP_EVIDENCE"
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_persistent_acp_transport -- --ignored --nocapture --test-threads=1
+          python3 scripts/verify-acp-transport.py "$NEXUS_ACP_EVIDENCE"
+      - name: Upload transport fixture evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-transport-fixture-evidence
+          path: ${{ runner.temp }}/nexus-acp-evidence.json
           if-no-files-found: warn
           retention-days: 7
       - name: Record scope
