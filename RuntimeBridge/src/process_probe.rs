@@ -408,7 +408,7 @@ pub fn valid_initialize_request(bytes: &[u8]) -> bool {
 
 // Project only the bounded protocol fields Swift needs. Never expose raw agent
 // notifications, authentication data, stderr or arbitrary error messages.
-fn initialize_projection(frame: &Value) -> Option<Value> {
+pub(crate) fn initialize_projection(frame: &Value) -> Option<Value> {
     if frame["jsonrpc"] != "2.0" || frame["id"] != 1 || frame.get("method").is_some() {
         return None;
     }
@@ -492,6 +492,62 @@ pub async fn agy_initialize(guest: &IshInstance, env: &HashMap<String,String>, r
                 "response":response,"closed":capture.closed,"transportClean":clean})
         },
         Err(error) => json!({"name":name,"passed":false,"error":error,"closed":capture.closed}),
+    }
+}
+
+
+// Bounded, serial request/response exchange over one long-lived guest process.
+// A retention gap, unknown request, unexpected response, or EOF poisons the
+// connection. Only the owner worker may use this object.
+pub(crate) struct ACPExchange {
+    session: std::sync::Arc<IshSession>,
+    capture: Capture,
+    offset: usize,
+}
+impl ACPExchange {
+    pub(crate) fn new(session: std::sync::Arc<IshSession>) -> Self {
+        Self { session, capture: Capture::default(), offset: 0 }
+    }
+
+    pub(crate) async fn request(&mut self, bytes: &[u8], id: i64) -> Result<Value,String> {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        write_ready(&self.session, bytes, deadline).await?;
+        loop {
+            self.capture.poll(&self.session, deadline).await?;
+            if self.capture.exited || self.capture.closed || !self.capture.pty.is_empty() {
+                return Err("ACP process stopped or wrong stream".into());
+            }
+            let mut answer = None;
+            while let Some(end) = self.capture.stdout[self.offset..].iter().position(|b| *b == b'\n') {
+                let end = self.offset + end;
+                let frame: Value = serde_json::from_slice(&self.capture.stdout[self.offset..end])
+                    .map_err(|_| "Invalid ACP stdout".to_owned())?;
+                self.offset = end + 1;
+                if frame["jsonrpc"] != "2.0" { return Err("Invalid JSON-RPC version".into()); }
+                if frame.get("id").is_none() && frame["method"].is_string() &&
+                    frame.get("result").is_none() && frame.get("error").is_none() {
+                    continue; // Discard notifications in this lab; no tool callbacks.
+                }
+                if frame.get("method").is_some() || frame["id"].as_i64() != Some(id) ||
+                    frame.get("result").is_some() == frame.get("error").is_some() ||
+                    answer.is_some() {
+                    return Err("Unexpected ACP request or response".into());
+                }
+                answer = Some(frame);
+            }
+            if let Some(frame) = answer {
+                if self.offset != self.capture.stdout.len() {
+                    return Err("Trailing incomplete ACP frame".into());
+                }
+                return Ok(frame);
+            }
+        }
+    }
+
+    pub(crate) async fn close(&mut self) -> bool {
+        let sent = self.session.terminate().await.is_ok();
+        let drained = drain(&self.session, &mut self.capture, Instant::now() + TIMEOUT).await.is_ok();
+        sent && drained && self.capture.closed && self.capture.pty.is_empty()
     }
 }
 

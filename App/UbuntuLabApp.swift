@@ -13,6 +13,8 @@ private struct UbuntuLabView: View {
     @State private var confirm = false
     @State private var report = "No device evidence."
     @State private var agentStatus = "Not initialized"
+    @State private var active = false
+    @State private var created = false
     private var digest: String? {
         guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil),
               let text = try? String(contentsOf: root.appendingPathComponent("agy.sha256"), encoding: .utf8) else { return nil }
@@ -30,14 +32,21 @@ private struct UbuntuLabView: View {
                     Text(digest == nil ? "No reviewed AGY binary imported." : "Local AGY digest manifest present. Execution not verified.")
                     if running { ProgressView("Keep this app open") }
                 }
-                Section("Native ACP client") { Text(agentStatus) }
+                Section("Native ACP client") {
+                    Text(agentStatus)
+                    if active {
+                        Text("Connection closes after 60 seconds without a request. Session uses /tmp, not your workspace.").font(.caption)
+                        Button("Create empty guest session") { act(close: false) }.disabled(running || created)
+                        Button("Close local connection", role: .destructive) { act(close: true) }.disabled(running)
+                    }
+                }
                 Section("Evidence") {
                     Text(report).font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
                 }
             }
             .navigationTitle("Ubuntu Lab")
             .confirmationDialog("Run original AGY in the local guest?", isPresented: $confirm) {
-                Button("Verify digest and initialize") { if let sha = digest { run(sha: sha) } }
+                Button("Verify digest and connect") { if let sha = digest { run(sha: sha) } }
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("AGY may make startup network requests. No credentials, user project, prompts or permission grants are supplied. This emulator is not a security sandbox. Run only a binary you obtained and reviewed under applicable terms.")
@@ -53,15 +62,29 @@ private struct UbuntuLabView: View {
             let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha) }.value
             report = result.report
             agentStatus = result.status
+            active = result.active
+            running = false
+        }
+    }
+
+    private func act(close: Bool) {
+        guard active, !running else { return }
+        running = true
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: close) }.value
+            report = result.report
+            agentStatus = result.status
+            active = result.active
+            if !close && result.ok { created = true }
             running = false
         }
     }
 }
 
 private enum UbuntuRunner {
-    static func run(sha: String?) -> (report: String, status: String) {
+    static func run(sha: String?) -> (report: String, status: String, active: Bool) {
         var client = ACPInitializeClient()
-        func failed(_ reason: String) -> (String, String) { (reason, "Not initialized") }
+        func failed(_ reason: String) -> (String, String, Bool) { (reason, "Not initialized", false) }
         do {
             let fm = FileManager.default
             guard let bundled = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else {
@@ -74,7 +97,7 @@ private enum UbuntuRunner {
             let pointer = data.path.withCString { path in
                 if let sha, let request {
                     return sha.withCString { digest in
-                        request.withCString { nexus_guest_probe_glibc_acp(path, digest, $0) }
+                        request.withCString { nexus_acp_start(path, digest, $0) }
                     }
                 }
                 return nexus_guest_probe_glibc(path, nil)
@@ -88,32 +111,65 @@ private enum UbuntuRunner {
             let pretty = (try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]))
                 .flatMap { String(data: $0, encoding: .utf8) } ?? raw
             guard sha != nil else {
-                return (pretty, "Libc only; AGY not executed")
+                return (pretty, "Libc only; AGY not executed", false)
             }
-            guard object["shutdownError"] is NSNull,
-                  let rows = object["checks"] as? [[String: Any]],
-                  let row = rows.first(where: { $0["name"] as? String == "agy_acp_initialize" }),
-                  row["transportClean"] as? Bool == true,
-                  let response = row["response"] as? [String: Any] else {
-                return (pretty, "Initialize or transport failed; restart app")
+            if object["authenticationRequired"] as? Bool == true {
+                return (pretty, "Authentication required; sign-in not implemented", false)
+            }
+            guard object["ok"] as? Bool == true, object["active"] as? Bool == true,
+                  let response = object["response"] as? [String: Any] else {
+                if object["active"] as? Bool == true { nexus_guest_free(nexus_acp_close()) }
+                return (pretty, "Initialize failed; restart app", false)
             }
             do {
                 var frame = try JSONSerialization.data(withJSONObject: response)
                 frame.append(10)
                 try client.receive(frame)
                 try client.finish()
-                switch client.state {
-                case let .initialized(name, version):
-                    guard object["ok"] as? Bool == true, row["passed"] as? Bool == true else {
-                        return (pretty, "Initialize failed")
-                    }
-                    return (pretty, "\(name) \(version): ACP v1 verified; probe stopped")
-                case .authenticationRequired:
-                    return (pretty, "Authentication required; sign-in not implemented")
-                default: return (pretty, "Initialize failed")
+                if case let .initialized(name, version) = client.state {
+                    return (pretty, "\(name) \(version): ACP v1 connected", true)
                 }
-            } catch { return (pretty, "Invalid or rejected ACP response") }
+            } catch {}
+            nexus_guest_free(nexus_acp_close())
+            return (pretty, "Invalid ACP response; connection closed", false)
         } catch { return failed("Preparation failed: \(error)") }
+    }
+
+    static func action(close: Bool) -> (report: String, status: String, active: Bool, ok: Bool) {
+        do {
+            let pointer: UnsafeMutablePointer<CChar>?
+            if close { pointer = nexus_acp_close() }
+            else {
+                let request = String(decoding: try ACPRequest.newSession(id: 2, cwd: "/tmp"), as: UTF8.self)
+                pointer = request.withCString { nexus_acp_new_session($0) }
+            }
+            guard let pointer else {
+                nexus_guest_free(nexus_acp_close())
+                return ("No report", "Connection unavailable", false, false)
+            }
+            defer { nexus_guest_free(pointer) }
+            let raw = String(cString: pointer)
+            guard let object = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] else {
+                nexus_guest_free(nexus_acp_close())
+                return ("Invalid report", "Connection unavailable", false, false)
+            }
+            let active = object["active"] as? Bool == true
+            let ok = object["ok"] as? Bool == true
+            let status: String
+            if close && ok && object["transportClosed"] as? Bool == true && object["shutdownClean"] as? Bool == true {
+                status = "Local connection closed; guest shutdown verified"
+            } else if !close && ok && active && object["sessionCreated"] as? Bool == true && object["responseId"] as? Int == 2 {
+                status = "Empty guest session created; prompt disabled"
+            } else if object["authenticationRequired"] as? Bool == true {
+                status = "Authentication required; connection stopped"
+            } else {
+                status = "Request failed or connection expired; restart app"
+            }
+            return (raw, status, active, ok)
+        } catch {
+            nexus_guest_free(nexus_acp_close())
+            return ("Request encoding failed", "Connection stopped", false, false)
+        }
     }
 }
 #endif
