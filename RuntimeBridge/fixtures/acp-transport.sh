@@ -40,6 +40,29 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture-%s"}}\n' "$$"
 IFS= read -r third
 case "$third" in *'"method":"session/prompt"'*) ;; *) exit 54 ;; esac
 case "$third" in *'"sessionId":"fixture-'$$'"'*) ;; *) exit 55 ;; esac
+if [ -n "${NEXUS_FIXTURE_REVIEW:-}" ]; then
+    case "$third" in *'Review fixture'*) ;; *) exit 125;; esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"plan","entries":[{"content":"Inspect fixture","priority":"high","status":"pending"}]}}}\n' "$$"
+    printf '{"jsonrpc":"2.0","id":"review-1","method":"session/request_permission","params":{"sessionId":"fixture-%s","toolCall":{"toolCallId":"tool-review","title":"Reviewed fixture","rawInput":{"path":"/tmp"}},"options":[{"optionId":"allow-one","name":"Allow once","kind":"allow_once"},{"optionId":"allow-always","name":"Allow always","kind":"allow_always"},{"optionId":"deny-one","name":"Deny","kind":"reject_once"}]}}\n' "$$"
+    IFS= read -r reply
+    case "$reply" in *'"id":"review-1"'*) ;; *) exit 126;; esac
+    case "$NEXUS_FIXTURE_REVIEW" in
+        allow) case "$reply" in *'"optionId":"allow-one"'*) ;; *) exit 127;; esac;;
+        deny) case "$reply" in *'"optionId":"deny-one"'*) ;; *) exit 128;; esac;;
+        cancel)
+            case "$reply" in *'"outcome":"cancelled"'*) ;; *) exit 129;; esac
+            IFS= read -r cancel
+            case "$cancel" in *'"method":"session/cancel"'*) ;; *) exit 130;; esac
+            printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelled"}}'
+            IFS= read -r unexpected
+            exit 131;;
+        *) exit 132;;
+    esac
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Reviewed fixture done"}}}}\n' "$$"
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+    IFS= read -r unexpected
+    exit 133
+fi
 if [ "${NEXUS_FIXTURE_MCP_SESSION:-0}" = 1 ]; then
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"NEXUS_MCP_SESSION_OK"}}}}\n' "$$"
     printf '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}\n'

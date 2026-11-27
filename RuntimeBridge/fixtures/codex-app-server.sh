@@ -7,7 +7,35 @@ IFS= read -r ready
 test "$ready" = '{"method":"initialized"}'
 IFS= read -r account
 test "$account" = '{"id":2,"method":"account/read","params":{"refreshToken":false}}'
-if [ -n "${NEXUS_CODEX_FIXTURE_TURN:-}" ]; then
+if [ -n "${NEXUS_CONVERSATION_PHASE:-}" ]; then
+    test "$(cat /tmp/nexus-agent-before)" = before
+    printf '%s\n' '{"id":2,"result":{"account":{"type":"chatgpt"},"requiresOpenaiAuth":true}}'
+    IFS= read -r start
+    if [ "$NEXUS_CONVERSATION_PHASE" = resume ]; then
+        test "$(cat /root/nexus-codex-thread-fixture)" = fixture-thread
+        case "$start" in *'"method":"thread/resume"'*'"threadId":"fixture-thread"'*) ;; *) exit 30;; esac
+    else
+        case "$start" in *'"method":"thread/start"'*'"ephemeral":false'*) ;; *) exit 31;; esac
+        printf '%s\n' fixture-thread >/root/nexus-codex-thread-fixture
+    fi
+    case "$start" in *'"approvalPolicy":"never"'*'"sandbox":"read-only"'*) ;; *) exit 32;; esac
+    printf '%s\n' '{"id":3,"result":{"thread":{"id":"fixture-thread"},"approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}}}'
+    for id in 4 5; do
+        IFS= read -r turn
+        case "$turn" in *'"id":'$id*'"method":"turn/start"'*'"threadId":"fixture-thread"'*) ;; *) exit 33;; esac
+        if [ "$id" = 4 ]; then
+            case "$turn" in *'First fixture'*) ;; *) exit 34;; esac
+            reply="First reply"
+        else
+            case "$turn" in *'Second fixture'*) ;; *) exit 35;; esac
+            reply="Second reply"
+            printf done >/tmp/nexus-agent-turn-done
+        fi
+        printf '{"id":%s,"result":{"turn":{"id":"turn-%s","status":"inProgress"}}}\n' "$id" "$id"
+        printf '{"method":"item/agentMessage/delta","params":{"threadId":"fixture-thread","turnId":"turn-%s","delta":"%s"}}\n' "$id" "$reply"
+        printf '{"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"turn-%s","status":"completed"}}}\n' "$id"
+    done
+elif [ -n "${NEXUS_CODEX_FIXTURE_TURN:-}" ]; then
     printf '%s\n' '{"id":2,"result":{"account":{"type":"chatgpt"},"requiresOpenaiAuth":true}}'
     IFS= read -r start
     case "$start" in *'"method":"thread/start"'*'"approvalPolicy":"never"'*'"sandbox":"read-only"'*) ;; *) exit 20;; esac

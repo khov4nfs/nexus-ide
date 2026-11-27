@@ -7,12 +7,58 @@ use std::{collections::{HashMap,VecDeque}, ffi::{c_char,CStr,CString}, path::Pat
     sync::{Mutex,atomic::Ordering}};
 
 pub(crate) enum Control { Input(Vec<u8>), Resize(u16,u16), Stop }
+const AGENT_LIMIT:usize=10;
+#[derive(Default)]
+struct AgentMailbox {waiting:bool, pending:Option<String>, finish:bool, turns:Vec<Value>, handle:Option<String>}
+#[derive(Clone)]
+pub(crate) struct NativeSession {pub retain:bool,pub resume:Option<String>,before:Option<String>,after:Option<String>}
+pub(crate) enum AgentNext {Prompt(String),Finish,Stop}
+fn valid_agent_text(s:&str)->bool {valid_command(s)&&s.chars().all(|c|!c.is_control()||c=='\n'||c=='\t')}
+pub(crate) fn valid_handle(s:&str)->bool {!s.is_empty()&&s.len()<=128&&s.bytes().all(|b|b.is_ascii_alphanumeric()||b"-_".contains(&b))}
+pub(crate) fn valid_uuid(s:&str)->bool {
+    s.len()==36&&s.bytes().enumerate().all(|(i,b)|if matches!(i,8|13|18|23){b==b'-'}else{b.is_ascii_hexdigit()})
+}
+pub(crate) fn agent_complete(prompt:&str,response:&str,handle:Option<&str>)->bool{
+    let Ok(mut s)=STATE.lock()else{return false;};
+    if s.stop||!s.running{return false;}
+    let Some(a)=s.agent.as_mut()else{return false;};
+    if a.turns.len()>=AGENT_LIMIT{return false;}
+    a.turns.push(json!({"prompt":prompt,"response":response}));
+    a.handle=handle.map(str::to_owned);
+    a.waiting=a.turns.len()<AGENT_LIMIT;
+    true
+}
+pub(crate) async fn agent_next()->AgentNext{
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(180);
+    loop{
+        {
+            let Ok(mut s)=STATE.lock()else{return AgentNext::Stop;};
+            if s.stop||!s.running{return AgentNext::Stop;}
+            let Some(a)=s.agent.as_mut()else{return AgentNext::Stop;};
+            if let Some(p)=a.pending.take(){a.waiting=false;return AgentNext::Prompt(p);}
+            if a.finish||a.turns.len()>=AGENT_LIMIT||std::time::Instant::now()>=deadline{a.waiting=false;return AgentNext::Finish;}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+fn agent_send(ticket:u32,text:Option<String>)->Value{
+    let Ok(mut s)=STATE.lock()else{return fail("Agent status unavailable");};
+    if !s.running||s.stop{return fail("No active agent session");}
+    let Some(a)=s.agent.as_mut()else{return fail("No native agent session");};
+    if !a.waiting||a.pending.is_some()||a.finish||a.turns.len()!=ticket as usize{return fail("Agent is not waiting for this turn");}
+    if let Some(text)=text{
+        if !valid_agent_text(&text){return fail("Invalid message");}
+        a.pending=Some(text);
+    }else{a.finish=true;}
+    a.waiting=false;
+    json!({"ok":true})
+}
 struct State {
     running: bool, ready: bool, mode: u8, output: String, raw: Vec<u8>, total: u64,
-    controls: VecDeque<Control>, stop: bool,
+    controls: VecDeque<Control>, stop: bool, agent:Option<AgentMailbox>,
 }
 static STATE: Mutex<State> = Mutex::new(State {
-    running:false, ready:false, mode:0, output:String::new(), raw:Vec::new(), total:0, controls:VecDeque::new(), stop:false,
+    running:false, ready:false, mode:0, output:String::new(), raw:Vec::new(), total:0, controls:VecDeque::new(), stop:false, agent:None,
 });
 const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
 fn fail(message: &str) -> Value { json!({"ok":false,"error":message}) }
@@ -53,23 +99,50 @@ fn parse_workbench(input:&str)->Option<(String,Option<String>)> {
     Some((token,Some(digest)))
 }
 const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
-fn parse_cli(input:&str)->Option<(String,String,String,Option<String>)> {
-    if input.len()>8192 {return None;}
+fn parse_cli(input:&str)->Option<(String,String,String,Option<String>,Option<NativeSession>)> {
+    if input.len()>16384 {return None;}
     let v:Value=serde_json::from_str(input).ok()?;
     let fields=v.as_object()?.len();
     let kind=v["kind"].as_str()?;
     let digest=v["sha256"].as_str()?;
     let action=v["action"].as_str()?;
-    if !matches!(kind,"codex"|"claude") || !process_probe::agy_digest_ok(digest) || !matches!(action,"shell"|"version"|"appServer"|"appServerChat"|"claudeAuth"|"claudeChat") || (matches!(action,"appServer"|"appServerChat") && kind!="codex") || (matches!(action,"claudeAuth"|"claudeChat")&&kind!="claude") {return None;}
-    let prompt=if matches!(action,"appServerChat"|"claudeChat") {
+    if !matches!(kind,"codex"|"claude") || !process_probe::agy_digest_ok(digest) || !matches!(action,"shell"|"version"|"appServer"|"appServerChat"|"claudeAuth"|"claudeChat"|"codexSession"|"claudeSession") || (matches!(action,"appServer"|"appServerChat"|"codexSession") && kind!="codex") || (matches!(action,"claudeAuth"|"claudeChat"|"claudeSession")&&kind!="claude") {return None;}
+    let interactive=matches!(action,"codexSession"|"claudeSession");
+    let prompt=if interactive||matches!(action,"appServerChat"|"claudeChat") {
         let p=v["prompt"].as_str()?;
-        if fields!=4||!valid_command(p)||p.chars().any(|c|c.is_control()&&c!='\n'&&c!='\t'){return None;}
+        if (if interactive{!matches!(fields,6|8)}else{fields!=4}) || !valid_agent_text(p){return None;}
         Some(p.to_owned())
     }else{if fields!=3{return None;}None};
-    Some((kind.into(),digest.into(),action.into(),prompt))
+    let session=if interactive{
+        let retain=v["retain"].as_bool()?;
+        let resume=v["resume"].as_str()?;
+        if !resume.is_empty()&&(!retain||!valid_handle(resume)||(kind=="claude"&&!valid_uuid(resume))){return None;}
+        let hook=|field:&str|->Option<Option<String>>{if fields==6{return Some(None);}let s=v.get(field)?.as_str()?;if s.is_empty(){Some(None)}else if valid_command(s){Some(Some(s.to_owned()))}else{None}};
+        let before=hook("before")?;let after=hook("after")?;
+        if fields==8&&before.is_none()&&after.is_none(){return None;}
+        Some(NativeSession{retain,resume:if resume.is_empty(){None}else{Some(resume.to_owned())},before,after})
+    }else{None};
+    Some((kind.into(),digest.into(),action.into(),prompt,session))
+}
+pub(crate) struct LspInput {pub argv:Vec<String>,pub language:String,pub uri:String,pub text:String}
+fn parse_lsp(input:&str)->Option<LspInput>{
+    if input.len()>65536{return None;}
+    let v:Value=serde_json::from_str(input).ok()?;
+    if v.as_object()?.len()!=4{return None;}
+    let argv=v["argv"].as_array()?;
+    if !(1..=17).contains(&argv.len())||v["argv"].to_string().len()>2048{return None;}
+    let argv=argv.iter().map(|a|a.as_str().filter(|s|s.len()<=512&&!s.chars().any(char::is_control)).map(str::to_owned)).collect::<Option<Vec<_>>>()?;
+    let exe=argv.first()?;
+    if exe.len()>256||!exe.starts_with('/')||!exe[1..].split('/').all(|p|!p.is_empty()&&p!="."&&p!=".."&&p.bytes().all(|b|b.is_ascii_alphanumeric()||b"._+-".contains(&b))){return None;}
+    let language=v["language"].as_str()?;
+    let ext=v["extension"].as_str()?;
+    if language.is_empty()||language.len()>32||!language.bytes().all(|b|b.is_ascii_alphanumeric()||b"-_".contains(&b))||ext.is_empty()||ext.len()>12||!ext.bytes().all(|b|b.is_ascii_alphanumeric()){return None;}
+    let text=v["text"].as_str()?;
+    if text.len()>8192||text.contains('\0'){return None;}
+    Some(LspInput{argv,language:language.into(),uri:format!("file:///tmp/nexus-lsp.{ext}"),text:text.into()})
 }
 fn progress() -> Value {
-    STATE.lock().map(|s| json!({"ok":true,"running":s.running,"ready":s.ready,"output":s.output,"stopRequested":s.stop}))
+    STATE.lock().map(|s| json!({"ok":true,"running":s.running,"ready":s.ready,"output":s.output,"stopRequested":s.stop,"agentWaiting":s.agent.as_ref().is_some_and(|a|a.waiting&&!s.stop),"agentTurns":s.agent.as_ref().map(|a|&a.turns),"agentHandle":s.agent.as_ref().and_then(|a|a.handle.as_deref())}))
         .unwrap_or_else(|_| fail("Local status unavailable"))
 }
 pub(crate) fn publish_output(bytes: &[u8], ready: bool, truncated: bool, total: u64) {
@@ -100,15 +173,35 @@ fn enqueue(control: Control) -> Value {
 struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Ok(mut s) = STATE.lock() { s.running = false; s.ready = false; s.controls.clear(); }
+        if let Ok(mut s) = STATE.lock() { s.running = false; s.ready = false; s.controls.clear(); if let Some(a)=s.agent.as_mut(){a.waiting=false;a.pending=None;} }
     }
+}
+// Explicit native conversation hooks only. No auto-discovery or native
+// provider credential injection. A guest may already have private CLI data.
+async fn run_agent_session(guest:&IshInstance,env:&HashMap<String,String>,kind:&str,digest:Option<&str>,prompt:&str,config:&NativeSession,fixture:bool)->Value{
+    let before=match config.before.as_deref(){Some(cmd)=>Some(process_probe::local_hook(guest,env,cmd).await),None=>None};
+    let executable=if kind=="codex"{"/opt/nexus/codex"}else{"/opt/nexus/claude"};
+    let verified=if let Some(digest)=digest{process_probe::guest_file_digest(guest,env,executable,digest).await["passed"]==true}else{fixture};
+    let mut r=if before.unwrap_or(true)&&verified&&!stop_requested(){
+        if kind=="codex"{process_probe::codex_session(guest,env,prompt,config,fixture).await}
+        else{process_probe::claude_session(guest,env,prompt,config,fixture).await}
+    }else{fail("Before-session hook, executable verification or cancellation prevented start")};
+    let after=if r["ok"]==true&&r["sessionFinished"]==true&&!stop_requested(){
+        match config.after.as_deref(){Some(cmd)=>Some(process_probe::local_hook(guest,env,cmd).await),None=>None}
+    }else{None};
+    let verified_after=if let Some(digest)=digest{process_probe::guest_file_digest(guest,env,executable,digest).await["passed"]==true}else{fixture};
+    r["hooks"]=json!({"before":before,"after":after,"afterSkipped":config.after.is_some()&&after.is_none()});
+    r["binaryDigestVerified"]=json!(verified&&verified_after);
+    r["ok"]=json!(r["ok"]==true&&after.unwrap_or(true)&&verified_after&&!stop_requested());
+    r
 }
 fn run(path: &Path, mode: u8, input: &str) -> Value {
     let call=if mode==4 {match parse_call(input) {Some(v)=>Some(v),None=>return fail("Invalid MCP call")}} else {None};
     let hooks=if mode==5 {match parse_hooks(input) {Some(v)=>Some(v),None=>return fail("Invalid hook plan")}} else {None};
     let workbench=if mode==3 {match parse_workbench(input) {Some(v)=>Some(v),None=>return fail("Invalid workbench launch")}} else {None};
     let cli=if mode==6 {match parse_cli(input) {Some(v)=>Some(v),None=>return fail("Invalid CLI launch")}} else {None};
-    if !matches!(mode,1..=6) ||
+    let lsp=if mode==8 {match parse_lsp(input){Some(v)=>Some(v),None=>return fail("Invalid LSP snapshot request")}}else{None};
+    if !matches!(mode,1..=6|8) ||
         (matches!(mode,1|2) && !valid_command(input)) { return fail("Invalid local job"); }
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
@@ -120,7 +213,8 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     }
     let Ok(mut s) = STATE.lock() else { return fail("Local job lock failed"); };
     if s.running || ATTEMPTED.swap(true,Ordering::AcqRel) { return fail("Restart app before another guest boot"); }
-    *s = State { running:true,ready:false,mode:if matches!(mode,5|6) {1}else{mode},output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false };
+    let native=cli.as_ref().is_some_and(|c|c.4.is_some());
+    *s = State { running:true,ready:false,mode:if native{7}else if matches!(mode,5|6) {1}else{mode},output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false,agent:if native{Some(AgentMailbox::default())}else{None} };
     drop(s);
     let _guard = Guard;
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -134,6 +228,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         ("TERM".into(),if matches!(mode,1|5|6) {"xterm-256color".into()} else {"dumb".into()}),("NODE_OPTIONS".into(),"--jitless".into())]);
     let libc = rt.block_on(process_probe::glibc_compat(&guest,&env));
     let mut result = if libc["passed"] != true { fail("Ubuntu compatibility failed") }
+        else if let Some(request)=lsp.as_ref(){rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}
         else if let Some(plan)=hooks.as_ref() {
             let before=plan["before"].as_str();
             let after=plan["after"].as_str();
@@ -154,14 +249,17 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         }
         else if let Some(call)=call.as_ref() {rt.block_on(process_probe::mcp_job(&guest,&env,call["command"].as_str().unwrap(),Some((call["name"].as_str().unwrap(),&call["arguments"]))))}
         else if mode == 2 { rt.block_on(process_probe::mcp_discover(&guest,&env,input)) }
-        else if let Some((kind,digest,action,prompt))=cli.as_ref() {
+        else if let Some((kind,digest,action,prompt,native_session))=cli.as_ref() {
             let executable=if kind=="codex" {"/opt/nexus/codex"}else{"/opt/nexus/claude"};
             let verified=rt.block_on(process_probe::guest_file_digest(&guest,&env,executable,digest))["passed"]==true;
             let mut r=if verified && !stop_requested() {
                 // Only fixed paths/actions; no user-provided shell interpolation,
                 // no CLI flags that disable the original harness safeguards.
                 env.insert("PATH".into(),"/opt/nexus:/usr/bin:/bin:/usr/sbin:/sbin".into());
-                if matches!(action.as_str(),"appServer"|"appServerChat") {rt.block_on(process_probe::codex_app_server_probe(&guest,&env,false,prompt.as_deref()))}
+                if let Some(config)=native_session {
+                    rt.block_on(run_agent_session(&guest,&env,kind,Some(digest),prompt.as_deref().unwrap_or(""),config,false))
+                }
+                else if matches!(action.as_str(),"appServer"|"appServerChat") {rt.block_on(process_probe::codex_app_server_probe(&guest,&env,false,prompt.as_deref()))}
                 else if action=="claudeAuth"{rt.block_on(process_probe::claude_auth_probe(&guest,&env,false))}
                 else if action=="claudeChat"{rt.block_on(process_probe::claude_text_turn(&guest,&env,prompt.as_deref().unwrap_or(""),false))}
                 else {
@@ -174,7 +272,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
                 rt.block_on(process_probe::local_process(&guest,&env,script,false))
                 }
             }else{fail("Reviewed CLI executable digest mismatch or cancelled")};
-            r["binaryDigestVerified"]=json!(verified);
+            if r.get("binaryDigestVerified").is_none(){r["binaryDigestVerified"]=json!(verified);}
             r["harness"]=json!(kind);
             r["action"]=json!(action);
             r
@@ -249,6 +347,14 @@ pub extern "C" fn nexus_local_resize(cols:u16,rows:u16) -> *mut c_char {
         enqueue(Control::Resize(cols,rows))
     } else { fail("Invalid PTY size") })
 }
+/// # Safety
+/// Valid NUL-terminated UTF-8 message. Never interpreted as terminal input.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_local_agent_send(ticket:u32,text:*const c_char)->*mut c_char{
+    ffi(||match arg(text){Some(s)=>agent_send(ticket,Some(s)),None=>fail("Missing message")})
+}
+#[no_mangle]
+pub extern "C" fn nexus_local_agent_finish(ticket:u32)->*mut c_char{ffi(||agent_send(ticket,None))}
 #[no_mangle]
 pub extern "C" fn nexus_local_stop() -> *mut c_char { ffi(|| enqueue(Control::Stop)) }
 
@@ -309,6 +415,90 @@ mod tests {
         let evidence=json!({"ok":ok&&clean,"fixtureOnly":true,"phase":phase,"shutdownClean":clean});
         std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
         assert!(ok&&clean);
+    }
+    #[test]
+    #[ignore = "requires independent Ubuntu guest boot for each phase"]
+    fn real_native_conversation_fixture(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let kind=std::env::var("NEXUS_CONVERSATION_KIND").expect("kind");
+        let phase=std::env::var("NEXUS_CONVERSATION_PHASE").expect("phase");
+        let handle=if kind=="codex"{"fixture-thread"}else{"550e8400-e29b-41d4-a716-446655440000"};
+        let config=NativeSession{retain:true,resume:if phase=="resume"{Some(handle.into())}else{None},before:Some("rm -f /tmp/nexus-agent-turn-done /tmp/nexus-agent-after; printf before >/tmp/nexus-agent-before".into()),after:Some("test \"$(cat /tmp/nexus-agent-turn-done)\" = done && printf after >/tmp/nexus-agent-after".into())};
+        {
+            let mut s=STATE.lock().unwrap();
+            s.running=true;s.mode=7;s.stop=false;s.agent=Some(AgentMailbox::default());
+        }
+        let driver=std::thread::spawn(||{
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);
+            let mut sent=false;
+            while std::time::Instant::now()<deadline{
+                let p=progress();
+                if p["agentWaiting"]==true{
+                    let n=p["agentTurns"].as_array().unwrap().len();
+                    if n==1&&!sent{
+                        assert_eq!(enqueue(Control::Input(b"forbidden".to_vec()))["ok"],false);
+                        assert_eq!(agent_send(1,Some("Second fixture".into()))["ok"],true);
+                        assert_eq!(agent_send(1,Some("duplicate".into()))["ok"],false);
+                        sent=true;
+                    }else if n==2{assert_eq!(agent_send(2,None)["ok"],true);return true;}
+                }
+                if p["running"]!=true{return false;}
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let _=enqueue(Control::Stop);
+            false
+        });
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin".into()),("HOME".into(),"/root".into()),("NEXUS_CONVERSATION_PHASE".into(),phase.clone()),("NEXUS_CLAUDE_FIXTURE_PHASE".into(),"conversation".into())]);
+        let r=rt.block_on(run_agent_session(&guest,&env,&kind,None,"First fixture",&config,true));
+        let after_verified=rt.block_on(process_probe::local_hook(&guest,&env,"test \"$(cat /tmp/nexus-agent-after)\" = after"));
+        let p=progress();
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        STATE.lock().unwrap().running=false;
+        let driven=driver.join().unwrap();
+        let ok=driven&&after_verified&&r["hooks"]["before"]==true&&r["hooks"]["after"]==true&&r["ok"]==true&&r["turnsCompleted"]==2&&p["agentHandle"]==handle&&p["agentTurns"][0]["response"]=="First reply"&&p["agentTurns"][1]["response"]=="Second reply"&&clean;
+        let evidence=json!({"ok":ok,"fixtureOnly":true,"kind":kind,"phase":phase,"turnsCompleted":r["turnsCompleted"],"shutdownClean":clean});
+        std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        assert!(ok,"conversation fixture failed: {r}");
+    }
+    #[test]
+    fn lsp_input_bounds(){
+        let valid=json!({"argv":["/usr/bin/server","--stdio"],"language":"python","extension":"py","text":"x = 1"});
+        assert!(parse_lsp(&valid.to_string()).is_some());
+        let mut v=valid.clone();v["argv"]=json!(["../../server"]);assert!(parse_lsp(&v.to_string()).is_none());
+        let mut v=valid.clone();v["extension"]=json!("../py");assert!(parse_lsp(&v.to_string()).is_none());
+        let mut v=valid.clone();v["text"]=json!("x".repeat(8193));assert!(parse_lsp(&v.to_string()).is_none());
+    }
+    #[test]
+    #[ignore = "requires fresh Ubuntu fakefs; synthetic LSP Content-Length peer"]
+    fn real_lsp_diagnostic_fixture(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let report=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_LSP_PHASE").expect("phase");
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin".into()),("HOME".into(),"/root".into()),("NEXUS_LSP_PHASE".into(),phase.clone())]);
+        let input=parse_lsp(&json!({"argv":["/usr/bin/server"],"language":"python","extension":"py","text":"x = 1\n"}).to_string()).unwrap();
+        let r=rt.block_on(process_probe::lsp_diagnostics(&guest,&env,&input,true));
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        let ok=if phase=="success"{r["ok"]==true&&r["diagnostics"][0]["message"]=="fixture diagnostic"&&r["diagnostics"][0]["range"]["end"]["character"]==1}else{r["ok"]==false&&r.get("diagnostics").is_none()};
+        let evidence=json!({"ok":ok&&clean,"fixtureOnly":true,"phase":phase,"shutdownClean":clean});
+        std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        assert!(ok&&clean,"LSP fixture failed: {r}");
+    }
+    #[test]
+    fn native_session_request_bounds(){
+        let valid=json!({"kind":"codex","sha256":"a".repeat(64),"action":"codexSession","prompt":"hello","retain":true,"resume":"fixture-thread"});
+        assert!(parse_cli(&valid.to_string()).is_some());
+        let mut v=valid.clone();v["retain"]=json!(false);assert!(parse_cli(&v.to_string()).is_none());
+        let mut v=valid.clone();v["resume"]=json!("../../bad");assert!(parse_cli(&v.to_string()).is_none());
+        let mut v=valid.clone();v["prompt"]=json!("x".repeat(2049));assert!(parse_cli(&v.to_string()).is_none());
+        let mut v=valid.clone();v["before"]=json!("echo before");v["after"]=json!("echo after");assert!(parse_cli(&v.to_string()).is_some());
+        v["before"]=json!(" ");assert!(parse_cli(&v.to_string()).is_none());
+        assert!(valid_uuid("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!valid_uuid("not-a-session-id"));
     }
     #[test]
     #[ignore = "requires fresh Ubuntu fakefs; synthetic Claude JSON peer"]

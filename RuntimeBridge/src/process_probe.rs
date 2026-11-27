@@ -947,17 +947,29 @@ fn codex_id(v:&Value)->Result<&str,String>{v.as_str().filter(|s|!s.is_empty()&&s
 fn codex_readonly(result:&Value)->bool{
     result["approvalPolicy"]=="never"&&result["sandbox"]["type"]=="readOnly"&&result["sandbox"]["networkAccess"]==false
 }
-async fn codex_text_turn(session:&IshSession,capture:&mut Capture,prompt:&str,deadline:Instant)->Result<String,String>{
+async fn codex_open_thread(session:&IshSession,capture:&mut Capture,config:Option<&crate::local_jobs::NativeSession>,deadline:Instant)->Result<String,String>{
     let mut early=Vec::new();
-    let start=json!({"id":3,"method":"thread/start","params":{"cwd":"/tmp","ephemeral":true,"sandbox":"read-only","approvalPolicy":"never"}});
+    let start=if let Some(handle)=config.and_then(|c|c.resume.as_deref()){
+        json!({"id":3,"method":"thread/resume","params":{"threadId":handle,"cwd":"/tmp","sandbox":"read-only","approvalPolicy":"never"}})
+    }else{
+        json!({"id":3,"method":"thread/start","params":{"cwd":"/tmp","ephemeral":!config.is_some_and(|c|c.retain),"sandbox":"read-only","approvalPolicy":"never"}})
+    };
     write_ready(session,format!("{start}\n").as_bytes(),deadline).await?;
     let result=codex_read(session,capture,3,deadline,&mut early).await?;
     if !codex_readonly(&result){return Err("Effective thread policy not confirmed".into());}
     let thread=codex_id(&result["thread"]["id"])?.to_owned();
-    early.clear();
-    let start=json!({"id":4,"method":"turn/start","params":{"threadId":thread,"input":[{"type":"text","text":prompt,"text_elements":[]}] }});
+    if config.and_then(|c|c.resume.as_deref()).is_some_and(|h|h!=thread){return Err("Resumed thread mismatch".into());}
+    Ok(thread)
+}
+async fn codex_text_turn(session:&IshSession,capture:&mut Capture,prompt:&str,deadline:Instant)->Result<String,String>{
+    let thread=codex_open_thread(session,capture,None,deadline).await?;
+    codex_turn(session,capture,&thread,4,prompt,deadline).await
+}
+async fn codex_turn(session:&IshSession,capture:&mut Capture,thread:&str,id:i64,prompt:&str,deadline:Instant)->Result<String,String>{
+    let mut early=Vec::new();
+    let start=json!({"id":id,"method":"turn/start","params":{"threadId":thread,"input":[{"type":"text","text":prompt,"text_elements":[]}] }});
     write_ready(session,format!("{start}\n").as_bytes(),deadline).await?;
-    let result=codex_read(session,capture,4,deadline,&mut early).await?;
+    let result=codex_read(session,capture,id,deadline,&mut early).await?;
     let turn=codex_id(&result["turn"]["id"])?.to_owned();
     let mut queue=std::collections::VecDeque::from(early);
     let mut output=String::new();
@@ -990,6 +1002,12 @@ async fn codex_text_turn(session:&IshSession,capture:&mut Capture,prompt:&str,de
     Err("Turn event limit exceeded".into())
 }
 pub(crate) async fn codex_app_server_probe(guest:&IshInstance,env:&HashMap<String,String>,fixture:bool,prompt:Option<&str>)->Value{
+    codex_run(guest,env,fixture,prompt,None).await
+}
+pub(crate) async fn codex_session(guest:&IshInstance,env:&HashMap<String,String>,prompt:&str,config:&crate::local_jobs::NativeSession,fixture:bool)->Value{
+    codex_run(guest,env,fixture,Some(prompt),Some(config)).await
+}
+async fn codex_run(guest:&IshInstance,env:&HashMap<String,String>,fixture:bool,prompt:Option<&str>,config:Option<&crate::local_jobs::NativeSession>)->Value{
     let mut opts=SpawnOpts::cmd(["/opt/nexus/codex","app-server"]);
     #[cfg(test)]
     if fixture{opts=shell(include_str!("../fixtures/codex-app-server.sh"),env);}
@@ -1016,9 +1034,29 @@ pub(crate) async fn codex_app_server_probe(guest:&IshInstance,env:&HashMap<Strin
         let mut r=json!({"ok":true,"initializeVerified":true,"accountReadVerified":true,"accountPresent":present,"requiresOpenaiAuth":requires});
         if let Some(prompt)=prompt{
             if !present{return Err("CLI sign-in required before native chat".into());}
-            let text=codex_text_turn(&session,&mut capture,prompt,deadline).await?;
-            r["turnCompleted"]=json!(true);
-            r["response"]=json!(text);
+            if let Some(config)=config{
+                use crate::local_jobs::{agent_complete,agent_next,AgentNext,valid_handle};
+                let thread=codex_open_thread(&session,&mut capture,Some(config),deadline).await?;
+                if config.retain&&!valid_handle(&thread){return Err("Invalid saved thread handle".into());}
+                let mut message=prompt.to_owned();
+                let mut completed=0i64;
+                loop{
+                    let text=codex_turn(&session,&mut capture,&thread,4+completed,&message,Instant::now()+Duration::from_secs(120)).await?;
+                    if !agent_complete(&message,&text,if config.retain{Some(thread.as_str())}else{None}){return Err("Session cancelled".into());}
+                    completed+=1;
+                    match agent_next().await{
+                        AgentNext::Prompt(next)=>message=next,
+                        AgentNext::Finish=>break,
+                        AgentNext::Stop=>return Err("Session stopped".into()),
+                    }
+                }
+                r["turnsCompleted"]=json!(completed);
+                r["sessionFinished"]=json!(true);
+            }else{
+                let text=codex_text_turn(&session,&mut capture,prompt,deadline).await?;
+                r["turnCompleted"]=json!(true);
+                r["response"]=json!(text);
+            }
         }
         Ok(r)
     }.await;
@@ -1033,9 +1071,13 @@ pub(crate) async fn codex_app_server_probe(guest:&IshInstance,env:&HashMap<Strin
 // Official Claude CLI JSON mode. Never parse or export account identity,
 // arbitrary stderr or auth tokens; the harness owns its authentication.
 async fn claude_json(guest:&IshInstance,env:&HashMap<String,String>,argv:Vec<&str>,fixture:bool,seconds:u64)->Result<(Value,i32),String>{
-    let mut opts=SpawnOpts::cmd(argv);
+    let mut opts=SpawnOpts::cmd(argv.iter().copied());
     #[cfg(test)]
-    if fixture{opts=shell(include_str!("../fixtures/claude-json.sh"),env);}
+    if fixture{
+        let mut args=vec!["/bin/sh","-c",include_str!("../fixtures/claude-json.sh"),"nexus-fixture"];
+        args.extend(argv.iter().skip(1).copied());
+        opts=SpawnOpts::cmd(args);
+    }
     #[cfg(not(test))]
     if fixture{return Err("Fixture unavailable".into());}
     opts.cwd=Some(Path::new("/tmp").to_path_buf());
@@ -1080,6 +1122,147 @@ pub(crate) async fn claude_text_turn(guest:&IshInstance,env:&HashMap<String,Stri
             json!({"ok":true,"turnCompleted":true,"response":text})
         },
         _=>json!({"ok":false,"error":"Claude text turn rejected, timed out or failed"}),
+    }
+}
+
+pub(crate) async fn claude_session(guest:&IshInstance,env:&HashMap<String,String>,prompt:&str,config:&crate::local_jobs::NativeSession,fixture:bool)->Value{
+    use crate::local_jobs::{agent_complete,agent_next,AgentNext,valid_uuid};
+    if !fixture&&claude_auth_probe(guest,env,false).await["accountPresent"]!=true{return json!({"ok":false,"error":"Use official CLI sign-in first"});}
+    let mut handle=config.resume.clone();
+    let mut message=prompt.to_owned();
+    let mut completed=0;
+    loop{
+        let mut argv=vec!["/opt/nexus/claude","--safe-mode","--print","--output-format","json","--tools","","--disallowedTools","mcp__*","--strict-mcp-config","--mcp-config","{\"mcpServers\":{}}","--permission-mode","dontAsk","--max-turns","1","--no-chrome"];
+        if let Some(id)=handle.as_deref(){argv.extend(["--resume",id]);}
+        argv.extend(["--",message.as_str()]);
+        let Ok((frame,0))=claude_json(guest,env,argv,fixture,120).await else{return json!({"ok":false,"error":"Claude session failed or cancelled"});};
+        if frame["type"]!="result"||frame["subtype"]!="success"||frame["is_error"]!=false{return json!({"ok":false,"error":"Claude turn rejected"});}
+        let Some(id)=frame["session_id"].as_str().filter(|id|valid_uuid(id))else{return json!({"ok":false,"error":"Missing valid Claude session ID"});};
+        if handle.as_deref().is_some_and(|h|h!=id){return json!({"ok":false,"error":"Claude session mismatch"});}
+        let Some(text)=frame["result"].as_str().filter(|s|!s.trim().is_empty()&&s.len()<=8192&&s.chars().all(|c|!c.is_control()||c=='\n'||c=='\t'))else{return json!({"ok":false,"error":"Invalid Claude text result"});};
+        handle=Some(id.to_owned());
+        if !agent_complete(&message,text,if config.retain{handle.as_deref()}else{None}){return json!({"ok":false,"error":"Session stopped"});}
+        completed+=1;
+        match agent_next().await{
+            AgentNext::Prompt(next)=>message=next,
+            AgentNext::Finish=>return json!({"ok":true,"turnsCompleted":completed,"sessionFinished":true}),
+            AgentNext::Stop=>return json!({"ok":false,"error":"Session stopped"}),
+        }
+    }
+}
+
+// LSP 3.17 Content-Length framing; no workspace edits, paths or server requests.
+fn lsp_frame(buffer:&mut Vec<u8>)->Result<Option<Value>,String>{
+    let Some(end)=buffer.windows(4).position(|b|b==b"\r\n\r\n")else{
+        return if buffer.len()>1024{Err("LSP header too large".into())}else{Ok(None)};
+    };
+    if end>1024{return Err("LSP header too large".into());}
+    let header=std::str::from_utf8(&buffer[..end]).map_err(|_|"Invalid LSP header")?;
+    let mut length=None;
+    for line in header.split("\r\n"){
+        let (key,value)=line.split_once(':').ok_or("Invalid LSP header")?;
+        if key.eq_ignore_ascii_case("Content-Length"){
+            let value=value.trim();
+            if length.is_some()||value.is_empty()||!value.bytes().all(|b|b.is_ascii_digit()){return Err("Invalid LSP length".into());}
+            let n=value.parse::<usize>().map_err(|_|"Invalid LSP length")?;
+            if !(1..=32768).contains(&n){return Err("LSP body limit".into());}
+            length=Some(n);
+        }else if !key.eq_ignore_ascii_case("Content-Type"){return Err("Unknown LSP header".into());}
+    }
+    let n=length.ok_or("Missing LSP length")?;
+    let start=end+4;
+    if buffer.len()<start+n{return Ok(None);}
+    let frame:Value=serde_json::from_slice(&buffer[start..start+n]).map_err(|_|"Invalid LSP JSON")?;
+    buffer.drain(..start+n);
+    if !frame.is_object()||frame["jsonrpc"]!="2.0"{return Err("Invalid LSP RPC".into());}
+    if frame.get("method").is_some()&&frame.get("id").is_some(){return Err("LSP server request denied".into());}
+    Ok(Some(frame))
+}
+async fn lsp_send(session:&IshSession,value:Value,deadline:Instant)->Result<(),String>{
+    let body=value.to_string();
+    let wire=format!("Content-Length: {}\r\n\r\n{}",body.len(),body);
+    write_ready(session,wire.as_bytes(),deadline).await
+}
+async fn lsp_next(session:&IshSession,capture:&mut Capture,deadline:Instant)->Result<Value,String>{
+    loop{
+        if crate::local_jobs::stop_requested()||Instant::now()>=deadline{return Err("LSP cancelled or timed out".into());}
+        if let Some(f)=lsp_frame(&mut capture.stdout)?{return Ok(f);}
+        if capture.exited||capture.closed||!capture.pty.is_empty(){return Err("LSP process stopped".into());}
+        capture.stderr.clear();
+        capture.poll(session,deadline).await?;
+    }
+}
+async fn lsp_reply(session:&IshSession,capture:&mut Capture,id:i64,deadline:Instant)->Result<Value,String>{
+    for _ in 0..64{
+        let f=lsp_next(session,capture,deadline).await?;
+        if f.get("id").is_none()&&f["method"].is_string(){continue;}
+        if f["id"].as_i64()!=Some(id)||f.get("error").is_some()||f.get("result").is_none(){return Err("LSP response rejected".into());}
+        return Ok(f["result"].clone());
+    }
+    Err("LSP notification limit".into())
+}
+fn lsp_position(v:&Value,lines:&[&str])->Option<(usize,usize)>{
+    let line=usize::try_from(v["line"].as_u64()?).ok()?;
+    let character=usize::try_from(v["character"].as_u64()?).ok()?;
+    let text=lines.get(line)?.trim_end_matches('\r');
+    if character>text.encode_utf16().count(){return None;}
+    Some((line,character))
+}
+fn lsp_project(params:&Value,request:&crate::local_jobs::LspInput)->Result<Vec<Value>,String>{
+    if params["uri"]!=request.uri||params.get("version").is_some_and(|v|!v.is_null()&&v.as_i64()!=Some(1)){return Err("LSP diagnostic document mismatch".into());}
+    let items=params["diagnostics"].as_array().filter(|a|a.len()<=64).ok_or("LSP diagnostics limit")?;
+    let lines=request.text.split('\n').collect::<Vec<_>>();
+    let mut result=Vec::new();
+    let mut bytes=0;
+    for item in items{
+        let start=lsp_position(&item["range"]["start"],&lines).ok_or("Invalid LSP diagnostic range")?;
+        let end=lsp_position(&item["range"]["end"],&lines).ok_or("Invalid LSP diagnostic range")?;
+        if start>end{return Err("Reversed LSP range".into());}
+        let message=item["message"].as_str().filter(|s|!s.is_empty()&&s.len()<=1024&&s.chars().all(|c|!c.is_control()||c=='\n'||c=='\t')).ok_or("Invalid LSP diagnostic message")?;
+        bytes+=message.len();
+        if bytes>8192{return Err("LSP text limit".into());}
+        let severity=match item.get("severity"){None|Some(Value::Null)=>None,Some(v)=>Some(v.as_u64().filter(|n|(1..=4).contains(n)).ok_or("Invalid LSP severity")?)};
+        result.push(json!({"range":{"start":{"line":start.0,"character":start.1},"end":{"line":end.0,"character":end.1}},"message":message,"severity":severity}));
+    }
+    Ok(result)
+}
+pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,String>,request:&crate::local_jobs::LspInput,fixture:bool)->Value{
+    let mut opts=SpawnOpts::cmd(request.argv.iter().map(String::as_str));
+    #[cfg(test)]
+    if fixture{opts=shell(include_str!("../fixtures/lsp-diagnostic.sh"),env);}
+    #[cfg(not(test))]
+    if fixture{return json!({"ok":false});}
+    opts.cwd=Some(Path::new("/tmp").to_path_buf());
+    opts.envp=Some(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect());
+    opts.pipe_stdin=true;
+    let Ok(session)=guest.spawn(opts)else{return json!({"ok":false,"error":"LSP spawn failed"});};
+    let mut capture=Capture::default();
+    let deadline=Instant::now()+Duration::from_secs(45);
+    let result:Result<Vec<Value>,String>=async{
+        lsp_send(&session,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"workspaceFolders":null,"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"versionSupport":true}}},"clientInfo":{"name":"nexus-ios","version":"0.7.0"}}}),deadline).await?;
+        let init=lsp_reply(&session,&mut capture,1,deadline).await?;
+        let caps=init["capabilities"].as_object().ok_or("Missing LSP capabilities")?;
+        if caps.get("positionEncoding").is_some_and(|v|v!="utf-16"){return Err("Unsupported LSP position encoding".into());}
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"initialized","params":{}}),deadline).await?;
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":request.uri,"languageId":request.language,"version":1,"text":request.text}}}),deadline).await?;
+        let mut found=None;
+        for _ in 0..128{
+            let f=lsp_next(&session,&mut capture,deadline).await?;
+            if f.get("id").is_some(){return Err("Unexpected LSP reply".into());}
+            if f["method"]=="textDocument/publishDiagnostics"{found=Some(lsp_project(&f["params"],request)?);break;}
+        }
+        let diagnostics=found.ok_or("No push diagnostics received")?;
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":request.uri}}}),deadline).await?;
+        lsp_send(&session,json!({"jsonrpc":"2.0","id":2,"method":"shutdown"}),deadline).await?;
+        if !lsp_reply(&session,&mut capture,2,deadline).await?.is_null(){return Err("Invalid LSP shutdown response".into());}
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"exit"}),deadline).await?;
+        drain(&session,&mut capture,deadline).await?;
+        if !capture.exited||capture.code!=Some(0)||capture.signal.unwrap_or(0)!=0||!capture.closed{return Err("LSP shutdown failed".into());}
+        Ok(diagnostics)
+    }.await;
+    match result{
+        Ok(d)=>json!({"ok":true,"diagnostics":d,"snapshotOnly":true,"transportClosed":true}),
+        Err(_)=>{let _=session.terminate().await;let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;json!({"ok":false,"error":"LSP diagnostics rejected, unsupported, cancelled or timed out","transportClosed":closed})}
     }
 }
 

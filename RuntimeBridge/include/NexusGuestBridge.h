@@ -45,7 +45,7 @@ char *nexus_acp_chat_terminal(const char *text,const char *choice);
 char *nexus_acp_prompt_progress(void);
 char *nexus_acp_cancel_prompt(void);
 char *nexus_acp_close(void);
-// Separate local boot: 1 PTY, 2 MCP discovery, 3 workbench, 4 MCP call, 5 PTY with reviewed lifecycle hooks, 6 reviewed original CLI.
+// Separate local boot: 1 PTY, 2 MCP discovery, 3 workbench, 4 MCP call, 5 PTY with reviewed lifecycle hooks, 6 reviewed original CLI, 8 LSP diagnostics.
 #include <stdint.h>
 char *nexus_local_run(const char *rootfs_data_path, uint8_t mode, const char *input);
 char *nexus_local_progress(void);
@@ -55,6 +55,9 @@ char *nexus_local_terminal_delta(uint64_t cursor);
 char *nexus_local_terminal_input(const char *base64_bytes);
 char *nexus_local_resize(uint16_t cols, uint16_t rows);
 char *nexus_local_stop(void);
+// Native chat mailbox: only accepts a message or finish while waiting.
+char *nexus_local_agent_send(uint32_t ticket,const char *text);
+char *nexus_local_agent_finish(uint32_t ticket);
 void nexus_guest_free(char *result);
 #ifdef __cplusplus
 }

@@ -24,6 +24,8 @@ on:
       - 'scripts/preflight-runtime.py'
       - 'scripts/package-ipa.py'
       - 'scripts/test-package-ipa.py'
+      - 'scripts/collect-release-acceptance.py'
+      - 'scripts/test-release-acceptance.py'
       - 'scripts/build-glibc-rootfs.sh'
       - 'scripts/verify-glibc-evidence.py'
       - 'scripts/verify-acp-transport.py'
@@ -62,6 +64,7 @@ jobs:
           python3 scripts/test-agy-import.py
           python3 scripts/test-workbench-import.py
           python3 scripts/test-package-ipa.py
+          python3 scripts/test-release-acceptance.py
       - name: Install guest build dependencies
         run: brew install meson ninja llvm lld libarchive sqlite xcodegen
       - name: Build pinned runtime and rootfs
@@ -334,6 +337,25 @@ jobs:
           name: acp-terminal-fixture-evidence
           path: ${{ runner.temp }}/nexus-terminal.json
           if-no-files-found: error
+      - name: Verify ACP reviewed permission decisions and cancellation (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for phase in allow deny cancel; do
+            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-acp-review-$phase"
+            export NEXUS_ACP_ROOTFS="$RUNNER_TEMP/nexus-acp-review-$phase/data"
+            export NEXUS_ACP_EVIDENCE="$RUNNER_TEMP/nexus-acp-review-$phase.json"
+            export NEXUS_ACP_REVIEW_PHASE="$phase"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_acp_permission_review_fixture -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","reviewVerified","outcomeVerified","shutdownClean"])' "$NEXUS_ACP_EVIDENCE"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acp-review-fixture-evidence
+          path: ${{ runner.temp }}/nexus-acp-review-*.json
+          if-no-files-found: error
       - name: Verify ACP session load across independent guest processes (synthetic peer)
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
@@ -406,6 +428,47 @@ jobs:
         with:
           name: claude-native-fixture-evidence
           path: ${{ runner.temp }}/nexus-claude-*.json
+          if-no-files-found: error
+      - name: Verify native multi-turn and saved session resume (synthetic peers)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for kind in codex claude; do
+            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-conversation-$kind"
+            export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-conversation-$kind/data"
+            export NEXUS_CONVERSATION_KIND="$kind"
+            for phase in create resume; do
+              export NEXUS_CONVERSATION_PHASE="$phase"
+              export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-conversation-$kind-$phase.json"
+              cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_native_conversation_fixture -- --ignored --nocapture --test-threads=1
+              python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","shutdownClean"]) and r["turnsCompleted"]==2' "$NEXUS_LOCAL_EVIDENCE"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-conversation-fixture-evidence
+          path: ${{ runner.temp }}/nexus-conversation-*.json
+          if-no-files-found: error
+      - name: Verify LSP snapshot diagnostics and invalid document rejection (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for phase in success invalidUri invalidRange; do
+            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-lsp-$phase"
+            export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-lsp-$phase/data"
+            export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-lsp-$phase.json"
+            export NEXUS_LSP_PHASE="$phase"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_lsp_diagnostic_fixture -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","shutdownClean"])' "$NEXUS_LOCAL_EVIDENCE"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lsp-diagnostics-fixture-evidence
+          path: ${{ runner.temp }}/nexus-lsp-*.json
           if-no-files-found: error
       - name: Verify original CLI import slots (Ubuntu ELF fixture only)
         run: |
@@ -503,8 +566,20 @@ jobs:
         env:
           VARIANT: ${{ inputs.variant || 'ubuntu' }}
         run: |
-          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.6.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
+          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.7.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
           python3 scripts/package-ipa.py --app "$RUNNER_TEMP/nexus-integrated/Build/Products/Release-iphoneos/NexusIDEUbuntuLab.app" --output "$RUNNER_TEMP/nexus-integrated-ipa" --variant "$VARIANT" --commit "$GITHUB_SHA"
+      - name: Bind completed CI evidence to exact integrated IPA
+        env:
+          VARIANT: ${{ inputs.variant || 'ubuntu' }}
+        run: python3 scripts/collect-release-acceptance.py --evidence "$RUNNER_TEMP" --package "$RUNNER_TEMP/nexus-integrated-ipa" --commit "$GITHUB_SHA" --variant "$VARIANT"
+      - name: Upload acceptance metadata (no IPA)
+        uses: actions/upload-artifact@v4
+        with:
+          name: NexusIDE-integrated-acceptance
+          path: |
+            ${{ runner.temp }}/nexus-integrated-ipa/acceptance.json
+            ${{ runner.temp }}/nexus-integrated-ipa/build.json
+          if-no-files-found: error
       - name: Upload integrated unsigned IPA only after owner license review
         if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.license_reviewed
         uses: actions/upload-artifact@v4
@@ -532,5 +607,5 @@ jobs:
         run: |
           cd release
           sha256sum -c SHA256SUMS
-          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json
+          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json acceptance.json
 

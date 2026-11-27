@@ -48,8 +48,24 @@ struct LocalToolsView: View {
     @State private var cliImport: LocalCLIImport?
     @State private var frozenCLI: LocalCLIImport?
     @State private var importingCLI = false
+    @State private var lspArgv = ""
+    @State private var lspLanguage = "python"
+    @State private var lspSnapshot: WorkspaceSnapshot?
+    @State private var lspLoading = false
     @State private var cliAction = "shell"
     @State private var cliPrompt = ""
+    @State private var cliResume = ""
+    @State private var enableAgentHooks = false
+    @State private var agentBefore = ""
+    @State private var agentAfter = ""
+    @State private var reviewedTurn = UInt32(0)
+    @State private var nativeChat = false
+    @State private var agentWaiting = false
+    @State private var agentTurns: [NativeAgentTurn] = []
+    @State private var agentHandle = ""
+    @State private var followup = ""
+    @State private var reviewedFollowup = ""
+    @State private var confirmFollowup = false
     @State private var keepCLIGuest = false
     @State private var confirmResetCLI = false
     private var stagedWorkbench: Bool {
@@ -66,8 +82,23 @@ struct LocalToolsView: View {
                         Text("MCP manual call").tag(UInt8(4))
                         Text("OpenVSCode").tag(UInt8(3))
                         Text("Original agent CLI").tag(UInt8(6))
+                        Text("Native LSP diagnostics").tag(UInt8(8))
                     }.disabled(model.guestClaimed)
-                    if mode == 6 {
+                    if mode == 8 {
+                        TextField("Reviewed absolute guest argv (JSON array)", text: $lspArgv, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
+                        TextField("LSP language ID", text: $lspLanguage).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
+                        Button("Attach saved editor snapshot") {
+                            lspLoading = true
+                            Task {
+                                defer { lspLoading = false }
+                                do { let snapshot = try await model.selectedSnapshot(); guard snapshot.text.utf8.count <= 8192 else { throw WorkspaceError.tooLarge }; lspSnapshot = snapshot; report = "Snapshot selected; not yet sent" }
+                                catch { lspSnapshot = nil; report = "Save and select an editor file, max 8192 bytes" }
+                            }
+                        }.disabled(model.guestClaimed || lspLoading || model.path.isEmpty)
+                        if let snapshot = lspSnapshot { Text(snapshot.path + " · " + String(snapshot.text.utf8.count) + " bytes").font(.caption); Button("Remove snapshot") { lspSnapshot = nil }.disabled(model.guestClaimed) }
+                        Text("One local stdio language server already installed in the guest. Snapshot-only push diagnostics, UTF-16 positions; no native file path, workspace mount or edits. Server may use network or retain the snapshot.").font(.caption)
+                        Toggle("Use saved local-tools guest", isOn: $keepGuest).disabled(model.guestClaimed)
+                    } else if mode == 6 {
                         Picker("Official executable", selection: $cliKind) {
                             Text("Codex CLI").tag("codex")
                             Text("Claude Code").tag("claude")
@@ -86,16 +117,28 @@ struct LocalToolsView: View {
                             if cliKind == "codex" {
                                 Text("Native app-server account probe").tag("appServer")
                                 Text("Native Codex text turn").tag("appServerChat")
+                                Text("Native Codex conversation").tag("codexSession")
                             } else {
                                 Text("Native Claude account probe").tag("claudeAuth")
                                 Text("Native Claude text turn").tag("claudeChat")
+                                Text("Native Claude conversation").tag("claudeSession")
                             }
                         }.disabled(model.guestClaimed)
-                        if ["appServerChat","claudeChat"].contains(cliAction) {
+                        if ["appServerChat","claudeChat","codexSession","claudeSession"].contains(cliAction) {
                             TextField("Message to agent (max 2048 bytes)", text: $cliPrompt, axis: .vertical).disabled(model.guestClaimed)
-                            Text("One text turn; requires CLI-owned sign-in. Model request may incur charges. Codex requests read-only policy; Claude disables customizations and tools. No native grants. Output is untrusted and may contain guest secrets.").font(.caption)
+                            Text("Requires CLI-owned sign-in. Model request may incur charges. Codex requests read-only policy; Claude disables customizations and tools. No native grants. Output is untrusted and may contain guest secrets.").font(.caption)
                         }
                         Toggle("Keep separate agent guest and CLI login", isOn: $keepCLIGuest).disabled(model.guestClaimed || importingCLI)
+                        if ["codexSession","claudeSession"].contains(cliAction) {
+                            Text("Up to 10 reviewed turns. Claude stores history inside the guest during conversation. Saved guests retain history after shutdown.").font(.caption)
+                            if keepCLIGuest { TextField("Saved session ID (optional)", text: $cliResume).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed) }
+                            Toggle("Review session lifecycle hooks", isOn: $enableAgentHooks).disabled(model.guestClaimed)
+                            if enableAgentHooks {
+                                TextField("Before session (optional shell command)", text: $agentBefore, axis: .vertical).disabled(model.guestClaimed)
+                                TextField("After successful finish (optional)", text: $agentAfter, axis: .vertical).disabled(model.guestClaimed)
+                                Text("Runs once per session, max 30 seconds per hook, same guest. No auto-loaded hooks. Commands may access guest credentials and network. After hook is skipped on failure or stop.").font(.caption)
+                            }
+                        }
                         Text("Optional: persists CLI-owned login state and project files for this exact binary digest. May retain secrets. Exit the shell cleanly before restarting. No backup, no sharing with other guests, no native token collection.").font(.caption)
                         Button("Reset saved CLI guest", role: .destructive) { confirmResetCLI = true }.disabled(model.guestClaimed || importingCLI || !AGYImportFormat.validDigest(cliDigest))
                         Text("Account probes read status only. Use the original CLI login inside the terminal. Linux sandbox/syscall compatibility remains unverified; do not disable agent safeguards.").font(.caption)
@@ -145,14 +188,28 @@ struct LocalToolsView: View {
                         frozenVSIX = mode == 3 ? selectedVSIX : nil
                         frozenCLI = mode == 6 ? cliImport : nil
                         frozenHooks = mode == 1 && enableHooks
-                        if mode == 6 {
+                        if mode == 8 {
+                            guard let snapshot = lspSnapshot, let approved = try? ACPTerminalApproval.parse(Data(lspArgv.utf8)) else { report = "Select a saved snapshot and valid argv"; return }
+                            let ext = (snapshot.path as NSString).pathExtension.lowercased()
+                            guard let wire = try? JSONSerialization.data(withJSONObject: ["argv":approved.arguments,"language":lspLanguage,"extension":ext,"text":snapshot.text], options: [.sortedKeys]), wire.count <= 65536 else { report = "Invalid LSP snapshot"; return }
+                            frozenInput = String(decoding: wire, as: UTF8.self)
+                        } else if mode == 6 {
                             guard let frozenCLI else { report = "Select reviewed executable"; return }
-                            var request = ["kind":frozenCLI.kind,"sha256":frozenCLI.digest,"action":cliAction]
-                            if ["appServerChat","claudeChat"].contains(cliAction) {
+                            var request: [String: Any] = ["kind":frozenCLI.kind,"sha256":frozenCLI.digest,"action":cliAction]
+                            if ["appServerChat","claudeChat","codexSession","claudeSession"].contains(cliAction) {
                                 guard !cliPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, cliPrompt.utf8.count <= 2048, !cliPrompt.utf8.contains(0) else { report = "Invalid message"; return }
                                 request["prompt"] = cliPrompt
                             }
-                            guard let wire = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), wire.count <= 8192 else { report = "Invalid request"; return }
+                            if ["codexSession","claudeSession"].contains(cliAction) {
+                                let handle = frozenKeep ? cliResume : ""
+                                guard handle.utf8.count <= 128, handle.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45,95].contains($0) }), cliKind != "claude" || handle.isEmpty || UUID(uuidString: handle) != nil else { report = "Invalid session ID"; return }
+                                request["retain"] = frozenKeep; request["resume"] = handle
+                                if enableAgentHooks {
+                                    guard (try? LocalHookPlan(command: "session", before: agentBefore, after: agentAfter)) != nil else { report = "Invalid lifecycle hooks"; return }
+                                    request["before"] = agentBefore; request["after"] = agentAfter
+                                }
+                            }
+                            guard let wire = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), wire.count <= 16384 else { report = "Invalid request"; return }
                             frozenInput = String(decoding: wire, as: UTF8.self)
                         } else if frozenHooks {
                             do {
@@ -169,12 +226,17 @@ struct LocalToolsView: View {
                             frozenInput = String(decoding: wire,as: UTF8.self)
                         } else { frozenInput = command }
                         confirm = true
-                    }.disabled(model.guestClaimed || importingVSIX || importingCLI || (mode == 6 ? cliImport == nil : mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
+                    }.disabled(model.guestClaimed || importingVSIX || importingCLI || (mode == 8 ? lspLoading || lspSnapshot == nil || lspArgv.isEmpty : mode == 6 ? cliImport == nil : mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
                     Text("No provider key or native workspace injected. Commands and extensions may use the network and are not sandboxed. Restart app for another boot.").font(.caption)
                 }
                 if running && frozenMode != 2 && frozenMode != 4 {
                     Section("Process controls") {
-                        if frozenMode == 1 || frozenMode == 6 {
+                        if nativeChat {
+                            Text(agentWaiting ? "Ready for a reviewed follow-up" : "Agent processing or closing").font(.caption)
+                            TextField("Next message", text: $followup, axis: .vertical).disabled(!agentWaiting)
+                            Button("Review next message") { reviewedFollowup = followup; reviewedTurn = UInt32(agentTurns.count); confirmFollowup = true }.disabled(!agentWaiting || followup.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || followup.utf8.count > 2048 || followup.utf8.contains(0))
+                            Button("Finish conversation") { if LocalRunner.agentFinish(UInt32(agentTurns.count)) { agentWaiting = false } }.disabled(!agentWaiting)
+                        } else if frozenMode == 1 || frozenMode == 6 {
                             Text("Paste commands on separate lines. Smart quotes and dashes are disabled.").font(.caption)
                             TerminalInput(text: $line)
                                 .frame(minHeight: 84, maxHeight: 140)
@@ -187,7 +249,7 @@ struct LocalToolsView: View {
                             Button("Open interactive ANSI terminal") { terminalShown = true }.disabled(!ready)
                             Button("Send Ctrl-C") { _ = LocalRunner.input("\u{3}") }.disabled(!ready)
                             Button("Resize to 111 × 33") { if !LocalRunner.resize() { report = "Resize not accepted" } }.disabled(!ready)
-                        } else {
+                        } else if frozenMode == 3 {
                             Button("Open local workbench") { webStatus = "Opening verified bind endpoint…"; workbenchShown = true }.disabled(!ready || token.isEmpty)
                             Text("Server launch requested; web view may fail until ready.").font(.caption)
                         }
@@ -197,7 +259,17 @@ struct LocalToolsView: View {
                         }
                     }
                 }
-                if frozenMode == 1 || frozenMode == 6 {
+                if nativeChat {
+                    Section("Native conversation · untrusted text") {
+                        ForEach(agentTurns.indices, id: \.self) { i in
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("You").font(.caption); Text(verbatim: agentTurns[i].prompt)
+                                Text("Agent").font(.caption); Text(verbatim: agentTurns[i].response).textSelection(.enabled)
+                            }
+                        }
+                        if !agentHandle.isEmpty { Text("Save this session ID for a clean restart").font(.caption); Text(verbatim: agentHandle).textSelection(.enabled) }
+                    }
+                } else if frozenMode == 1 || frozenMode == 6 {
                     Section("PTY output · plain text") {
                         Text(verbatim: output).font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
                     }
@@ -263,13 +335,18 @@ struct LocalToolsView: View {
                 Button("Start") { start() }
                 Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false; frozenVSIX = nil; frozenCLI = nil }
             } message: {
-                Text(frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(frozenMode == 8 ? "Send this reviewed snapshot to the specified local LSP server?\n" + frozenInput + "\nNo native write grant. Server may use network or retain data." : frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
+            .confirmationDialog("Send reviewed message to model?", isPresented: $confirmFollowup) {
+                Button("Send") { if LocalRunner.agentSend(reviewedFollowup, ticket: reviewedTurn) { followup = ""; agentWaiting = false } else { report = "Message not accepted for this turn" }; reviewedFollowup = "" }
+                Button("Cancel", role: .cancel) { reviewedFollowup = "" }
+            } message: { Text(reviewedFollowup + "\nMay incur provider charges. No native grants.") }
             .task(id: running) {
                 while running && !Task.isCancelled {
                     let p = LocalRunner.progress()
                     ready = p.ready
                     output = p.output
+                    if nativeChat { agentWaiting = p.agentWaiting; agentTurns = p.turns; agentHandle = p.handle }
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
             }
@@ -308,13 +385,18 @@ struct LocalToolsView: View {
         selectedVSIX = nil
         frozenCLI = nil
         if cli != nil { cliImport = nil }
+        let reviewedAction = (try? JSONSerialization.jsonObject(with: Data(input.utf8)) as? [String: Any])?["action"] as? String ?? ""
+        nativeChat = selectedMode == 6 && ["codexSession","claudeSession"].contains(reviewedAction)
+        agentWaiting = false; agentTurns = []; agentHandle = ""; followup = ""
         running = true
         report = "Starting local guest"
         Task {
             report = await Task.detached(priority: .userInitiated) {
                 LocalRunner.run(mode: selectedMode, input: input, persistent: persistent, vsix: vsix, cli: cli)
             }.value
-            output = LocalRunner.progress().output
+            let progress = LocalRunner.progress()
+            output = progress.output
+            if nativeChat { agentTurns = progress.turns; agentHandle = progress.handle; agentWaiting = false }
             ready = false
             running = false
             token = ""
@@ -353,6 +435,8 @@ private struct TerminalInput: UIViewRepresentable {
     }
 }
 
+private struct NativeAgentTurn: Decodable { let prompt: String; let response: String }
+
 private enum LocalRunner {
     static func token() -> String? {
         var data = [UInt8](repeating: 0, count: 32)
@@ -364,10 +448,17 @@ private enum LocalRunner {
         defer { nexus_guest_free(pointer) }
         return (try? JSONSerialization.jsonObject(with: Data(String(cString: pointer).utf8)) as? [String: Any]) ?? [:]
     }
-    static func progress() -> (ready: Bool, output: String) {
+    static func progress() -> (ready: Bool, output: String, agentWaiting: Bool, turns: [NativeAgentTurn], handle: String) {
         let object = decode(nexus_local_progress())
-        return (object["ready"] as? Bool == true, object["output"] as? String ?? "")
+        let rows = object["agentTurns"] as? [[String: Any]] ?? []
+        let turns = rows.compactMap { row -> NativeAgentTurn? in
+            guard let prompt = row["prompt"] as? String, let response = row["response"] as? String else { return nil }
+            return NativeAgentTurn(prompt: prompt, response: response)
+        }
+        return (object["ready"] as? Bool == true, object["output"] as? String ?? "", object["agentWaiting"] as? Bool == true, turns, object["agentHandle"] as? String ?? "")
     }
+    static func agentSend(_ text: String, ticket: UInt32) -> Bool { text.withCString { decode(nexus_local_agent_send(ticket,$0))["ok"] as? Bool == true } }
+    static func agentFinish(_ ticket: UInt32) -> Bool { decode(nexus_local_agent_finish(ticket))["ok"] as? Bool == true }
     static func input(_ text: String) -> Bool {
         text.withCString { decode(nexus_local_input($0))["ok"] as? Bool == true }
     }
