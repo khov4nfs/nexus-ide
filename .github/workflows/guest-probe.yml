@@ -41,7 +41,7 @@ jobs:
           retention-days: 7
       - name: Unsigned ARM64 device build
         run: xcodebuild -project NexusIDEGuest.xcodeproj -scheme NexusIDEGuest -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
-      - name: Real guest process and signed package tests on macOS build host
+      - name: Real guest process, toolchain and workspace tests on macOS build host
         env:
           NEXUS_TEST_PACKAGES: '1'
           NEXUS_TEST_TOOLCHAINS: '1'

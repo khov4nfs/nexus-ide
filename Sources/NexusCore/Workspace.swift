@@ -1,7 +1,13 @@
 import Foundation
 
 public enum WorkspaceError: Error, Equatable {
-    case invalidPath, symbolicLink, outsideWorkspace, tooLarge, notRegularFile
+    case invalidPath, symbolicLink, outsideWorkspace, tooLarge, notRegularFile, conflict
+}
+
+public struct WorkspaceSnapshot: Sendable {
+    public let path: String
+    public let text: String
+    fileprivate let root: URL
 }
 
 /// For trusted native UI operations only. Not a security sandbox for guest code.
@@ -59,6 +65,20 @@ public actor Workspace {
         guard data.count <= maxBytes else { throw WorkspaceError.tooLarge }
         guard let value = String(data: data, encoding: .utf8) else { throw CocoaError(.fileReadInapplicableStringEncoding) }
         return value
+    }
+
+    public func snapshot(_ path: String) throws -> WorkspaceSnapshot {
+        WorkspaceSnapshot(path: path, text: try read(path), root: root)
+    }
+
+    /// Compare exact UTF-8 bytes and write within one actor turn.
+    /// This protects cooperative native edits, not concurrent external writers.
+    public func apply(_ snapshot: WorkspaceSnapshot, replacement: String) throws {
+        guard snapshot.root == root else { throw WorkspaceError.outsideWorkspace }
+        guard Data(try read(snapshot.path).utf8) == Data(snapshot.text.utf8) else {
+            throw WorkspaceError.conflict
+        }
+        try write(snapshot.path, text: replacement)
     }
 
     public func write(_ path: String, text: String) throws {

@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
-fn probe(path: &Path, packages: bool, toolchains: bool) -> Value {
+fn probe(path: &Path, packages: bool, toolchains: bool, workspace_text: &str) -> Value {
+    if !process_probe::workspace_input_ok(workspace_text) { return json!({"ok":false,"stage":"workspace","error":"Expected UTF-8 text of at most 2048 bytes without NUL"}); }
     if !path.is_dir() || !path.parent().map(|p| p.join("meta.db").is_file()).unwrap_or(false) {
         return json!({"ok":false,"stage":"rootfs","error":"Expected fakefs data directory with sibling meta.db"});
     }
@@ -57,6 +58,11 @@ fn probe(path: &Path, packages: bool, toolchains: bool) -> Value {
                 ok &= row["passed"].as_bool() == Some(true);
                 rows.push(row);
             }
+            if ok {
+                let row = process_probe::workspace_roundtrip(&guest, &env, workspace_text).await;
+                ok &= row["passed"].as_bool() == Some(true);
+                rows.push(row);
+            }
             guest.shutdown().await.map_err(|e| e.to_string())
         }),
         Err(e) => Err(e.to_string()),
@@ -69,30 +75,44 @@ fn probe(path: &Path, packages: bool, toolchains: bool) -> Value {
 /// path must point to a valid, null-terminated string for this call.
 #[no_mangle]
 pub unsafe extern "C" fn nexus_guest_probe(path: *const c_char) -> *mut c_char {
-    run_bridge(path, false, false)
+    run_bridge(path, false, false, process_probe::WORKSPACE_FIXTURE)
 }
 
 /// # Safety
 /// Same pointer contract as nexus_guest_probe. Only call after explicit network consent.
 #[no_mangle]
 pub unsafe extern "C" fn nexus_guest_probe_packages(path: *const c_char) -> *mut c_char {
-    run_bridge(path, true, false)
+    run_bridge(path, true, false, process_probe::WORKSPACE_FIXTURE)
 }
 
 /// # Safety
 /// Same pointer contract as nexus_guest_probe; explicit large download consent.
 #[no_mangle]
 pub unsafe extern "C" fn nexus_guest_probe_toolchains(path: *const c_char) -> *mut c_char {
-    run_bridge(path, true, true)
+    run_bridge(path, true, true, process_probe::WORKSPACE_FIXTURE)
 }
 
-unsafe fn run_bridge(path: *const c_char, packages: bool, toolchains: bool) -> *mut c_char {
+/// # Safety
+/// Both pointers must reference valid NUL-terminated strings for this call.
+/// Caller must explicitly approve transferring the selected text to the local guest.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_guest_probe_workspace(path: *const c_char, text: *const c_char) -> *mut c_char {
+    if text.is_null() {
+        return CString::new(r#"{"ok":false,"stage":"workspace","error":"Missing text"}"#).unwrap().into_raw();
+    }
+    match CStr::from_ptr(text).to_str() {
+        Ok(text) => run_bridge(path, false, false, text),
+        Err(_) => CString::new(r#"{"ok":false,"stage":"workspace","error":"Invalid UTF-8"}"#).unwrap().into_raw(),
+    }
+}
+
+unsafe fn run_bridge(path: *const c_char, packages: bool, toolchains: bool, workspace_text: &str) -> *mut c_char {
     let result = std::panic::catch_unwind(|| {
         if path.is_null() {
             return json!({"ok":false,"stage":"rootfs","error":"Missing rootfs"});
         }
         match CStr::from_ptr(path).to_str() {
-            Ok(s) => probe(Path::new(s), packages, toolchains),
+            Ok(s) => probe(Path::new(s), packages, toolchains, workspace_text),
             Err(_) => json!({"ok":false,"stage":"rootfs","error":"Invalid UTF-8 path"}),
         }
     }).unwrap_or_else(|_| json!({"ok":false,"stage":"bridge","error":"Rust panic; restart application"}));
@@ -120,10 +140,10 @@ mod tests {
         let packages = std::env::var("NEXUS_TEST_PACKAGES").as_deref() == Ok("1");
         let toolchains = std::env::var("NEXUS_TEST_TOOLCHAINS").as_deref() == Ok("1");
         assert!(!toolchains || packages, "toolchain mode requires packages");
-        let report = probe(Path::new(&path), packages, toolchains);
+        let report = probe(Path::new(&path), packages, toolchains, process_probe::WORKSPACE_FIXTURE);
         std::fs::write(evidence_path, serde_json::to_vec_pretty(&report).unwrap()).expect("write completed evidence");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         assert_eq!(report["ok"].as_bool(), Some(true), "{report}");
-        assert_eq!(report["checks"].as_array().map(Vec::len), Some(if toolchains { 8 } else if packages { 7 } else { 6 }));
+        assert_eq!(report["checks"].as_array().map(Vec::len), Some(if toolchains { 9 } else if packages { 8 } else { 7 }));
     }
 }

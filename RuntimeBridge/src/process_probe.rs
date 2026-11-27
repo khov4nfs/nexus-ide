@@ -291,9 +291,61 @@ fn toolchain_output_ok(bytes: &[u8]) -> bool {
     hash.len() == 40 && hash.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
+
+// A bounded text transfer over the existing guest stdin/stdout transport.
+// Only a disposable guest file is touched; no host filesystem mount.
+pub const WORKSPACE_LIMIT: usize = 2048;
+pub const WORKSPACE_FIXTURE: &str = "Nexus workspace\nTiếng Việt — UTF-8\nliteral: $(echo never-execute) `quote`\\\n";
+const WORKSPACE_SUFFIX: &str = "\n[Nexus guest workspace probe]\n";
+const WORKSPACE_SCRIPT: &str = include_str!("../fixtures/workspace.sh");
+
+pub fn workspace_input_ok(text: &str) -> bool {
+    text.len() <= WORKSPACE_LIMIT && !text.contains('\0')
+}
+
+pub async fn workspace_roundtrip(guest: &IshInstance, env: &HashMap<String,String>, text: &str) -> Value {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let name = "workspace_roundtrip";
+    if !workspace_input_ok(text) {
+        return json!({"name":name,"passed":false,"error":"Invalid workspace input"});
+    }
+    let session = match guest.spawn(shell(WORKSPACE_SCRIPT, env)) {
+        Ok(s) => s,
+        Err(e) => return json!({"name":name,"passed":false,"error":e.to_string()}),
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    let mut capture = Capture::default();
+    let result = async {
+        wait_ready(&session, &mut capture, deadline, |c| contains(&c.stderr,b"NEXUS_WORKSPACE_READY\n")).await?;
+        let wire = format!("{}\n", STANDARD.encode(text.as_bytes()));
+        write_ready(&session, wire.as_bytes(), deadline).await?;
+        drain(&session, &mut capture, deadline).await?;
+        if capture.code != Some(0) || capture.signal != Some(0) || !capture.closed ||
+           !capture.pty.is_empty() || capture.stdout != format!("{text}{WORKSPACE_SUFFIX}").as_bytes() {
+            return Err("workspace byte roundtrip mismatch".to_owned());
+        }
+        Ok(())
+    }.await;
+    if result.is_err() { let _ = session.terminate().await; }
+    // Do not return raw text from a failed transfer.
+    match result {
+        Ok(()) => json!({"name":name,"passed":true,"evidence":capture.evidence(),"error":null}),
+        Err(error) => json!({"name":name,"passed":false,"error":error}),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn workspace_input_boundaries() {
+        assert!(workspace_input_ok(WORKSPACE_FIXTURE));
+        assert!(workspace_input_ok(""));
+        assert!(workspace_input_ok(&"a".repeat(WORKSPACE_LIMIT)));
+        assert!(!workspace_input_ok(&"a".repeat(WORKSPACE_LIMIT+1)));
+        assert!(!workspace_input_ok("a\0b"));
+        assert!(!workspace_input_ok(&"é".repeat(WORKSPACE_LIMIT)));
+    }
     #[test]
     fn toolchain_evidence_requires_all_workflow_steps() {
         let good = "NEXUS_TOOLCHAINS_ABSENT\nNEXUS_TOOLCHAIN_APK=nodejs-22.1.0-r0\nNEXUS_TOOLCHAIN_APK=npm-10.1.0-r0\nNEXUS_TOOLCHAIN_APK=python3-3.12.0-r0\nNEXUS_TOOLCHAIN_APK=git-2.47.0-r0\nNEXUS_NODE_VERSION=v22.1.0\nNEXUS_NPM_VERSION=10.1.0\nNEXUS_PYTHON_VERSION=Python 3.12.0\nNEXUS_GIT_VERSION=git version 2.47.0\nNEXUS_NODE_DEPENDENCY_OK\nNEXUS_PYTHON_TEST_OK\nNEXUS_GIT_COMMIT=0123456789abcdef0123456789abcdef01234567\nNEXUS_TOOLCHAINS_OK\n";

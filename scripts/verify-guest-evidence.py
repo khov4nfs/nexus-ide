@@ -21,6 +21,7 @@ if packages:
     names.append("apk_install_jq")
 if toolchains:
     names.append("development_toolchains")
+names.append("workspace_roundtrip")
 require(report.get("packageRequested") is packages and report.get("toolchainsRequested") is toolchains, "Wrong probe mode")
 require([r.get("name") for r in rows] == names and all(r.get("passed") is True for r in rows), "Incomplete or failed checks")
 for row, code, marker in zip(rows[:3], [0,0,7], ["aarch64","NEXUS_GUEST_OK","NEXUS_SHELL_OK"]):
@@ -53,4 +54,9 @@ if toolchains:
     for line, prefix in zip(lines[5:9], ("NEXUS_NODE_VERSION=v", "NEXUS_NPM_VERSION=", "NEXUS_PYTHON_VERSION=Python ", "NEXUS_GIT_VERSION=git version ")):
         require(line.startswith(prefix) and line[len(prefix):][:1] in tuple("0123456789"), "Invalid binary version: " + prefix)
     require(re.fullmatch(r"NEXUS_GIT_COMMIT=[0-9a-f]{40}", lines[11]) is not None, "Missing Git commit")
+workspace = rows[-1]
+e = workspace["evidence"]
+expected = "Nexus workspace\nTiếng Việt — UTF-8\nliteral: $(echo never-execute) `quote`\\\n\n[Nexus guest workspace probe]\n"
+require(workspace.get("error") is None and e.get("closed") is True and e.get("exitCode") == 0 and e.get("termSignal") == 0 and not e.get("pty"), "Workspace process failed")
+require(e.get("stdout") == expected and "NEXUS_WORKSPACE_READY" in e.get("stderr", "").splitlines(), "Workspace byte roundtrip mismatch")
 print(f"All {len(names)} guest checks and shutdown verified from completed evidence")
