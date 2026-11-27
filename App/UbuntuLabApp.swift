@@ -43,6 +43,11 @@ struct UbuntuLabView: View {
     @State private var promptRunning = false
     @State private var receivedChunks = 0
     @State private var permissionDenials = 0
+    @State private var permissionAllows = 0
+    @State private var agentPlan: [String] = []
+    @State private var permissionRequest: ACPReviewRequest?
+    @State private var reviewPermissions = false
+    @State private var pendingReview = false
     @State private var toolUpdates = 0
     @State private var cancelRequested = false
     @State private var keyInput = ""
@@ -228,14 +233,28 @@ struct UbuntuLabView: View {
                                     Text("A reviewed command can modify guest files or access its network and credentials. Do not grant commands you do not understand. No shell interpolation by Nexus.").font(.caption)
                                 }
                             }
+                            if useGemini && !useGoogle && fileContext == nil && editSnapshot == nil && terminalChoice.isEmpty {
+                                Toggle("Review agent permissions this turn", isOn: $reviewPermissions).disabled(running)
+                            }
                             Button(editSnapshot == nil ? "Send chat" : "Request edit proposal") { prepareChat() }
                                 .disabled(running || importingContext || smokeUsed || turnCount >= maxTurns || !UbuntuRunner.validChat(chatInput))
                             Text("Chat turns: \(turnCount)/\(maxTurns)").font(.caption)
                         }
                         if turnCount > 0 {
-                            Text("Permission denials selected: \(permissionDenials) · Tool updates: \(toolUpdates)").font(.caption)
+                            Text("Permissions: \(permissionAllows) allowed / \(permissionDenials) denied · Tool updates: \(toolUpdates)").font(.caption)
+                        }
+                        if !agentPlan.isEmpty {
+                            ForEach(Array(agentPlan.enumerated()), id: \.offset) { entry in Text(entry.element).font(.caption) }
                         }
                         if promptRunning {
+                            if let request = permissionRequest {
+                                Text("Untrusted agent permission request · 15s maximum").font(.headline)
+                                Text(request.title)
+                                Text(request.detail).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                                Text("Allow once may cause guest side effects or network access. This is not a sandbox.").font(.caption)
+                                Button("Allow once") { if UbuntuRunner.decidePermission(request.ticket, allow: true) { permissionRequest = nil } }.disabled(cancelRequested)
+                                Button("Reject", role: .destructive) { if UbuntuRunner.decidePermission(request.ticket, allow: false) { permissionRequest = nil } }
+                            }
                             Text("Received text chunks: \(receivedChunks)").font(.caption)
                             Button(cancelRequested ? "Cancellation requested" : "Cancel prompt", role: .destructive) {
                                 let accepted = UbuntuRunner.cancelPrompt()
@@ -357,6 +376,9 @@ struct UbuntuLabView: View {
                     if progress.responseID == turnCount + 2 {
                         receivedChunks = progress.chunks
                         permissionDenials = progress.permissionDenials
+                        permissionAllows = progress.permissionAllows
+                        agentPlan = progress.plan
+                        permissionRequest = progress.permission
                         toolUpdates = progress.toolUpdates
                         if !sentChat.isEmpty { chatResponse = progress.text }
                         if progress.cancelRequested { cancelRequested = true }
@@ -381,7 +403,7 @@ struct UbuntuLabView: View {
                 }
                 Button("Cancel", role: .cancel) { pendingMCP = nil }
             } message: {
-                Text((pendingMCP?.display ?? "") + "\nAGY may launch the executable and invoke tools internally, with side effects or network access. The bridge injects no MCP environment variables but cannot isolate guest secrets. Native permission requests remain deny-only. Only approve trusted code.")
+                Text((pendingMCP?.display ?? "") + "\nAGY may launch the executable and invoke tools internally, with side effects or network access. The bridge injects no MCP environment variables but cannot isolate guest secrets. Native permission requests are denied by default unless explicitly reviewed in a plain Gemini chat turn. Only approve trusted code.")
             }
             .confirmationDialog("Send your message to the model?", isPresented: $confirmChat) {
                 Button("Send message") {
@@ -390,13 +412,15 @@ struct UbuntuLabView: View {
                     let edit = pendingEdit
                     let content = pendingReadContent
                     let terminal = pendingTerminal
+                    let review = pendingReview
+                    pendingReview = false; reviewPermissions = false
                     pendingTerminal = nil
                     pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil
-                    runPrompt(chat: wire, display: display, edit: edit, readContent: content, terminal: terminal)
+                    runPrompt(chat: wire, display: display, edit: edit, readContent: content, terminal: terminal, review: review)
                 }
-                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil; pendingTerminal = nil; terminalChoice = "" }
+                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil; pendingTerminal = nil; terminalChoice = ""; pendingReview = false; reviewPermissions = false }
             } message: {
-                Text(pendingTerminal != nil ? "Allow this exact guest command once?\n" + Self.terminalDescription(pendingTerminal ?? "") + "\nIts output may be sent to the model. Commands may modify guest files, access guest credentials or use the network. No security sandbox." : pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Google-mode edits filter the known login code, not all OAuth tokens. Do not share secrets; review the full replacement." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
+                Text(pendingReview ? "Send plain Gemini chat and enable explicit one-shot review for fully described agent permission requests? Nothing is approved automatically; guest operations may have side effects. No sandbox." : pendingTerminal != nil ? "Allow this exact guest command once?\n" + Self.terminalDescription(pendingTerminal ?? "") + "\nIts output may be sent to the model. Commands may modify guest files, access guest credentials or use the network. No security sandbox." : pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Google-mode edits filter the known login code, not all OAuth tokens. Do not share secrets; review the full replacement." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
             }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
@@ -557,6 +581,7 @@ struct UbuntuLabView: View {
             guard try credentialAllows(wire) else {
                 fileContext = nil; editSnapshot = nil; chatInput = ""; contextStatus = "Credential unavailable or detected"; return
             }
+            pendingReview = reviewPermissions && useGemini && !useGoogle && fileContext == nil && editSnapshot == nil && pendingTerminal == nil
             pendingChat = wire
             pendingEdit = editSnapshot
             pendingDisplay = fileContext == nil ? chatInput : chatInput + "\n[Selected text snapshot included]"
@@ -567,7 +592,7 @@ struct UbuntuLabView: View {
         }
     }
 
-    private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil, readContent: String? = nil, terminal: String? = nil) {
+    private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil, readContent: String? = nil, terminal: String? = nil, review: Bool = false) {
         guard active, created, (useGemini || useGoogle), !running, !importingContext, !smokeUsed, turnCount < maxTurns,
               chat != nil || turnCount == 0 else { return }
         if let chat {
@@ -593,13 +618,16 @@ struct UbuntuLabView: View {
         promptRunning = true
         receivedChunks = 0
         permissionDenials = 0
+        permissionAllows = 0; agentPlan = []; permissionRequest = nil
         toolUpdates = 0
         cancelRequested = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent, stageEdit: edit != nil && readContent != nil, terminal: terminal) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent, stageEdit: edit != nil && readContent != nil, terminal: terminal, review: review) }.value
             let snapshot = UbuntuRunner.progress()
             if snapshot.responseID == expectedID {
                 permissionDenials = snapshot.permissionDenials
+                permissionAllows = snapshot.permissionAllows
+                agentPlan = snapshot.plan
                 toolUpdates = snapshot.toolUpdates
             }
             let matches = result.responseID == expectedID && snapshot.responseID == expectedID && !snapshot.running
@@ -629,6 +657,7 @@ struct UbuntuLabView: View {
                 sentChat = ""
                 chatResponse = ""
             }
+            permissionRequest = nil
             promptRunning = false
             report = result.report
             agentStatus = result.status
@@ -669,6 +698,8 @@ struct UbuntuLabView: View {
         }
     }
 }
+
+private struct ACPReviewRequest { let ticket: Int64; let title: String; let detail: String }
 
 private enum UbuntuRunner {
     private static let trialLock = NSLock()
@@ -792,22 +823,28 @@ private enum UbuntuRunner {
             text.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) || $0.value == 10 || $0.value == 9 }
     }
 
-    static func progress() -> (chunks: Int, cancelRequested: Bool, text: String, responseID: Int, running: Bool, permissionDenials: Int, toolUpdates: Int) {
+    static func progress() -> (chunks: Int, cancelRequested: Bool, text: String, responseID: Int, running: Bool, permissionDenials: Int, toolUpdates: Int, permissionAllows: Int, plan: [String], permission: ACPReviewRequest?) {
         let obj = controlReport(nexus_acp_prompt_progress())
-        return (obj["chunkCount"] as? Int ?? 0, obj["cancelRequested"] as? Bool == true, obj["text"] as? String ?? "", obj["responseId"] as? Int ?? 0, obj["running"] as? Bool == true, obj["permissionDenials"] as? Int ?? 0, obj["toolUpdates"] as? Int ?? 0)
+        let permission: ACPReviewRequest?
+        if let p = obj["permission"] as? [String: Any], let ticket = p["ticket"] as? Int64, let title = p["title"] as? String, let detail = p["detail"] as? String { permission = ACPReviewRequest(ticket: ticket, title: title, detail: detail) } else { permission = nil }
+        return (obj["chunkCount"] as? Int ?? 0, obj["cancelRequested"] as? Bool == true, obj["text"] as? String ?? "", obj["responseId"] as? Int ?? 0, obj["running"] as? Bool == true, obj["permissionDenials"] as? Int ?? 0, obj["toolUpdates"] as? Int ?? 0, obj["permissionAllows"] as? Int ?? 0, obj["plan"] as? [String] ?? [], permission)
+    }
+
+    static func decidePermission(_ ticket: Int64, allow: Bool) -> Bool {
+        controlReport(nexus_acp_permission_decision(ticket, allow ? 1 : 0))["ok"] as? Bool == true
     }
 
     static func cancelPrompt() -> Bool {
         controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
     }
 
-    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false, terminal: String? = nil, mcp: ACPStdioServer? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
+    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false, terminal: String? = nil, mcp: ACPStdioServer? = nil, review: Bool = false) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
             else if let chat, let readContent { pointer = chat.withCString { t in readContent.withCString { stageEdit ? nexus_acp_chat_edit(t,$0) : nexus_acp_chat_snapshot(t,$0) } } }
             else if let chat, let terminal { pointer = chat.withCString { t in terminal.withCString { nexus_acp_chat_terminal(t,$0) } } }
-            else if let chat { pointer = chat.withCString { nexus_acp_chat($0) } }
+            else if let chat { pointer = chat.withCString { review ? nexus_acp_chat_reviewed($0) : nexus_acp_chat($0) } }
             else if prompt { pointer = nexus_acp_prompt_probe() }
             else {
                 let request = String(decoding: try ACPRequest.newSession(id: 2, cwd: "/tmp", mcp: mcp), as: UTF8.self)

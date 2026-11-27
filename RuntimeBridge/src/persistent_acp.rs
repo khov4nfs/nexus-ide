@@ -9,14 +9,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{atomic::{AtomicBool,Ordering}, mpsc::{self, Receiver, SyncSender}, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const IDLE: Duration = Duration::from_secs(180);
 const REPLY: Duration = Duration::from_secs(300);
 const NEW_REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"/tmp\",\"mcpServers\":[]}}\n";
 type Reply = SyncSender<Value>;
-enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Option<String>, bool, Option<String>, Reply), Close(Reply) }
+enum Command { New(Vec<u8>, Reply), Prompt(Option<String>, Option<String>, bool, Option<String>, bool, Reply), Close(Reply) }
 static ACTIVE: Mutex<Option<SyncSender<Command>>> = Mutex::new(None);
 static WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct ActiveGuard;
@@ -126,24 +126,30 @@ const SMOKE_REPLY: &str = "NEXUS_ACP_OK";
 // Separate from ACTIVE, whose lock is held while a blocking command waits.
 // Only counters, local control flags and filtered chat text leave this mailbox.
 #[derive(Default)]
+struct PendingPermission { ticket: i64, title: String, detail: String, decision: Option<bool> }
+
+#[derive(Default)]
 struct PromptProgress {
     running: bool,
     response_id: i64,
     chunks: usize,
     permission_denials: usize,
+    permission_allows: usize,
+    plan: Vec<String>,
+    permission: Option<PendingPermission>,
     tool_updates: usize,
     cancel_requested: bool,
     cancel_taken: bool,
     visible: String,
 }
 static PROGRESS: Mutex<PromptProgress> = Mutex::new(PromptProgress {
-    running: false, response_id: 0, chunks: 0, permission_denials: 0, tool_updates: 0, cancel_requested: false, cancel_taken: false, visible: String::new(),
+    running: false, response_id: 0, chunks: 0, permission_denials: 0, permission_allows: 0, plan: Vec::new(), permission: None, tool_updates: 0, cancel_requested: false, cancel_taken: false, visible: String::new(),
 });
 
 fn prompt_progress() -> Value {
     match PROGRESS.lock() {
         Ok(p) => json!({"ok":true,"running":p.running,"responseId":p.response_id,"chunkCount":p.chunks,
-            "cancelRequested":p.cancel_requested,"text":p.visible,"permissionDenials":p.permission_denials,"toolUpdates":p.tool_updates}),
+            "cancelRequested":p.cancel_requested,"text":p.visible,"permissionDenials":p.permission_denials,"permissionAllows":p.permission_allows,"plan":p.plan,"permission":p.permission.as_ref().filter(|x|x.decision.is_none()).map(|x|json!({"ticket":x.ticket,"title":x.title,"detail":x.detail})),"toolUpdates":p.tool_updates}),
         Err(_) => json!({"ok":false,"running":false,"error":"Progress unavailable"}),
     }
 }
@@ -170,7 +176,8 @@ impl ProgressGuard {
 }
 impl Drop for ProgressGuard {
     fn drop(&mut self) {
-        PROGRESS.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+        let mut p=PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+        p.running=false; p.permission=None;
     }
 }
 
@@ -249,6 +256,79 @@ fn permission_reply(frame: &Value, session: &str, cancelled: bool) -> Result<Val
     Ok(json!({"jsonrpc":"2.0","id":id,"result":{"outcome":outcome}}))
 }
 
+// Only plain Gemini chat can opt into one-shot agent permission review.
+// An agent description is untrusted and cannot prove the actual side effects.
+fn permission_preview(frame:&Value,key:&str)->Option<(String,String,String)> {
+    let call=&frame["params"]["toolCall"];
+    let title=call["title"].as_str()?;
+    let input=call.get("rawInput")?;
+    if title.trim().is_empty() || title.len()>256 || title.chars().any(char::is_control) ||
+        input.is_null() || !input.is_object() {return None;}
+    let detail=serde_json::to_string_pretty(input).ok()?;
+    // Check decoded string values as well as their serialized representation.
+    fn safe(v:&Value,key:&str,depth:usize)->bool {
+        if depth>12 {return false;}
+        match v {
+            Value::String(s)=>!s.contains(key) && !s.chars().any(char::is_control),
+            Value::Array(a)=>a.iter().all(|x|safe(x,key,depth+1)),
+            Value::Object(o)=>o.iter().all(|(k,x)|!k.contains(key)&&!k.chars().any(char::is_control)&&safe(x,key,depth+1)),
+            _=>true,
+        }
+    }
+    if key.is_empty() || detail.len()>2048 || title.contains(key) || detail.contains(key) || !safe(input,key,0) {return None;}
+    let mut options=frame["params"]["options"].as_array()?.iter().filter(|x|x["kind"]=="allow_once");
+    let allow=options.next()?["optionId"].as_str()?.to_owned();
+    if options.next().is_some(){return None;}
+    Some((title.to_owned(),detail,allow))
+}
+fn decide_permission(ticket:i64,allow:bool)->Value {
+    let Ok(mut p)=PROGRESS.lock() else {return json!({"ok":false});};
+    if !p.running || p.cancel_requested {return json!({"ok":false});}
+    match p.permission.as_mut() {
+        Some(x) if x.ticket==ticket && x.decision.is_none()=>{x.decision=Some(allow);json!({"ok":true})},
+        _=>json!({"ok":false}),
+    }
+}
+fn review_permission(frame:&Value,session:&str,key:&str,ticket:i64,deadline:Instant)->Result<(Value,bool),String> {
+    let denied=permission_reply(frame,session,prompt_cancel_requested())?;
+    let Some((title,detail,allow_id))=permission_preview(frame,key) else {return Ok((denied,false));};
+    let until=(Instant::now()+Duration::from_secs(15)).min(deadline.checked_sub(Duration::from_secs(1)).unwrap_or(deadline));
+    if Instant::now()>=until {return Ok((denied,false));}
+    {
+        let mut p=PROGRESS.lock().map_err(|_|"Permission status unavailable")?;
+        if p.cancel_requested {return Ok((permission_reply(frame,session,true)?,false));}
+        p.permission=Some(PendingPermission{ticket,title,detail,decision:None});
+    }
+    // This waits on the dedicated ACP worker only, never the native UI.
+    loop {
+        {
+            let mut p=PROGRESS.lock().map_err(|_|"Permission status unavailable")?;
+            let cancelled=p.cancel_requested;
+            let decision=p.permission.as_ref().and_then(|x|x.decision);
+            if cancelled || Instant::now()>=until || decision.is_some() {
+                p.permission=None;
+                if cancelled {return Ok((permission_reply(frame,session,true)?,false));}
+                if decision==Some(true) && Instant::now()<until {
+                    let mut reply=denied;
+                    reply["result"]["outcome"]["optionId"]=json!(allow_id);
+                    return Ok((reply,true));
+                }
+                return Ok((denied,false));
+            }
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+}
+fn plan_entries(update:&Value)->Result<Vec<String>,String>{
+    let entries=update["entries"].as_array().filter(|a|a.len()<=16).ok_or("Invalid plan entries")?;
+    entries.iter().map(|e|{
+        let content=e["content"].as_str().filter(|s|!s.trim().is_empty()&&s.len()<=256&&!s.chars().any(char::is_control)).ok_or("Invalid plan content")?;
+        let status=e["status"].as_str().filter(|s|matches!(*s,"pending"|"in_progress"|"completed")).ok_or("Invalid plan status")?;
+        let priority=e["priority"].as_str().filter(|s|matches!(*s,"high"|"medium"|"low")).ok_or("Invalid plan priority")?;
+        Ok(format!("[{status} · {priority}] {content}"))
+    }).collect()
+}
+
 const SNAPSHOT_PATH:&str="/nexus-selected.txt";
 fn valid_snapshot(s:&str)->bool {
     !s.trim().is_empty() && s.len()<=768 && s.chars().all(|c| !c.is_control() || c=='\n' || c=='\t')
@@ -290,6 +370,7 @@ struct PromptEvidence {
     message_id: Option<String>,
     tool_updates: usize,
     observe_granted_tools: bool,
+    plan: Vec<String>,
 }
 impl PromptEvidence {
     fn update(&mut self, frame: &Value, session: &str) -> Result<(),String> {
@@ -332,6 +413,7 @@ impl PromptEvidence {
                 self.tool_updates += 1;
                 Ok(())
             }
+            Some("plan") => { self.plan=plan_entries(u)?; Ok(()) }
             Some("agent_thought_chunk" | "user_message_chunk" | "available_commands_update" |
                  "current_mode_update" | "config_option_update" | "session_info_update" | "usage_update") => Ok(()),
             // Observing a tool notification is NOT a preventive sandbox.
@@ -504,7 +586,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     }
                 }
             }
-            Ok(Command::Prompt(chat, snapshot, edit, terminal_choice, reply)) => {
+            Ok(Command::Prompt(chat, snapshot, edit, terminal_choice, review, reply)) => {
                 let Some(id) = session_id.as_deref() else {
                     let _ = reply.send(json!({"ok":false,"active":true,"error":"Create a session first"}));
                     continue;
@@ -531,6 +613,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                     continue;
                 }
                 let is_chat = chat.is_some();
+                let review=review && keyed && !google && is_chat && snapshot.is_none() && terminal_choice.is_none() && !edit;
                 let text = chat.as_deref().unwrap_or(SMOKE_PROMPT);
                 turns += 1;
                 smoke_used = !is_chat;
@@ -538,7 +621,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                 let request = json!({"jsonrpc":"2.0","id":response_id,"method":"session/prompt",
                     "params":{"sessionId":id,"prompt":[{"type":"text","text":text}]}});
                 let wire = format!("{request}\n");
-                let mut evidence = PromptEvidence {observe_granted_tools:edit || terminal_choice.is_some() || mcp_configured,..Default::default()};
+                let mut evidence = PromptEvidence {observe_granted_tools:edit || terminal_choice.is_some() || mcp_configured || review,..Default::default()};
                 let progress = ProgressGuard::begin(response_id);
                 let mut cancel_taken = false;
                 let mut permission_ids = std::collections::HashSet::new();
@@ -559,7 +642,10 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         if let Ok(mut p) = PROGRESS.lock() {
                             p.chunks = evidence.chunks;
                             p.tool_updates = evidence.tool_updates;
-                            if is_chat { p.visible = safe.to_owned(); }
+                            if is_chat {
+                                p.visible = safe.to_owned();
+                                p.plan=if evidence.plan.iter().any(|s|s.contains(key)){Vec::new()}else{evidence.plan.clone()};
+                            }
                         }
                         Ok(())
                     },
@@ -568,9 +654,16 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         cancel_taken |= wire.is_some();
                         wire
                     },
-                    |frame| {
+                    |frame, deadline| {
                         if permission_ids.len() >= 8 {
                             return Err("Permission request limit exceeded".into());
+                        }
+                        if review && frame["method"]=="session/request_permission" {
+                            let (response,allowed)=review_permission(frame,id,key,response_id*32+permission_ids.len() as i64+1,deadline)?;
+                            if !permission_ids.insert(response["id"].to_string()) {return Err("Duplicate permission request ID".into());}
+                            let mut p=PROGRESS.lock().map_err(|_|"Permission status unavailable")?;
+                            if allowed {p.permission_allows+=1;} else if response["result"]["outcome"]["outcome"]=="selected" {p.permission_denials+=1;}
+                            return Ok(response);
                         }
                         let mut p = PROGRESS.lock().map_err(|_| "Permission status unavailable")?;
                         let response = if frame["method"]=="fs/read_text_file" && snapshot_capability {
@@ -672,13 +765,13 @@ fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, googl
     }
 }
 
-enum Action { New(Vec<u8>), Prompt, Chat(String), Snapshot(String,String), Edit(String,String), Terminal(String,String), Close }
+enum Action { New(Vec<u8>), Prompt, Chat(String), Reviewed(String), Snapshot(String,String), Edit(String,String), Terminal(String,String), Close }
 
 fn command(action: Action) -> Value {
     let Ok(mut slot) = ACTIVE.lock() else { return failure("Connection lock failed"); };
     let Some(tx) = slot.as_ref() else { return failure("No active connection"); };
     let (reply, wait) = mpsc::sync_channel(1);
-    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(None, None, false, None, reply), Action::Chat(text) => Command::Prompt(Some(text), None, false, None, reply), Action::Snapshot(text,content) => Command::Prompt(Some(text),Some(content),false,None,reply), Action::Edit(text,content) => Command::Prompt(Some(text),Some(content),true,None,reply), Action::Terminal(text,choice)=>Command::Prompt(Some(text),None,false,Some(choice),reply), Action::Close => Command::Close(reply) };
+    let message = match action { Action::New(b) => Command::New(b, reply), Action::Prompt => Command::Prompt(None, None, false, None, false, reply), Action::Chat(text) => Command::Prompt(Some(text), None, false, None, false, reply), Action::Reviewed(text)=>Command::Prompt(Some(text),None,false,None,true,reply), Action::Snapshot(text,content) => Command::Prompt(Some(text),Some(content),false,None,false,reply), Action::Edit(text,content) => Command::Prompt(Some(text),Some(content),true,None,false,reply), Action::Terminal(text,choice)=>Command::Prompt(Some(text),None,false,Some(choice),false,reply), Action::Close => Command::Close(reply) };
     if tx.send(message).is_err() {
         *slot = None; return failure("Connection stopped or idle timeout");
     }
@@ -786,7 +879,19 @@ pub unsafe extern "C" fn nexus_acp_chat_snapshot(text:*const c_char,content:*con
     })
 }
 
-// These two functions do not acquire the blocking command lock.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_acp_chat_reviewed(text:*const c_char)->*mut c_char {
+    ffi_result(||match read_arg(text) {
+        Some(t) if valid_chat(&t)=>command(Action::Reviewed(t)),
+        _=>failure("Invalid reviewed chat"),
+    })
+}
+#[no_mangle]
+pub extern "C" fn nexus_acp_permission_decision(ticket:i64,allow:u8)->*mut c_char {
+    ffi_result(||if allow<=1 {decide_permission(ticket,allow==1)}else{json!({"ok":false})})
+}
+
+// These functions do not acquire the blocking command lock.
 #[no_mangle]
 pub extern "C" fn nexus_acp_prompt_progress() -> *mut c_char {
     ffi_result(prompt_progress)
@@ -821,6 +926,18 @@ pub unsafe extern "C" fn nexus_acp_chat_terminal(text:*const c_char,choice:*cons
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plan_and_permission_preview_are_bounded() {
+        let plan=json!({"entries":[{"content":"Inspect","status":"pending","priority":"high"}]});
+        assert_eq!(plan_entries(&plan).unwrap().len(),1);
+        assert!(plan_entries(&json!({"entries":[{"content":"x","status":"unknown","priority":"low"}]})).is_err());
+        let mut f=json!({"params":{"toolCall":{"title":"List files","rawInput":{"path":"/tmp"}},"options":[{"kind":"allow_once","optionId":"one"}]}});
+        assert!(permission_preview(&f,"SECRET").is_some());
+        f["params"]["toolCall"]["rawInput"]=json!({"key":"SECRET"});
+        assert!(permission_preview(&f,"SECRET").is_none());
+        f["params"]["toolCall"]["rawInput"]=Value::Null;
+        assert!(permission_preview(&f,"SECRET").is_none());
+    }
     #[test]
     fn staged_write_scope_and_limits() {
         let mut staged=None;

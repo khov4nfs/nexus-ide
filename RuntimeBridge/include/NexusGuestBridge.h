@@ -30,7 +30,10 @@ char *nexus_acp_new_session(const char *session_new_request);
 char *nexus_acp_prompt_probe(void);
 // Up to twenty consented text turns (max 1024 UTF-8 bytes each); no project mount.
 // Smoke test and chat are mutually exclusive within one boot.
+#include <stdint.h>
 char *nexus_acp_chat(const char *text);
+char *nexus_acp_chat_reviewed(const char *text);
+char *nexus_acp_permission_decision(int64_t ticket,uint8_t allow);
 // Optional read-only capability: explicit one-turn virtual snapshot, no native path.
 char *nexus_acp_chat_snapshot(const char *text,const char *content);
 // Explicit per-turn virtual write grant; stages replacement for native review only.

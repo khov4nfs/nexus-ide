@@ -661,13 +661,13 @@ impl ACPExchange {
 
     pub(crate) async fn request_updates<F>(&mut self, bytes: &[u8], id: i64, update: F) -> Result<Value,String>
     where F: FnMut(&Value) -> Result<(),String> {
-        self.request_controlled(bytes, id, update, || None, |_| Err("Unexpected agent request".into()), None).await
+        self.request_controlled(bytes, id, update, || None, |_,_| Err("Unexpected agent request".into()), None).await
     }
 
     // Control is checked by the owner of the same stdin stream, never by
     // another writer. Cancellation is a notification, not a new request ID.
     pub(crate) async fn request_controlled<F, C, R>(&mut self, bytes: &[u8], id: i64, mut update: F, mut control: C, mut server_request: R, mut terminal: Option<&mut TerminalGrant<'_>>) -> Result<Value,String>
-    where F: FnMut(&Value) -> Result<(),String>, C: FnMut() -> Option<Vec<u8>>, R: FnMut(&Value) -> Result<Value,String> {
+    where F: FnMut(&Value) -> Result<(),String>, C: FnMut() -> Option<Vec<u8>>, R: FnMut(&Value, Instant) -> Result<Value,String> {
         let mut deadline = Instant::now() + Duration::from_secs(90);
         let mut server_ids=std::collections::HashSet::new();
         write_ready(&self.session, bytes, deadline).await?;
@@ -701,7 +701,7 @@ impl ACPExchange {
                             Some(t)=>t.handle(&frame,deadline).await?,
                             None=>json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32602,"message":"No terminal grant"}}),
                         }
-                    } else {server_request(&frame)?};
+                    } else {server_request(&frame,deadline)?};
                     let wire = format!("{reply}\n");
                     write_ready(&self.session, wire.as_bytes(), deadline).await?;
                     continue;
