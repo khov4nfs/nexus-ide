@@ -532,11 +532,22 @@ impl ACPExchange {
         self.request_updates(bytes, id, |_| Ok(())).await
     }
 
-    pub(crate) async fn request_updates<F>(&mut self, bytes: &[u8], id: i64, mut update: F) -> Result<Value,String>
+    pub(crate) async fn request_updates<F>(&mut self, bytes: &[u8], id: i64, update: F) -> Result<Value,String>
     where F: FnMut(&Value) -> Result<(),String> {
-        let deadline = Instant::now() + Duration::from_secs(90);
+        self.request_controlled(bytes, id, update, || None).await
+    }
+
+    // Control is checked by the owner of the same stdin stream, never by
+    // another writer. Cancellation is a notification, not a new request ID.
+    pub(crate) async fn request_controlled<F, C>(&mut self, bytes: &[u8], id: i64, mut update: F, mut control: C) -> Result<Value,String>
+    where F: FnMut(&Value) -> Result<(),String>, C: FnMut() -> Option<Vec<u8>> {
+        let mut deadline = Instant::now() + Duration::from_secs(90);
         write_ready(&self.session, bytes, deadline).await?;
         loop {
+            if let Some(cancel) = control() {
+                deadline = deadline.min(Instant::now() + Duration::from_secs(10));
+                write_ready(&self.session, &cancel, deadline).await?;
+            }
             self.capture.poll(&self.session, deadline).await?;
             if self.capture.exited || self.capture.closed || !self.capture.pty.is_empty() {
                 return Err("ACP process stopped or wrong stream".into());

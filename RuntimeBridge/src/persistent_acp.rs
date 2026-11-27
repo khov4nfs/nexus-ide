@@ -51,6 +51,59 @@ fn session_created(frame: &Value) -> bool {
 const SMOKE_PROMPT: &str = "Reply with exactly NEXUS_ACP_OK. Do not use tools, read files, or perform actions.";
 const SMOKE_REPLY: &str = "NEXUS_ACP_OK";
 
+// Separate from ACTIVE, whose lock is held while a blocking command waits.
+// Only counters and local control flags leave this mailbox.
+#[derive(Default)]
+struct PromptProgress {
+    running: bool,
+    chunks: usize,
+    cancel_requested: bool,
+    cancel_taken: bool,
+}
+static PROGRESS: Mutex<PromptProgress> = Mutex::new(PromptProgress {
+    running: false, chunks: 0, cancel_requested: false, cancel_taken: false,
+});
+
+fn prompt_progress() -> Value {
+    match PROGRESS.lock() {
+        Ok(p) => json!({"ok":true,"running":p.running,"chunkCount":p.chunks,
+            "cancelRequested":p.cancel_requested}),
+        Err(_) => json!({"ok":false,"running":false,"error":"Progress unavailable"}),
+    }
+}
+
+fn request_cancel() -> Value {
+    match PROGRESS.lock() {
+        Ok(mut p) if p.running && !p.cancel_requested => {
+            p.cancel_requested = true;
+            json!({"ok":true,"cancelRequested":true})
+        }
+        _ => json!({"ok":false,"error":"No cancellable prompt or cancellation already requested"}),
+    }
+}
+
+struct ProgressGuard;
+impl ProgressGuard {
+    fn begin() -> Self {
+        let mut p = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+        *p = PromptProgress { running: true, ..Default::default() };
+        Self
+    }
+}
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        PROGRESS.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+    }
+}
+
+fn take_cancel(session: &str) -> Option<Vec<u8>> {
+    let mut p = PROGRESS.lock().ok()?;
+    if !p.running || !p.cancel_requested || p.cancel_taken { return None; }
+    p.cancel_taken = true;
+    let frame = json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}});
+    Some(format!("{frame}\n").into_bytes())
+}
+
 #[derive(Default)]
 struct PromptEvidence {
     text: String,
@@ -129,6 +182,10 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
     }
     let mut agent_env = env;
     if let Some(key) = key { agent_env.insert("GEMINI_API_KEY".into(), key); }
+    #[cfg(test)]
+    if matches!(&mode, Mode::Fixture) && std::env::var("NEXUS_ACP_TEST_CANCEL").as_deref() == Ok("1") {
+        agent_env.insert("NEXUS_FIXTURE_CANCEL".into(), "1".into());
+    }
     opts.envp = Some(agent_env.into_iter().collect());
     opts.pipe_stdin = true;
     let session = match guest.spawn(opts) {
@@ -216,8 +273,30 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, comm
                     "params":{"sessionId":id,"prompt":[{"type":"text","text":SMOKE_PROMPT}]}});
                 let wire = format!("{request}\n");
                 let mut evidence = PromptEvidence::default();
-                let result = rt.block_on(exchange.request_updates(wire.as_bytes(), 3,
-                    |frame| evidence.update(frame, id)));
+                let progress = ProgressGuard::begin();
+                let mut cancel_taken = false;
+                let result = rt.block_on(exchange.request_controlled(wire.as_bytes(), 3,
+                    |frame| {
+                        evidence.update(frame, id)?;
+                        if let Ok(mut p) = PROGRESS.lock() { p.chunks = evidence.chunks; }
+                        Ok(())
+                    },
+                    || {
+                        let wire = take_cancel(id);
+                        cancel_taken |= wire.is_some();
+                        wire
+                    }));
+                drop(progress);
+                let cancelled = cancel_taken && result.as_ref().is_ok_and(|frame|
+                    frame.get("error").is_none() && frame["result"]["stopReason"] == "cancelled");
+                if cancelled {
+                    // Confirm only the response to the original prompt. No raw text.
+                    if reply.send(json!({"ok":true,"active":true,"cancelled":true,
+                        "responseId":3,"stopReason":"cancelled","chunkCount":evidence.chunks})).is_err() {
+                        break None;
+                    }
+                    continue;
+                }
                 let success = result.as_ref().is_ok_and(|frame| evidence.complete(frame));
                 if success {
                     // Export a constant marker only, never model text, IDs or errors.
@@ -342,6 +421,17 @@ pub extern "C" fn nexus_acp_prompt_probe() -> *mut c_char {
     ffi_result(|| command(Action::Prompt))
 }
 
+// These two functions do not acquire the blocking command lock.
+#[no_mangle]
+pub extern "C" fn nexus_acp_prompt_progress() -> *mut c_char {
+    ffi_result(prompt_progress)
+}
+
+#[no_mangle]
+pub extern "C" fn nexus_acp_cancel_prompt() -> *mut c_char {
+    ffi_result(request_cancel)
+}
+
 #[no_mangle]
 pub extern "C" fn nexus_acp_close() -> *mut c_char {
     ffi_result(|| command(Action::Close))
@@ -386,7 +476,24 @@ mod tests {
         let before_session = command(Action::Prompt);
         let second = command(Action::New(NEW_REQUEST.to_vec()));
         let duplicate = command(Action::New(NEW_REQUEST.to_vec()));
-        let prompt = command(Action::Prompt);
+        let cancel_mode = std::env::var("NEXUS_ACP_TEST_CANCEL").as_deref() == Ok("1");
+        let idle_cancel = request_cancel();
+        let (prompt, progress_seen, cancel_reply, duplicate_cancel) = if cancel_mode {
+            let turn = thread::spawn(|| command(Action::Prompt));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let progress_seen = loop {
+                let snapshot = prompt_progress();
+                if snapshot["running"] == true && snapshot["chunkCount"] == 1 { break true; }
+                if std::time::Instant::now() >= deadline || turn.is_finished() { break false; }
+                thread::sleep(Duration::from_millis(20));
+            };
+            let accepted = request_cancel();
+            let duplicate = request_cancel();
+            (turn.join().expect("prompt worker"), progress_seen, accepted, duplicate)
+        } else {
+            (command(Action::Prompt), false, Value::Null, Value::Null)
+        };
+        let finished = prompt_progress();
         let duplicate_prompt = command(Action::Prompt);
         let close = command(Action::Close);
         let after_close = command(Action::New(NEW_REQUEST.to_vec()));
@@ -394,12 +501,18 @@ mod tests {
             second["ok"] == true && second["sessionCreated"] == true &&
             duplicate["ok"] == false && duplicate["active"] == true &&
             before_session["ok"] == false && before_session["active"] == true &&
-            prompt["ok"] == true && prompt["marker"] == SMOKE_REPLY && prompt["chunkCount"] == 2 &&
+            idle_cancel["ok"] == false && finished["running"] == false &&
+            prompt["ok"] == true && (if cancel_mode {
+                progress_seen && cancel_reply["ok"] == true && duplicate_cancel["ok"] == false &&
+                prompt["cancelled"] == true && prompt["stopReason"] == "cancelled" && prompt["chunkCount"] == 1
+            } else { prompt["marker"] == SMOKE_REPLY && prompt["chunkCount"] == 2 }) &&
             duplicate_prompt["ok"] == false && duplicate_prompt["active"] == true &&
             close["ok"] == true && close["transportClosed"] == true && close["shutdownClean"] == true &&
             after_close["ok"] == false && after_close["active"] == false;
         let report = json!({"ok":ok,"fixtureOnly":true,"initialize":first,"newSession":second,
-            "duplicate":duplicate,"beforeSession":before_session,"prompt":prompt,"duplicatePrompt":duplicate_prompt,"close":close,"afterClose":after_close});
+            "duplicate":duplicate,"beforeSession":before_session,"prompt":prompt,"duplicatePrompt":duplicate_prompt,"close":close,"afterClose":after_close,
+            "cancelMode":cancel_mode,"progressSeen":progress_seen,"cancelRequest":cancel_reply,
+            "duplicateCancel":duplicate_cancel,"idleCancel":idle_cancel,"finishedProgress":finished});
         std::fs::write(evidence, serde_json::to_vec_pretty(&report).unwrap()).expect("completed evidence");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         assert!(ok, "{report}");

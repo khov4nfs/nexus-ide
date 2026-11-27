@@ -7,6 +7,8 @@ def require(condition, message):
     if not condition:
         raise SystemExit(message)
 
+require(len(sys.argv) == 2 or (len(sys.argv) == 3 and sys.argv[2] == "--cancel"), "Usage: REPORT [--cancel]")
+cancel = len(sys.argv) == 3
 p = Path(sys.argv[1])
 require(p.is_file(), "Missing transport fixture report")
 r = json.loads(p.read_text())
@@ -22,7 +24,13 @@ require(n.get("ok") is True and n.get("active") is True and n.get("sessionCreate
 require(r["duplicate"].get("ok") is False and r["duplicate"].get("active") is True, "Duplicate request not rejected")
 require(r["beforeSession"].get("ok") is False and r["beforeSession"].get("active") is True, "Prompt allowed before session")
 p = r["prompt"]
-require(p.get("ok") is True and p.get("active") is True and p.get("promptVerified") is True and p.get("responseId") == 3 and p.get("chunkCount") == 2 and p.get("stopReason") == "end_turn" and p.get("marker") == "NEXUS_ACP_OK", "Missing prompt chunk evidence")
+require(r.get("cancelMode") is cancel and r["idleCancel"].get("ok") is False and r["finishedProgress"].get("running") is False, "Wrong mode or prompt state")
+require(p.get("ok") is True and p.get("active") is True and p.get("responseId") == 3, "Prompt failed")
+if cancel:
+    require(r.get("progressSeen") is True and r["cancelRequest"].get("ok") is True and r["duplicateCancel"].get("ok") is False, "Missing live progress or cancel request")
+    require(p.get("cancelled") is True and p.get("stopReason") == "cancelled" and p.get("chunkCount") == 1 and "marker" not in p, "Missing cancellation acknowledgement")
+else:
+    require(p.get("promptVerified") is True and p.get("chunkCount") == 2 and p.get("stopReason") == "end_turn" and p.get("marker") == "NEXUS_ACP_OK", "Missing prompt chunk evidence")
 require(r["duplicatePrompt"].get("ok") is False and r["duplicatePrompt"].get("active") is True, "Duplicate prompt not rejected")
 c = r["close"]
 require(c.get("ok") is True and c.get("active") is False and c.get("transportClosed") is True and c.get("shutdownClean") is True, "Close or shutdown failed")
