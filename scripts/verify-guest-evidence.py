@@ -1,5 +1,6 @@
 """Fail closed if the emulator exits before returning a complete report."""
 import json
+import re
 from pathlib import Path
 import sys
 
@@ -33,5 +34,8 @@ if packages:
     lines = e.get("stdout", "").splitlines()
     require(e.get("closed") is True and e.get("exitCode") == 0 and e.get("termSignal") == 0 and not e.get("pty"), "Package process failed")
     require("NEXUS_PACKAGE_ABSENT" in lines and "NEXUS_PACKAGE_INSTALLED" in lines and lines.index("NEXUS_PACKAGE_ABSENT") < lines.index("NEXUS_PACKAGE_INSTALLED"), "Missing install transition")
-    require(any(s.startswith("jq-") and "-r" in s for s in lines) and any(s.startswith("jq-") and "-r" not in s for s in lines) and lines[-1:] == ["NEXUS_JQ_OK"], "Missing installed package version or execution evidence")
+    tail = lines[lines.index("NEXUS_PACKAGE_INSTALLED")+1:]
+    require(len(tail) == 3 and tail[-1] == "NEXUS_JQ_OK", "Missing version or execution evidence")
+    pkg = re.fullmatch(r"NEXUS_APK_VERSION=(jq-[0-9][A-Za-z0-9._+\-]*)-r[0-9]+", tail[0])
+    require(pkg is not None and tail[1] == "NEXUS_BINARY_VERSION=" + pkg.group(1), "Installed package and executable versions must match")
 print(f"All {len(names)} guest checks and shutdown verified from completed evidence")

@@ -201,8 +201,88 @@ fi
     --no-cache --no-scripts add jq >&2
 /sbin/apk info -e jq >/dev/null
 printf 'NEXUS_PACKAGE_INSTALLED\n'
-/sbin/apk info -v jq
-/usr/bin/jq --version
+# Query installed package versions without a package argument.
+installed=$(/sbin/apk --no-network info -v)
+pkg=$(printf '%s\n' "$installed" | grep -E '^jq-[0-9][^[:space:]]*-r[0-9]+
+printf '%s\n' '{"value":"NEXUS_JQ_OK"}' | /usr/bin/jq -er '.value'
+"#;
+
+pub async fn package_install(guest: &IshInstance, env: &HashMap<String,String>) -> Value {
+    let name = "apk_install_jq";
+    let mut opts = shell(PACKAGE_SCRIPT, env);
+    opts.pipe_stdin = false;
+    let session = match guest.spawn(opts) {
+        Ok(s) => s,
+        Err(e) => return json!({"name":name,"passed":false,"error":e.to_string()}),
+    };
+    let mut capture = Capture::default();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let result = drain(&session, &mut capture, deadline).await;
+    if result.is_err() { let _ = session.terminate().await; }
+    let passed = result.is_ok() && capture.code == Some(0) &&
+        capture.signal.unwrap_or(0) == 0 && package_output_ok(&capture.stdout) &&
+        capture.pty.is_empty();
+    json!({"name":name,"passed":passed,"evidence":capture.evidence(),
+           "repository":"https://dl-cdn.alpinelinux.org/alpine/v3.21/main",
+           "error":result.err()})
+}
+
+fn package_output_ok(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let absent = lines.iter().position(|line| *line == "NEXUS_PACKAGE_ABSENT");
+    let installed = lines.iter().position(|line| *line == "NEXUS_PACKAGE_INSTALLED");
+    let (Some(a), Some(b)) = (absent, installed) else { return false; };
+    if a >= b || lines.len() != b + 4 || lines.last() != Some(&"NEXUS_JQ_OK") {
+        return false;
+    }
+    let Some(pkg) = lines[b+1].strip_prefix("NEXUS_APK_VERSION=") else { return false; };
+    let Some(bin) = lines[b+2].strip_prefix("NEXUS_BINARY_VERSION=") else { return false; };
+    let Some((version, revision)) = pkg.rsplit_once("-r") else { return false; };
+    version == bin && version.strip_prefix("jq-")
+        .map(|v| v.as_bytes().first().map_or(false, |c| c.is_ascii_digit()) &&
+            v.bytes().all(|c| c.is_ascii_alphanumeric() || b"._+-".contains(&c)))
+        .unwrap_or(false) &&
+        !revision.is_empty() && revision.bytes().all(|c| c.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn package_evidence_requires_install_and_execution() {
+        let good = b"NEXUS_PACKAGE_ABSENT\nNEXUS_DNS_FALLBACK\nNEXUS_PACKAGE_INSTALLED\nNEXUS_APK_VERSION=jq-1.8.2-r0\nNEXUS_BINARY_VERSION=jq-1.8.2\nNEXUS_JQ_OK\n";
+        assert!(package_output_ok(good));
+        assert!(!package_output_ok(b"NEXUS_JQ_OK\n"));
+        assert!(!package_output_ok(b"NEXUS_PACKAGE_INSTALLED\nNEXUS_PACKAGE_ABSENT\nNEXUS_APK_VERSION=jq-1.8.2-r0\nNEXUS_BINARY_VERSION=jq-1.8.2\nNEXUS_JQ_OK\n"));
+        // Regression: actual stdout from failed run 45949654663.
+        assert!(!package_output_ok(b"NEXUS_PACKAGE_ABSENT\nNEXUS_DNS_FALLBACK\nNEXUS_PACKAGE_INSTALLED\njq: A lightweight and flexible command-line JSON processor\njq: https://jqlang.github.io/jq/\njq: 387 KiB\njq-1.8.2\nNEXUS_JQ_OK\n"));
+        assert!(!package_output_ok(b"NEXUS_PACKAGE_ABSENT\nNEXUS_PACKAGE_INSTALLED\nNEXUS_APK_VERSION=jq-1.8.2-r0\nNEXUS_BINARY_VERSION=jq-1.8.1\nNEXUS_JQ_OK\n"));
+        assert!(!package_output_ok(b"NEXUS_PACKAGE_ABSENT\nNEXUS_PACKAGE_INSTALLED\nNEXUS_APK_VERSION=jq-1.8.2-r\nNEXUS_BINARY_VERSION=jq-1.8.2\nNEXUS_JQ_OK\n"));
+    }
+    #[test]
+    fn capture_preserves_binary_and_streams() {
+        let mut c=Capture::default();
+        c.append(1,Stream::Stdout,b"a\xff").unwrap();
+        c.append(2,Stream::Stderr,b"b").unwrap();
+        c.append(3,Stream::Pty,b"c").unwrap();
+        assert_eq!(c.stdout,b"a\xff");
+        assert_eq!(c.stderr,b"b");
+        assert_eq!(c.pty,b"c");
+        assert_eq!(c.cursor,3);
+    }
+    #[test]
+    fn capture_rejects_replay_and_oversize() {
+        let mut c=Capture::default();
+        c.append(1,Stream::Stdout,&vec![0;LIMIT]).unwrap();
+        assert!(c.append(1,Stream::Stderr,b"").is_err());
+        assert!(c.append(2,Stream::Pty,b"x").is_err());
+        assert_eq!(c.cursor,1);
+    }
+}
+)
+bin=$(/usr/bin/jq --version)
+printf 'NEXUS_APK_VERSION=%s\nNEXUS_BINARY_VERSION=%s\n' "$pkg" "$bin"
 printf '%s\n' '{"value":"NEXUS_JQ_OK"}' | /usr/bin/jq -er '.value'
 "#;
 
