@@ -4,6 +4,7 @@ import UIKit
 import Foundation
 import WebKit
 import Security
+import CryptoKit
 import NexusCore
 import UniformTypeIdentifiers
 
@@ -11,6 +12,8 @@ struct LocalToolsView: View {
     @ObservedObject var model: IDEModel
     @State private var mode: UInt8 = 1
     @State private var keepGuest = false
+    @State private var keepWorkbench = false
+    @State private var resetWorkbench = false
     @State private var frozenKeep = false
     @State private var enableHooks = false
     @State private var beforeHook = ""
@@ -62,7 +65,10 @@ struct LocalToolsView: View {
                         }
                     } else {
                         Text(stagedWorkbench ? "Pinned workbench archive staged; runtime unverified." : "No workbench staged. See build instructions.")
-                        Text("Separate guest workspace, not native Files. Token-protected loopback only.").font(.caption)
+                        Text("Separate guest workspace, not native Files. Token-protected loopback only.")
+                        Toggle("Keep workbench files and extensions", isOn: $keepWorkbench).disabled(model.guestClaimed)
+                        Text("Uses a separate saved workbench guest. A new token is generated on every launch. Unclean shutdown blocks reuse.").font(.caption)
+                        Button("Reset saved workbench", role: .destructive) { resetWorkbench = true; confirmReset = true }.disabled(model.guestClaimed).font(.caption)
                     }
                     if mode == 1 {
                         Toggle("Run reviewed lifecycle hooks", isOn: $enableHooks).disabled(model.guestClaimed)
@@ -75,10 +81,10 @@ struct LocalToolsView: View {
                     if mode != 3 {
                         Toggle("Keep Linux files across launches", isOn: $keepGuest).disabled(model.guestClaimed)
                         Text("Local tools only; never shared with Agent. Unclean shutdown blocks reuse. Reset deletes saved Linux files, not native Files.").font(.caption)
-                        Button("Reset saved Linux environment", role: .destructive) { confirmReset = true }.disabled(model.guestClaimed)
+                        Button("Reset saved Linux environment", role: .destructive) { resetWorkbench = false; confirmReset = true }.disabled(model.guestClaimed)
                     }
                     Button("Review and start local job") {
-                        frozenKeep = keepGuest && mode != 3
+                        frozenKeep = mode == 3 ? keepWorkbench : keepGuest
                         frozenMode = mode
                         frozenHooks = mode == 1 && enableHooks
                         if frozenHooks {
@@ -150,18 +156,18 @@ struct LocalToolsView: View {
                     report = "Profile loaded; no execution until confirmed"
                 } catch { report = "Invalid local tool profile" }
             }
-            .alert("Delete saved Linux environment?", isPresented: $confirmReset) {
+            .alert(resetWorkbench ? "Delete saved workbench?" : "Delete saved Linux environment?", isPresented: $confirmReset) {
                 Button("Delete saved Linux files", role: .destructive) {
                     guard !model.guestClaimed else { return }
-                    report = LocalRunner.resetSaved()
+                    report = LocalRunner.resetSaved(workbench: resetWorkbench)
                 }
                 Button("Cancel", role: .cancel) {}
-            } message: { Text("This permanently deletes the saved local-tools guest, including installed packages and guest files. Native editor files and Agent are separate.") }
+            } message: { Text(resetWorkbench ? "This permanently deletes saved workbench files, settings and extensions. Native Files and local-tools guest remain separate." : "This permanently deletes the saved local-tools guest, including installed packages and guest files. Native editor files and Agent are separate.") }
             .confirmationDialog("Execute in local Linux?", isPresented: $confirm) {
                 Button("Start") { start() }
                 Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false }
             } message: {
-                Text(frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
             .task(id: running) {
                 while running && !Task.isCancelled {
@@ -262,24 +268,50 @@ private enum LocalRunner {
     }
     static func resize() -> Bool { decode(nexus_local_resize(111, 33))["ok"] as? Bool == true }
     static func stop() -> Bool { decode(nexus_local_stop())["ok"] as? Bool == true }
-    static func savedStore() throws -> LocalGuestStore {
+    static func savedStore(workbench: Bool = false) throws -> LocalGuestStore {
         let parent = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-        var container = parent.appendingPathComponent("NexusLocalTools", isDirectory: true)
+        var container = parent.appendingPathComponent(workbench ? "NexusWorkbench" : "NexusLocalTools", isDirectory: true)
         try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         try container.setResourceValues(values)
         return LocalGuestStore(directory: container.appendingPathComponent("guest-v1", isDirectory: true))
     }
-    static func resetSaved() -> String {
-        do { try savedStore().reset(); return "Saved Linux environment deleted" }
+    static func resetSaved(workbench: Bool = false) -> String {
+        do { try savedStore(workbench: workbench).reset(); return workbench ? "Saved workbench deleted" : "Saved Linux environment deleted" }
         catch { return "Saved environment reset failed" }
     }
+    private static func verifyWorkbench(dataPath: URL, bundled: URL) -> Bool {
+        // Read expected digests only from the installed app bundle, not from
+        // mutable guest metadata. This checks launcher and Node, not all files.
+        for (name, relative) in [("launcher","bin/openvscode-server"),("node","node")] {
+            do {
+                let expected = try String(contentsOf: bundled.appendingPathComponent("workbench-\(name).sha256"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard AGYImportFormat.validDigest(expected) else { return false }
+                let file = dataPath.appendingPathComponent("opt/nexus/workbench/" + relative)
+                let v = try file.resourceValues(forKeys: [.isRegularFileKey,.isSymbolicLinkKey,.fileSizeKey])
+                guard v.isRegularFile == true, v.isSymbolicLink != true, let size = v.fileSize,
+                      size > 0, size <= 256 * 1024 * 1024 else { return false }
+                let handle = try FileHandle(forReadingFrom: file)
+                defer { try? handle.close() }
+                var sha = SHA256()
+                var bytes = 0
+                while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+                    bytes += chunk.count
+                    guard bytes <= size else { return false }
+                    sha.update(data: chunk)
+                }
+                guard bytes == size, sha.finalize().map({ String(format: "%02x", $0) }).joined() == expected else { return false }
+            } catch { return false }
+        }
+        return true
+    }
+
     static func run(mode: UInt8, input: String, persistent: Bool) -> String {
         do {
             guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else { return "Missing Ubuntu assets" }
             let fm = FileManager.default
-            let store = persistent ? try savedStore() : nil
+            let store = persistent ? try savedStore(workbench: mode == 3) : nil
             let trial = fm.temporaryDirectory.appendingPathComponent("NexusLocal-\(UUID().uuidString)", isDirectory: true)
             let dataPath: URL
             if let store {
@@ -287,6 +319,10 @@ private enum LocalRunner {
             } else {
                 try fm.copyItem(at: root, to: trial)
                 dataPath = trial.appendingPathComponent("data")
+            }
+            if mode == 3, !verifyWorkbench(dataPath: dataPath, bundled: root) {
+                if store == nil { try? fm.removeItem(at: trial) }
+                return "Workbench executable digest mismatch; saved environment not booted. Reset explicitly or use disposable mode."
             }
             var result = dataPath.path.withCString { path in
                 input.withCString { decode(nexus_local_run(path, mode, $0)) }

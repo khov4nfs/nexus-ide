@@ -909,7 +909,7 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
     };
     let mut capture = Capture::default();
     capture.rolling_pty = !workbench;
-    let deadline = Instant::now() + Duration::from_secs(if workbench {300} else {1800});
+    let deadline = Instant::now() + Duration::from_secs(1800);
     let mut stopped = false;
     let result: Result<(),String> = async {
         loop {

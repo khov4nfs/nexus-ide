@@ -14,7 +14,7 @@ struct State {
 static STATE: Mutex<State> = Mutex::new(State {
     running:false, ready:false, mode:0, output:String::new(), raw:Vec::new(), total:0, controls:VecDeque::new(), stop:false,
 });
-const WORKBENCH: &str = "umask 077; mkdir -p /tmp/nexus-workbench /tmp/nexus-vscode-data /tmp/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /tmp/nexus-vscode-data --extensions-dir /tmp/nexus-vscode-extensions /tmp/nexus-workbench";
+const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
 fn fail(message: &str) -> Value { json!({"ok":false,"error":message}) }
 fn valid_command(s: &str) -> bool { !s.trim().is_empty() && s.len() <= 2048 && !s.contains('\0') }
 fn parse_call(input:&str)->Option<Value> {
