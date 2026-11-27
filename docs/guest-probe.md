@@ -1,6 +1,6 @@
 # Embedded ARM64 Linux device experiment
 
-Status: implementation / unverified device build. This is not a general-purpose
+Status: initial unsigned ARM64 device build passed (run 45946965351, commit b233c6d). Physical-device boot remains unverified; extended process probes are new. This is not a general-purpose
 shell or agent host. Native workspace utilities remain the default. No remote
 runtime or mock output is used in the app.
 
@@ -31,15 +31,14 @@ not independently authenticated package provenance or a committed digest.
 Cargo dependency lock and reproducibility still need review after first build.
 The separate Xcode project links the library only for physical ARM64 iOS.
 Set signing team and unique bundle identifier if required. No IPA is produced.
-CI checks cross-build only; the normal app and Swift tests remain independent.
-The guest build script and Xcode linker settings are unverified until CI.
+CI also runs fixed guest probes on the macOS build host using a disposable generated rootfs. This is a development test, not an execution backend of the app. The normal app and Swift tests remain independent. New revisions require fresh CI evidence.
 
 ## Acceptance on an actual iPhone
 1. Install the signed NexusIDEGuest target. Save existing work.
 2. Open Linux Lab, confirm the fixed probe. Keep app foregrounded.
 3. Record device model, iOS version, app commit, upstream commit, rootfs digest,
    and the JSON output. Check architecture is aarch64, echo marker matches,
-   shell marker matches with exit 7, and shutdown has no error.
+   shell marker matches with exit 7, separate stdout/stderr and stdin roundtrip pass, PTY reports 33 rows / 111 columns, cancellation reports signal 9, and shutdown has no error.
 4. A crash, freeze, timeout, missing rootfs metadata, incorrect output, or
    inability to copy fakefs correctly is a failed gate, not a pass.
 5. Restart the app before another attempt. The native and guest filesystems
@@ -54,3 +53,21 @@ boot. A stuck boot requires app termination. Do not run on production data.
 
 ## CI troubleshooting
 Run 45946162960 failed during host Meson setup after successful rootfs checksum verification. Upstream suppressed stdout, so the exact configuration error was not visible. The build now explicitly selects Apple clang and the macOS SDK for the host converter, sets host-only pkg-config paths, puts Homebrew lld on PATH, and prints/uploads Meson diagnostics on failure. This is a targeted remediation, not a verified root-cause diagnosis. Device cross-build must still pass independently.
+
+## Process I/O acceptance (v0.2.1)
+The fixed shell fixture writes distinct stdout/stderr markers, blocks on a
+line from stdin, then exits after echoing it. The probe requires the markers
+before exit and uses an explicit sequence cursor rather than the upstream
+next_seq field. A PTY fixture waits for input, is resized to 111x33, then
+executes stty size. A cancellation fixture emits a readiness marker before
+its process group is terminated; only a closed session with signal 9 passes.
+Each read is bounded by deadline and total retained bytes; dropped output
+or nonmonotonic sequence fails the probe. Errors attempt termination and
+stop the remaining process tests. This is not an arbitrary process API,
+interactive terminal UI, or ACP session. Boot may still block in upstream.
+
+Host CI executes the same fixed Rust probe through the real embedded kernel
+on the macOS build machine, with no remote runtime fallback in the iOS app.
+The host test explicitly fails if its rootfs is missing; it is ignored by
+ordinary unit tests and explicitly invoked by the workflow. Initial device
+cross-build evidence does not establish the new probes' correctness.
