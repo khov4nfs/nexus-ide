@@ -124,6 +124,19 @@ fn parse_cli(input:&str)->Option<(String,String,String,Option<String>,Option<Nat
     }else{None};
     Some((kind.into(),digest.into(),action.into(),prompt,session))
 }
+pub(crate) struct TransferInput {pub name:String,pub text:Option<String>}
+fn parse_transfer(input:&str)->Option<TransferInput>{
+    if input.len()>65536{return None;}
+    let v:Value=serde_json::from_str(input).ok()?;
+    let name=v["name"].as_str()?;
+    if name.is_empty()||name.len()>128||name.starts_with('.')||!name.bytes().all(|b|b.is_ascii_alphanumeric()||b"._-".contains(&b)){return None;}
+    let text=match v["action"].as_str()?{
+        "push" if v.as_object()?.len()==3=>{let s=v["text"].as_str()?;if s.len()>8192||s.contains('\0'){return None;}Some(s.to_owned())},
+        "pull" if v.as_object()?.len()==2=>None,
+        _=>return None,
+    };
+    Some(TransferInput{name:name.into(),text})
+}
 pub(crate) struct LspInput {pub argv:Vec<String>,pub language:String,pub uri:String,pub text:String}
 fn parse_lsp(input:&str)->Option<LspInput>{
     if input.len()>65536{return None;}
@@ -201,7 +214,8 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let workbench=if mode==3 {match parse_workbench(input) {Some(v)=>Some(v),None=>return fail("Invalid workbench launch")}} else {None};
     let cli=if mode==6 {match parse_cli(input) {Some(v)=>Some(v),None=>return fail("Invalid CLI launch")}} else {None};
     let lsp=if mode==8 {match parse_lsp(input){Some(v)=>Some(v),None=>return fail("Invalid LSP snapshot request")}}else{None};
-    if !matches!(mode,1..=6|8) ||
+    let transfer=if mode==9 {match parse_transfer(input){Some(v)=>Some(v),None=>return fail("Invalid workspace transfer")}}else{None};
+    if !matches!(mode,1..=6|8|9) ||
         (matches!(mode,1|2) && !valid_command(input)) { return fail("Invalid local job"); }
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
@@ -228,6 +242,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         ("TERM".into(),if matches!(mode,1|5|6) {"xterm-256color".into()} else {"dumb".into()}),("NODE_OPTIONS".into(),"--jitless".into())]);
     let libc = rt.block_on(process_probe::glibc_compat(&guest,&env));
     let mut result = if libc["passed"] != true { fail("Ubuntu compatibility failed") }
+        else if let Some(request)=transfer.as_ref(){rt.block_on(process_probe::workspace_transfer(&guest,&env,request))}
         else if let Some(request)=lsp.as_ref(){rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}
         else if let Some(plan)=hooks.as_ref() {
             let before=plan["before"].as_str();
@@ -294,6 +309,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let shutdown = rt.block_on(guest.shutdown()).is_ok();
     result["shutdownClean"] = json!(shutdown);
     result["ok"] = json!(result["ok"] == true && shutdown);
+    if mode==9 && result["ok"]!=true {result.as_object_mut().unwrap().remove("text");}
     result
 }
 fn ffi(f: impl FnOnce() -> Value + std::panic::UnwindSafe) -> *mut c_char {
@@ -462,6 +478,36 @@ mod tests {
         let evidence=json!({"ok":ok,"fixtureOnly":true,"kind":kind,"phase":phase,"turnsCompleted":r["turnsCompleted"],"shutdownClean":clean});
         std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
         assert!(ok,"conversation fixture failed: {r}");
+    }
+    #[test]
+    fn transfer_input_bounds(){
+        assert!(parse_transfer(r#"{"action":"push","name":"demo.txt","text":""}"#).is_some());
+        for name in ["../demo",".hidden","/root/a","a/b","a b"]{
+            assert!(parse_transfer(&json!({"action":"pull","name":name}).to_string()).is_none());
+        }
+        assert!(parse_transfer(&json!({"action":"push","name":"a","text":"x".repeat(8193)}).to_string()).is_none());
+    }
+    #[test]
+    #[ignore = "requires independent boots sharing the same Ubuntu fakefs"]
+    fn real_workspace_transfer(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_TRANSFER_PHASE").expect("phase");
+        let text="Nexus — Tiếng Việt\n$(never-execute)\n";
+        let request=match phase.as_str(){
+            "push"=>json!({"action":"push","name":"demo.txt","text":text}),
+            "duplicate"=>json!({"action":"push","name":"demo.txt","text":"must not overwrite"}),
+            "pull"=>json!({"action":"pull","name":"demo.txt"}),
+            _=>panic!("unknown phase"),
+        };
+        let r=run(Path::new(&path),9,&request.to_string());
+        let ok=match phase.as_str(){
+            "push"=>r["ok"]==true&&r["bytes"]==text.len(),
+            "duplicate"=>r["ok"]==false&&r.get("text").is_none(),
+            _=>r["ok"]==true&&r["text"]==text,
+        }&&r["shutdownClean"]==true;
+        std::fs::write(evidence,serde_json::to_vec_pretty(&json!({"ok":ok,"phase":phase,"shutdownClean":r["shutdownClean"],"fixtureOnly":true})).unwrap()).unwrap();
+        assert!(ok,"transfer failed: {}",r["error"]);
     }
     #[test]
     fn lsp_input_bounds(){

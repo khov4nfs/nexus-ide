@@ -1151,6 +1151,66 @@ pub(crate) async fn claude_session(guest:&IshInstance,env:&HashMap<String,String
     }
 }
 
+// Fixed guest folder, direct argv, create-only export. No host filesystem mount.
+pub(crate) async fn workspace_transfer(guest:&IshInstance,env:&HashMap<String,String>,request:&crate::local_jobs::TransferInput)->Value{
+    use base64::{engine::general_purpose::STANDARD,Engine as _};
+    let script=r#"
+set -eu
+umask 077
+dir=/root/nexus-transfer
+test ! -L /root
+test ! -L "$dir"
+mkdir -p "$dir"
+test -d "$dir"
+target="$dir/$1"
+test ! -L "$target"
+if [ "$2" = push ]; then
+    test ! -e "$target"
+    tmp=$(mktemp "$dir/.incoming-XXXXXXXX")
+    trap 'rm -f "$tmp"' EXIT
+    printf 'NEXUS_TRANSFER_READY\n' >&2
+    IFS= read -r wire
+    printf '%s' "$wire" | /usr/bin/base64 -d > "$tmp"
+    test "$(wc -c < "$tmp")" -le 8192
+    ln "$tmp" "$target"
+else
+    test -f "$target"
+    test "$(wc -c < "$target")" -le 8192
+fi
+head -c 8193 "$target" | /usr/bin/base64 -w0
+"#;
+    let mut opts=SpawnOpts::cmd(["/bin/sh","-c",script,"nexus-transfer",request.name.as_str(),if request.text.is_some(){"push"}else{"pull"}]);
+    opts.cwd=Some(Path::new("/").to_path_buf());
+    opts.envp=Some(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect());
+    opts.pipe_stdin=true;
+    let Ok(session)=guest.spawn(opts)else{return json!({"ok":false,"error":"Transfer process spawn failed"});};
+    let mut capture=Capture::default();
+    let deadline=Instant::now()+Duration::from_secs(30);
+    let result:Result<Value,String>=async{
+        if crate::local_jobs::stop_requested(){return Err("Cancelled".into());}
+        if let Some(text)=request.text.as_deref(){
+            wait_ready(&session,&mut capture,deadline,|c|c.stderr==b"NEXUS_TRANSFER_READY\n").await?;
+            if crate::local_jobs::stop_requested(){return Err("Cancelled".into());}
+            write_ready(&session,format!("{}\n",STANDARD.encode(text.as_bytes())).as_bytes(),deadline).await?;
+        }
+        drain(&session,&mut capture,deadline).await?;
+        if crate::local_jobs::stop_requested()||!capture.closed||capture.code!=Some(0)||capture.signal.unwrap_or(0)!=0||!capture.pty.is_empty(){return Err("Transfer rejected".into());}
+        let bytes=STANDARD.decode(&capture.stdout).map_err(|_|"Invalid transfer encoding")?;
+        let text=String::from_utf8(bytes).map_err(|_|"Invalid UTF-8")?;
+        if text.len()>8192||text.contains('\0'){return Err("Invalid transfer text".into());}
+        if let Some(original)=request.text.as_deref(){
+            if text!=original{return Err("Export byte verification failed".into());}
+            Ok(json!({"ok":true,"action":"push","name":request.name,"bytes":text.len(),"createOnly":true}))
+        }else{
+            Ok(json!({"ok":true,"action":"pull","name":request.name,"bytes":text.len(),"text":text}))
+        }
+    }.await;
+    match result{
+        Ok(r)=>r,
+        Err(_)=>{let _=session.terminate().await;let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;json!({"ok":false,"error":"Transfer rejected, cancelled, or destination already exists"})}
+    }
+}
+
 // LSP 3.17 Content-Length framing; no workspace edits, paths or server requests.
 fn lsp_frame(buffer:&mut Vec<u8>)->Result<Option<Value>,String>{
     let Some(end)=buffer.windows(4).position(|b|b==b"\r\n\r\n")else{
