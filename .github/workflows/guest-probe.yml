@@ -476,7 +476,7 @@ jobs:
           export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
           export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
           export CC="$(xcrun --sdk macosx --find clang)"
-          for phase in success invalidUri invalidRange; do
+          for phase in success invalidUri invalidRange completion completionInvalid; do
             cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-lsp-$phase"
             export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-lsp-$phase/data"
             export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-lsp-$phase.json"

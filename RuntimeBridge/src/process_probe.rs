@@ -1265,7 +1265,7 @@ fn lsp_position(v:&Value,lines:&[&str])->Option<(usize,usize)>{
     let line=usize::try_from(v["line"].as_u64()?).ok()?;
     let character=usize::try_from(v["character"].as_u64()?).ok()?;
     let text=lines.get(line)?.trim_end_matches('\r');
-    if character>text.encode_utf16().count(){return None;}
+    if !std::iter::once(0).chain(text.chars().scan(0usize,|n,c|{*n+=c.len_utf16();Some(*n)})).any(|n|n==character){return None;}
     Some((line,character))
 }
 fn lsp_project(params:&Value,request:&crate::local_jobs::LspInput)->Result<Vec<Value>,String>{
@@ -1286,6 +1286,39 @@ fn lsp_project(params:&Value,request:&crate::local_jobs::LspInput)->Result<Vec<V
     }
     Ok(result)
 }
+// Project only plain, single-range insertions. Never execute completion commands,
+// resolve items, snippets, or apply additional edits.
+fn lsp_completions(value:&Value,request:&crate::local_jobs::LspInput)->Result<Vec<Value>,String>{
+    if value.is_null(){return Ok(Vec::new());}
+    let items=if value.is_array(){value.as_array()}else{
+        if value.get("itemDefaults").is_some(){return Err("Unsupported completion defaults".into());}
+        value["items"].as_array()
+    }.filter(|a|a.len()<=128).ok_or("Invalid completion list")?;
+    let cursor=request.completion.ok_or("Missing completion position")?;
+    let lines=request.text.split('\n').collect::<Vec<_>>();
+    let mut result=Vec::new();
+    let mut bytes=0;
+    for item in items{
+        if item.get("command").is_some()||item.get("additionalTextEdits").is_some()||item.get("textEditText").is_some()||
+           item.get("insertTextFormat").is_some_and(|v|v.as_u64()!=Some(1))||
+           item.get("insertTextMode").is_some_and(|v|v.as_u64()!=Some(1)){continue;}
+        let Some(label)=item["label"].as_str().filter(|s|!s.is_empty()&&s.len()<=256&&!s.chars().any(char::is_control))else{continue;};
+        let (start,end,text)=if let Some(edit)=item.get("textEdit"){
+            let Some(start)=lsp_position(&edit["range"]["start"],&lines)else{continue;};
+            let Some(end)=lsp_position(&edit["range"]["end"],&lines)else{continue;};
+            if start.0!=cursor.0||end.0!=cursor.0||start>cursor||end<cursor||start>end{continue;}
+            let Some(text)=edit["newText"].as_str()else{continue;};
+            (start,end,text)
+        }else{
+            (cursor,cursor,item.get("insertText").and_then(Value::as_str).unwrap_or(label))
+        };
+        if text.is_empty()||text.len()>1024||text.chars().any(char::is_control){continue;}
+        bytes+=label.len()+text.len();
+        if result.len()>=32||bytes>8192{break;}
+        result.push(json!({"label":label,"text":text,"range":{"start":{"line":start.0,"character":start.1},"end":{"line":end.0,"character":end.1}}}));
+    }
+    Ok(result)
+}
 pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,String>,request:&crate::local_jobs::LspInput,fixture:bool)->Value{
     let mut opts=SpawnOpts::cmd(request.argv.iter().map(String::as_str));
     #[cfg(test)]
@@ -1298,31 +1331,38 @@ pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,Strin
     let Ok(session)=guest.spawn(opts)else{return json!({"ok":false,"error":"LSP spawn failed"});};
     let mut capture=Capture::default();
     let deadline=Instant::now()+Duration::from_secs(45);
-    let result:Result<Vec<Value>,String>=async{
-        lsp_send(&session,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"workspaceFolders":null,"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"versionSupport":true}}},"clientInfo":{"name":"nexus-ios","version":"0.7.0"}}}),deadline).await?;
+    let result:Result<Value,String>=async{
+        lsp_send(&session,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"workspaceFolders":null,"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"versionSupport":true},"completion":{"completionItem":{"snippetSupport":false}}}},"clientInfo":{"name":"nexus-ios","version":"0.7.0"}}}),deadline).await?;
         let init=lsp_reply(&session,&mut capture,1,deadline).await?;
         let caps=init["capabilities"].as_object().ok_or("Missing LSP capabilities")?;
         if caps.get("positionEncoding").is_some_and(|v|v!="utf-16"){return Err("Unsupported LSP position encoding".into());}
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"initialized","params":{}}),deadline).await?;
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":request.uri,"languageId":request.language,"version":1,"text":request.text}}}),deadline).await?;
+        let (projected,shutdown_id)=if let Some((line,character))=request.completion{
+            if !caps.get("completionProvider").is_some_and(Value::is_object){return Err("Server does not advertise completion".into());}
+            lsp_send(&session,json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":request.uri},"position":{"line":line,"character":character},"context":{"triggerKind":1}}}),deadline).await?;
+            let answer=lsp_reply(&session,&mut capture,2,deadline).await?;
+            (json!({"completions":lsp_completions(&answer,request)?}),3)
+        }else{
         let mut found=None;
         for _ in 0..128{
             let f=lsp_next(&session,&mut capture,deadline).await?;
             if f.get("id").is_some(){return Err("Unexpected LSP reply".into());}
             if f["method"]=="textDocument/publishDiagnostics"{found=Some(lsp_project(&f["params"],request)?);break;}
         }
-        let diagnostics=found.ok_or("No push diagnostics received")?;
+        (json!({"diagnostics":found.ok_or("No push diagnostics received")?}),2)
+        };
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":request.uri}}}),deadline).await?;
-        lsp_send(&session,json!({"jsonrpc":"2.0","id":2,"method":"shutdown"}),deadline).await?;
-        if !lsp_reply(&session,&mut capture,2,deadline).await?.is_null(){return Err("Invalid LSP shutdown response".into());}
+        lsp_send(&session,json!({"jsonrpc":"2.0","id":shutdown_id,"method":"shutdown"}),deadline).await?;
+        if !lsp_reply(&session,&mut capture,shutdown_id,deadline).await?.is_null(){return Err("Invalid LSP shutdown response".into());}
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"exit"}),deadline).await?;
         drain(&session,&mut capture,deadline).await?;
         if !capture.exited||capture.code!=Some(0)||capture.signal.unwrap_or(0)!=0||!capture.closed{return Err("LSP shutdown failed".into());}
-        Ok(diagnostics)
+        Ok(projected)
     }.await;
     match result{
-        Ok(d)=>json!({"ok":true,"diagnostics":d,"snapshotOnly":true,"transportClosed":true}),
-        Err(_)=>{let _=session.terminate().await;let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;json!({"ok":false,"error":"LSP diagnostics rejected, unsupported, cancelled or timed out","transportClosed":closed})}
+        Ok(mut d)=>{d["ok"]=json!(true);d["snapshotOnly"]=json!(true);d["transportClosed"]=json!(true);d},
+        Err(_)=>{let _=session.terminate().await;let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;json!({"ok":false,"error":"LSP request rejected, unsupported, cancelled or timed out","transportClosed":closed})}
     }
 }
 

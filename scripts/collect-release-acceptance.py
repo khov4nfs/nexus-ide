@@ -28,7 +28,7 @@ def gates(variant):
         "claude": ("signedIn", "signedOut", "success", "error"),
         "conversation-codex": ("create", "resume"),
         "conversation-claude": ("create", "resume"),
-        "lsp": ("success", "invalidUri", "invalidRange"),
+        "lsp": ("success", "invalidUri", "invalidRange", "completion", "completionInvalid"),
         "transfer": ("push", "duplicate", "pull"),
     }
     for group, phases in groups.items():

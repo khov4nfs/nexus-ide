@@ -56,6 +56,11 @@ struct LocalToolsView: View {
     @State private var transferReview = false
     @State private var lspArgv = ""
     @State private var lspLanguage = "python"
+    @State private var lspCompletion = false
+    @State private var lspLine = "0"
+    @State private var lspCharacter = "0"
+    @State private var lspItems: [LSPTextEdit] = []
+    @State private var reviewTitle = "Review Linux import"
     @State private var lspSnapshot: WorkspaceSnapshot?
     @State private var lspLoading = false
     @State private var cliAction = "shell"
@@ -88,7 +93,7 @@ struct LocalToolsView: View {
                         Text("MCP manual call").tag(UInt8(4))
                         Text("OpenVSCode").tag(UInt8(3))
                         Text("Original agent CLI").tag(UInt8(6))
-                        Text("Native LSP diagnostics").tag(UInt8(8))
+                        Text("Native LSP").tag(UInt8(8))
                         Text("Native/Linux file transfer").tag(UInt8(9))
                     }.disabled(model.guestClaimed)
                     if mode == 9 {
@@ -116,7 +121,12 @@ struct LocalToolsView: View {
                             }
                         }.disabled(model.guestClaimed || lspLoading || model.path.isEmpty)
                         if let snapshot = lspSnapshot { Text(snapshot.path + " · " + String(snapshot.text.utf8.count) + " bytes").font(.caption); Button("Remove snapshot") { lspSnapshot = nil }.disabled(model.guestClaimed) }
-                        Text("One local stdio language server already installed in the guest. Snapshot-only push diagnostics, UTF-16 positions; no native file path, workspace mount or edits. Server may use network or retain the snapshot.").font(.caption)
+                        Toggle("Request completion instead of diagnostics", isOn: $lspCompletion).disabled(model.guestClaimed)
+                        if lspCompletion {
+                            TextField("Zero-based line", text: $lspLine).keyboardType(.numberPad).disabled(model.guestClaimed)
+                            TextField("Zero-based UTF-16 character", text: $lspCharacter).keyboardType(.numberPad).disabled(model.guestClaimed)
+                        }
+                        Text("Snapshot diagnostics or one completion request. Only plain single-range edits may be reviewed; no snippets, commands, automatic edits or native path. Server may use network or retain data.").font(.caption)
                         Toggle("Use saved local-tools guest", isOn: $keepGuest).disabled(model.guestClaimed)
                     } else if mode == 6 {
                         Picker("Official executable", selection: $cliKind) {
@@ -217,7 +227,12 @@ struct LocalToolsView: View {
                         } else if mode == 8 {
                             guard let snapshot = lspSnapshot, let approved = try? ACPTerminalApproval.parse(Data(lspArgv.utf8)) else { report = "Select a saved snapshot and valid argv"; return }
                             let ext = (snapshot.path as NSString).pathExtension.lowercased()
-                            guard let wire = try? JSONSerialization.data(withJSONObject: ["argv":approved.arguments,"language":lspLanguage,"extension":ext,"text":snapshot.text], options: [.sortedKeys]), wire.count <= 65536 else { report = "Invalid LSP snapshot"; return }
+                            var request: [String: Any] = ["argv":approved.arguments,"language":lspLanguage,"extension":ext,"text":snapshot.text]
+                            if lspCompletion {
+                                guard let line = Int(lspLine), let character = Int(lspCharacter), LSPTextEdit.offset(.init(line: line, character: character), in: snapshot.text) != nil else { report = "Invalid UTF-16 cursor"; return }
+                                request["completion"] = ["line":line,"character":character]
+                            }
+                            guard let wire = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]), wire.count <= 65536 else { report = "Invalid LSP snapshot"; return }
                             frozenInput = String(decoding: wire, as: UTF8.self)
                         } else if mode == 6 {
                             guard let frozenCLI else { report = "Select reviewed executable"; return }
@@ -300,6 +315,17 @@ struct LocalToolsView: View {
                         Text(verbatim: output).font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
                     }
                 }
+                if !lspItems.isEmpty {
+                    Section("Completion · review before apply") {
+                        ForEach(lspItems.indices, id: \.self) { i in
+                            Button {
+                                guard let snap = lspSnapshot, let replacement = try? lspItems[i].replacement(in: snap.text) else { report = "Completion cannot be applied"; return }
+                                transferSnapshot = snap; transferReplacement = replacement; reviewTitle = "Review completion"; transferReview = true
+                            } label: { VStack(alignment: .leading) { Text(verbatim: lspItems[i].label); Text(verbatim: lspItems[i].text).font(.caption) } }
+                            .disabled(running || model.reviewBusy)
+                        }
+                    }
+                }
                 Section("Status") {
                     if running { ProgressView("Keep app open") }
                     Text(verbatim: report).font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
@@ -371,12 +397,12 @@ struct LocalToolsView: View {
                                 Text(snap.path).font(.headline)
                                 Text("Original").font(.caption)
                                 Text(verbatim: snap.text).textSelection(.enabled)
-                                Text("Linux replacement (untrusted)").font(.caption)
+                                Text("Proposed replacement (untrusted)").font(.caption)
                                 Text(verbatim: replacement).textSelection(.enabled)
                                 Text("Apply only if the saved file and editor still match the original.").font(.caption)
                             }
                         }.padding().frame(maxWidth: .infinity, alignment: .leading)
-                    }.navigationTitle("Review Linux import")
+                    }.navigationTitle(reviewTitle)
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) { Button("Discard") { transferReplacement = nil; transferReview = false }.disabled(model.reviewBusy) }
                         ToolbarItem(placement: .confirmationAction) {
@@ -449,7 +475,10 @@ struct LocalToolsView: View {
                 LocalRunner.run(mode: selectedMode, input: input, persistent: persistent, vsix: vsix, cli: cli)
             }.value
             if selectedMode == 9, let obj = try? JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any], obj["ok"] as? Bool == true, obj["shutdownClean"] as? Bool == true, obj["action"] as? String == "pull", let text = obj["text"] as? String, text.utf8.count <= 8192, !text.utf8.contains(0) {
-                transferReplacement = text; transferReview = true; report = "Linux file retrieved; native review required"
+                transferReplacement = text; reviewTitle = "Review Linux import"; transferReview = true; report = "Linux file retrieved; native review required"
+            }
+            if selectedMode == 8, let obj = try? JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any], obj["ok"] as? Bool == true, obj["shutdownClean"] as? Bool == true, let items = obj["completions"], let data = try? JSONSerialization.data(withJSONObject: items), let decoded = try? JSONDecoder().decode([LSPTextEdit].self, from: data), decoded.count <= 32 {
+                lspItems = decoded; report = "Received \(decoded.count) plain completion suggestions"
             }
             let progress = LocalRunner.progress()
             output = progress.output

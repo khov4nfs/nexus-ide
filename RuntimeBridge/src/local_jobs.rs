@@ -137,11 +137,12 @@ fn parse_transfer(input:&str)->Option<TransferInput>{
     };
     Some(TransferInput{name:name.into(),text})
 }
-pub(crate) struct LspInput {pub argv:Vec<String>,pub language:String,pub uri:String,pub text:String}
+pub(crate) struct LspInput {pub argv:Vec<String>,pub language:String,pub uri:String,pub text:String,pub completion:Option<(usize,usize)>}
 fn parse_lsp(input:&str)->Option<LspInput>{
     if input.len()>65536{return None;}
     let v:Value=serde_json::from_str(input).ok()?;
-    if v.as_object()?.len()!=4{return None;}
+    let fields=v.as_object()?.len();
+    if !matches!(fields,4|5){return None;}
     let argv=v["argv"].as_array()?;
     if !(1..=17).contains(&argv.len())||v["argv"].to_string().len()>2048{return None;}
     let argv=argv.iter().map(|a|a.as_str().filter(|s|s.len()<=512&&!s.chars().any(char::is_control)).map(str::to_owned)).collect::<Option<Vec<_>>>()?;
@@ -152,7 +153,17 @@ fn parse_lsp(input:&str)->Option<LspInput>{
     if language.is_empty()||language.len()>32||!language.bytes().all(|b|b.is_ascii_alphanumeric()||b"-_".contains(&b))||ext.is_empty()||ext.len()>12||!ext.bytes().all(|b|b.is_ascii_alphanumeric()){return None;}
     let text=v["text"].as_str()?;
     if text.len()>8192||text.contains('\0'){return None;}
-    Some(LspInput{argv,language:language.into(),uri:format!("file:///tmp/nexus-lsp.{ext}"),text:text.into()})
+    let completion=if fields==5{
+        let pos=v["completion"].as_object()?;
+        if pos.len()!=2{return None;}
+        let line=usize::try_from(pos.get("line")?.as_u64()?).ok()?;
+        let col=usize::try_from(pos.get("character")?.as_u64()?).ok()?;
+        let source=text.split('\n').nth(line)?.trim_end_matches('\r');
+        let mut boundaries=std::iter::once(0).chain(source.chars().scan(0usize,|n,c|{*n+=c.len_utf16();Some(*n)}));
+        if !boundaries.any(|n|n==col){return None;}
+        Some((line,col))
+    }else{None};
+    Some(LspInput{argv,language:language.into(),uri:format!("file:///tmp/nexus-lsp.{ext}"),text:text.into(),completion})
 }
 fn progress() -> Value {
     STATE.lock().map(|s| json!({"ok":true,"running":s.running,"ready":s.ready,"output":s.output,"stopRequested":s.stop,"agentWaiting":s.agent.as_ref().is_some_and(|a|a.waiting&&!s.stop),"agentTurns":s.agent.as_ref().map(|a|&a.turns),"agentHandle":s.agent.as_ref().and_then(|a|a.handle.as_deref())}))
@@ -310,6 +321,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     result["shutdownClean"] = json!(shutdown);
     result["ok"] = json!(result["ok"] == true && shutdown);
     if mode==9 && result["ok"]!=true {result.as_object_mut().unwrap().remove("text");}
+    if mode==8 && result["ok"]!=true {let o=result.as_object_mut().unwrap();o.remove("diagnostics");o.remove("completions");}
     result
 }
 fn ffi(f: impl FnOnce() -> Value + std::panic::UnwindSafe) -> *mut c_char {
@@ -526,10 +538,12 @@ mod tests {
         let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
         let env=HashMap::from([("PATH".into(),"/usr/bin:/bin".into()),("HOME".into(),"/root".into()),("NEXUS_LSP_PHASE".into(),phase.clone())]);
-        let input=parse_lsp(&json!({"argv":["/usr/bin/server"],"language":"python","extension":"py","text":"x = 1\n"}).to_string()).unwrap();
+        let mut request=json!({"argv":["/usr/bin/server"],"language":"python","extension":"py","text":"x = 1\n"});
+        if phase.starts_with("completion"){request["completion"]=json!({"line":0,"character":5});}
+        let input=parse_lsp(&request.to_string()).unwrap();
         let r=rt.block_on(process_probe::lsp_diagnostics(&guest,&env,&input,true));
         let clean=rt.block_on(guest.shutdown()).is_ok();
-        let ok=if phase=="success"{r["ok"]==true&&r["diagnostics"][0]["message"]=="fixture diagnostic"&&r["diagnostics"][0]["range"]["end"]["character"]==1}else{r["ok"]==false&&r.get("diagnostics").is_none()};
+        let ok=if phase=="success"{r["ok"]==true&&r["diagnostics"][0]["message"]=="fixture diagnostic"&&r["diagnostics"][0]["range"]["end"]["character"]==1}else if phase=="completion"{r["ok"]==true&&r["completions"].as_array().is_some_and(|a|a.len()==1)&&r["completions"][0]["text"]==" + 2"}else{r["ok"]==false&&r.get("diagnostics").is_none()&&r.get("completions").is_none()};
         let evidence=json!({"ok":ok&&clean,"fixtureOnly":true,"phase":phase,"shutdownClean":clean});
         std::fs::write(report,serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
         assert!(ok&&clean,"LSP fixture failed: {r}");
