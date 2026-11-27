@@ -203,7 +203,9 @@ fi
 printf 'NEXUS_PACKAGE_INSTALLED\n'
 # Query installed package versions without a package argument.
 installed=$(/sbin/apk --no-network info -v)
-pkg=$(printf '%s\n' "$installed" | grep -E '^jq-[0-9][^[:space:]]*-r[0-9]+
+pkg=$(printf '%s\n' "$installed" | grep -E '^jq-[0-9][^[:space:]]*-r[0-9]+$')
+bin=$(/usr/bin/jq --version)
+printf 'NEXUS_APK_VERSION=%s\nNEXUS_BINARY_VERSION=%s\n' "$pkg" "$bin"
 printf '%s\n' '{"value":"NEXUS_JQ_OK"}' | /usr/bin/jq -er '.value'
 "#;
 
