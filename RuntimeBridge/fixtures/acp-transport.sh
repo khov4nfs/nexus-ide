@@ -40,6 +40,16 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture-%s"}}\n' "$$"
 IFS= read -r third
 case "$third" in *'"method":"session/prompt"'*) ;; *) exit 54 ;; esac
 case "$third" in *'"sessionId":"fixture-'$$'"'*) ;; *) exit 55 ;; esac
+if [ -n "${NEXUS_FIXTURE_HOOK:-}" ]; then
+    case "$third" in *'Hook fixture'*) ;; *) exit 140;; esac
+    test "$NEXUS_FIXTURE_HOOK" != beforeFailure
+    test "$(cat /tmp/nexus-acp-before)" = before
+    printf done >/tmp/nexus-acp-turn
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hook fixture done"}}}}\n' "$$"
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+    IFS= read -r unexpected
+    exit 141
+fi
 if [ -n "${NEXUS_FIXTURE_REVIEW:-}" ]; then
     case "$third" in *'Review fixture'*) ;; *) exit 125;; esac
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-%s","update":{"sessionUpdate":"plan","entries":[{"content":"Inspect fixture","priority":"high","status":"pending"}]}}}\n' "$$"

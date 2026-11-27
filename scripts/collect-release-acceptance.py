@@ -23,6 +23,7 @@ def gates(variant):
         rows[name] = ("synthetic protocol peer", {"ok": True, "fixtureOnly": True, "shutdownClean": True})
     groups = {
         "acp-review": ("allow", "deny", "cancel"),
+        "acp-hooks": ("success", "beforeFailure", "afterFailure"),
         "acp-resume": ("create", "resume"),
         "codex-turn": ("success", "policy", "mismatch"),
         "claude": ("signedIn", "signedOut", "success", "error"),

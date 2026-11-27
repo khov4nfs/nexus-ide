@@ -33,6 +33,7 @@ char *nexus_acp_prompt_probe(void);
 // Smoke test and chat are mutually exclusive within one boot.
 #include <stdint.h>
 char *nexus_acp_chat(const char *text);
+char *nexus_acp_chat_hooks(const char *text,const char *plan);
 char *nexus_acp_chat_reviewed(const char *text);
 char *nexus_acp_permission_decision(int64_t ticket,uint8_t allow);
 // Optional read-only capability: explicit one-turn virtual snapshot, no native path.

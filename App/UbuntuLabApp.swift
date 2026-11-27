@@ -48,6 +48,10 @@ struct UbuntuLabView: View {
     @State private var permissionRequest: ACPReviewRequest?
     @State private var reviewPermissions = false
     @State private var pendingReview = false
+    @State private var enableTurnHooks = false
+    @State private var turnBefore = ""
+    @State private var turnAfter = ""
+    @State private var pendingHooks: String?
     @State private var toolUpdates = 0
     @State private var cancelRequested = false
     @State private var keyInput = ""
@@ -213,6 +217,14 @@ struct UbuntuLabView: View {
                             else { act(close: false) }
                         }.disabled(running || created)
                         if created && (useGemini || useGoogle) {
+                            if useGemini && !useGoogle {
+                                Toggle("Review hooks for next plain chat", isOn: $enableTurnHooks).disabled(running)
+                                if enableTurnHooks {
+                                    TextField("Before prompt (optional)", text: $turnBefore, axis: .vertical).disabled(running)
+                                    TextField("After successful prompt (optional)", text: $turnAfter, axis: .vertical).disabled(running)
+                                    Text("Explicit guest commands, 30 seconds each; no injected Gemini key. Guest files and network may still be accessible. No other grants in this turn.").font(.caption)
+                                }
+                            }
                             Button("Test model response") { confirmPrompt = true }.disabled(running || importingContext || turnCount != 0)
                             TextField("Ask the agent", text: $chatInput, axis: .vertical)
                                 .lineLimit(2...6).disabled(running || smokeUsed || turnCount >= maxTurns)
@@ -446,14 +458,16 @@ struct UbuntuLabView: View {
                     let content = pendingReadContent
                     let terminal = pendingTerminal
                     let review = pendingReview
+                    let hooks = pendingHooks
+                    pendingHooks = nil; enableTurnHooks = false
                     pendingReview = false; reviewPermissions = false
                     pendingTerminal = nil
                     pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil
-                    runPrompt(chat: wire, display: display, edit: edit, readContent: content, terminal: terminal, review: review)
+                    runPrompt(chat: wire, display: display, edit: edit, readContent: content, terminal: terminal, review: review, hooks: hooks)
                 }
-                Button("Cancel", role: .cancel) { pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil; pendingTerminal = nil; terminalChoice = ""; pendingReview = false; reviewPermissions = false }
+                Button("Cancel", role: .cancel) { pendingHooks = nil; pendingChat = ""; pendingDisplay = ""; pendingEdit = nil; pendingReadContent = nil; pendingTerminal = nil; terminalChoice = ""; pendingReview = false; reviewPermissions = false }
             } message: {
-                Text(pendingReview ? "Send plain Gemini chat and enable explicit one-shot review for fully described agent permission requests? Nothing is approved automatically; guest operations may have side effects. No sandbox." : pendingTerminal != nil ? "Allow this exact guest command once?\n" + Self.terminalDescription(pendingTerminal ?? "") + "\nIts output may be sent to the model. Commands may modify guest files, access guest credentials or use the network. No security sandbox." : pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Google-mode edits filter the known login code, not all OAuth tokens. Do not share secrets; review the full replacement." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
+                Text(pendingHooks != nil ? "Run these exact guest hooks before/after this model prompt?\n" + (pendingHooks ?? "") + "\nCommands may have side effects and use network or guest credentials. After only on successful completion." : pendingReview ? "Send plain Gemini chat and enable explicit one-shot review for fully described agent permission requests? Nothing is approved automatically; guest operations may have side effects. No sandbox." : pendingTerminal != nil ? "Allow this exact guest command once?\n" + Self.terminalDescription(pendingTerminal ?? "") + "\nIts output may be sent to the model. Commands may modify guest files, access guest credentials or use the network. No security sandbox." : pendingEdit != nil && pendingReadContent != nil ? "Allow this turn to read the selected saved editor file and stage one complete replacement? Nothing is written until you review and apply. The model may receive the selected text and incur charges. Google-mode edits filter the known login code, not all OAuth tokens. Do not share secrets; review the full replacement." : "Your message and any selected snapshot may be sent to Google and incur charges. Review the file text before sending. Do not include passwords, keys or private data. No file path or project mount is sent. Agent actions are not sandboxed.")
             }
             .alert("Send fixed test prompt to Google?", isPresented: $confirmPrompt) {
                 Button("Send test prompt") { runPrompt() }
@@ -622,6 +636,14 @@ struct UbuntuLabView: View {
                 fileContext = nil; editSnapshot = nil; chatInput = ""; contextStatus = "Credential unavailable or detected"; return
             }
             pendingReview = reviewPermissions && useGemini && !useGoogle && fileContext == nil && editSnapshot == nil && pendingTerminal == nil
+            pendingHooks = nil
+            if enableTurnHooks {
+                guard useGemini, !useGoogle, fileContext == nil, editSnapshot == nil, pendingTerminal == nil, !pendingReview, !enableSessionMCP,
+                      (try? LocalHookPlan(command: "turn", before: turnBefore, after: turnAfter)) != nil,
+                      try credentialAllows(turnBefore), try credentialAllows(turnAfter),
+                      let data = try? JSONSerialization.data(withJSONObject: ["before":turnBefore,"after":turnAfter], options: [.sortedKeys]), data.count <= 8192 else { contextStatus = "Hooks require plain Gemini chat with no other grants"; return }
+                pendingHooks = String(decoding: data, as: UTF8.self)
+            }
             pendingChat = wire
             pendingEdit = editSnapshot
             pendingDisplay = fileContext == nil ? chatInput : chatInput + "\n[Selected text snapshot included]"
@@ -632,7 +654,7 @@ struct UbuntuLabView: View {
         }
     }
 
-    private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil, readContent: String? = nil, terminal: String? = nil, review: Bool = false) {
+    private func runPrompt(chat: String? = nil, display: String? = nil, edit: WorkspaceSnapshot? = nil, readContent: String? = nil, terminal: String? = nil, review: Bool = false, hooks: String? = nil) {
         guard active, created, (useGemini || useGoogle), !running, !importingContext, !smokeUsed, turnCount < maxTurns,
               chat != nil || turnCount == 0 else { return }
         if let chat {
@@ -662,7 +684,7 @@ struct UbuntuLabView: View {
         toolUpdates = 0
         cancelRequested = false
         Task {
-            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent, stageEdit: edit != nil && readContent != nil, terminal: terminal, review: review) }.value
+            let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.action(close: false, prompt: true, chat: chat, readContent: readContent, stageEdit: edit != nil && readContent != nil, terminal: terminal, review: review, hooks: hooks) }.value
             let snapshot = UbuntuRunner.progress()
             if snapshot.responseID == expectedID {
                 permissionDenials = snapshot.permissionDenials
@@ -906,10 +928,11 @@ private enum UbuntuRunner {
         controlReport(nexus_acp_cancel_prompt())["ok"] as? Bool == true
     }
 
-    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false, terminal: String? = nil, mcp: ACPStdioServer? = nil, review: Bool = false, resume: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
+    static func action(close: Bool, prompt: Bool = false, chat: String? = nil, readContent: String? = nil, stageEdit: Bool = false, terminal: String? = nil, mcp: ACPStdioServer? = nil, review: Bool = false, resume: String? = nil, hooks: String? = nil) -> (report: String, status: String, active: Bool, ok: Bool, responseID: Int, stagedResponse: String?) {
         do {
             let pointer: UnsafeMutablePointer<CChar>?
             if close { pointer = nexus_acp_close() }
+            else if let chat, let hooks { pointer = chat.withCString { t in hooks.withCString { nexus_acp_chat_hooks(t,$0) } } }
             else if let chat, let readContent { pointer = chat.withCString { t in readContent.withCString { stageEdit ? nexus_acp_chat_edit(t,$0) : nexus_acp_chat_snapshot(t,$0) } } }
             else if let chat, let terminal { pointer = chat.withCString { t in terminal.withCString { nexus_acp_chat_terminal(t,$0) } } }
             else if let chat { pointer = chat.withCString { review ? nexus_acp_chat_reviewed($0) : nexus_acp_chat($0) } }
