@@ -24,6 +24,8 @@ on:
       - 'scripts/preflight-runtime.py'
       - 'scripts/package-ipa.py'
       - 'scripts/test-package-ipa.py'
+      - 'scripts/collect-release-acceptance.py'
+      - 'scripts/test-release-acceptance.py'
       - 'scripts/build-glibc-rootfs.sh'
       - 'scripts/verify-glibc-evidence.py'
       - 'scripts/verify-acp-transport.py'
@@ -62,6 +64,7 @@ jobs:
           python3 scripts/test-agy-import.py
           python3 scripts/test-workbench-import.py
           python3 scripts/test-package-ipa.py
+          python3 scripts/test-release-acceptance.py
       - name: Install guest build dependencies
         run: brew install meson ninja llvm lld libarchive sqlite xcodegen
       - name: Build pinned runtime and rootfs
@@ -563,8 +566,20 @@ jobs:
         env:
           VARIANT: ${{ inputs.variant || 'ubuntu' }}
         run: |
-          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.6.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
+          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.7.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
           python3 scripts/package-ipa.py --app "$RUNNER_TEMP/nexus-integrated/Build/Products/Release-iphoneos/NexusIDEUbuntuLab.app" --output "$RUNNER_TEMP/nexus-integrated-ipa" --variant "$VARIANT" --commit "$GITHUB_SHA"
+      - name: Bind completed CI evidence to exact integrated IPA
+        env:
+          VARIANT: ${{ inputs.variant || 'ubuntu' }}
+        run: python3 scripts/collect-release-acceptance.py --evidence "$RUNNER_TEMP" --package "$RUNNER_TEMP/nexus-integrated-ipa" --commit "$GITHUB_SHA" --variant "$VARIANT"
+      - name: Upload acceptance metadata (no IPA)
+        uses: actions/upload-artifact@v4
+        with:
+          name: NexusIDE-integrated-acceptance
+          path: |
+            ${{ runner.temp }}/nexus-integrated-ipa/acceptance.json
+            ${{ runner.temp }}/nexus-integrated-ipa/build.json
+          if-no-files-found: error
       - name: Upload integrated unsigned IPA only after owner license review
         if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.license_reviewed
         uses: actions/upload-artifact@v4
@@ -592,5 +607,5 @@ jobs:
         run: |
           cd release
           sha256sum -c SHA256SUMS
-          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json
+          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json acceptance.json
 

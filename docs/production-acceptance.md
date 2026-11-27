@@ -86,3 +86,6 @@ Optional reviewed before/after session shell commands are frozen in the launch r
 
 ## ACP review regression gates
 Added real guest transport fixtures for reviewed allow_once, reject_once and cancel while a request is pending, with legacy plan projection, stale/duplicate ticket refusal, mailbox cleanup and clean shutdown. Synthetic peer checks opaque outcome IDs rather than trusting labels; no allow_always or real tool side effects. Actual AGY permission behavior remains unverified.
+
+## Integrated candidate acceptance manifest
+New CI gate collects every required completed report, checks exact boolean/status fields, rehashes the unsigned IPA against build.json and binds the commit, variant, package and individual evidence SHA-256. It emits acceptance.json with explicit fixture/macOS scope, physicalDeviceVerified=false, realProviderAuthVerified=false, realProviderInferenceVerified=false and productionReady=false. Missing or failed evidence blocks release job; PR can download metadata only. Manual main owner license acknowledgement and prerelease conditions remain unchanged. Integrated marketing version advanced to 0.7.0; native-only version is unchanged. Tests include missing, nonboolean status, wrong commit and altered IPA. CI pending.
