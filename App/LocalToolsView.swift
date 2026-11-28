@@ -190,7 +190,7 @@ struct LocalToolsView: View {
                             TextField("Zero-based line", text: $lspLine).keyboardType(.numberPad).disabled(model.guestClaimed)
                             TextField("Zero-based UTF-16 character", text: $lspCharacter).keyboardType(.numberPad).disabled(model.guestClaimed)
                         }
-                        if mode == 12 { Text("Keep server alive for up to ten saved versions. Return to Files editor, save and tap Refresh LSP to send a reviewed version. Requires full document sync and versioned diagnostics.").font(.caption) }
+                        if mode == 12 { Text("Keep server alive for up to ten saved versions. Return to Files editor, save and tap Refresh LSP to send a reviewed version. Full-sync servers must provide versioned diagnostics; incremental servers use a new virtual document URI for each reviewed snapshot. No project file writes.").font(.caption) }
                         Text("Snapshot diagnostics or one completion request. Only plain single-range edits may be reviewed; no snippets, commands, automatic edits or native path. Server may use network or retain data.").font(.caption)
                         Toggle("Use saved local-tools guest", isOn: $keepGuest).disabled(model.guestClaimed)
                     } else if mode == 6 {
