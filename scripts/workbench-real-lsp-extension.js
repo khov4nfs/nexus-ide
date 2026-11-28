@@ -1,195 +1,159 @@
 'use strict';
-// Fixed, reviewable acceptance extension. Real pylsp subprocess, not an LSP peer.
-const vscode = require('vscode');
-const fs = require('fs');
-const { spawn } = require('child_process');
-const nodePath = require('path');
-const dir = '/root/nexus-workbench';
-const path = dir + '/nexus-real-lsp.py';
-const initial = 'missing_nexus_symbol\nclass NexusCompletion:\n    nexus_value = 42\nitem = NexusCompletion()\nitem';
-const final = initial + '.nexus_value';
-let completed = false, acceptance = false;
-let tail = Promise.resolve(), queued = 0;
-function supported(doc) {
-    return vscode.workspace.isTrusted && doc.uri.scheme==='file' && doc.languageId==='python' &&
-        nodePath.resolve(doc.uri.fsPath).startsWith(dir+'/') && Buffer.byteLength(doc.getText(),'utf8')<=131072;
+// Reviewed guest-local persistent language support. No automatic downloads.
+const vscode=require('vscode');
+const fs=require('fs');
+const path=require('path');
+const {Session,profileFor,ROOT}=require('./lsp-session.js');
+const fixtures={
+    python:{filename:'nexus-real-lsp.py',initial:'missing_nexus_symbol\nclass NexusCompletion:\n    nexus_value = 42\nitem = NexusCompletion()\nitem',suffix:'.nexus_value',symbol:'missing_nexus_symbol',line:0,character:0,label:'nexus_value',completionLine:4,completionCharacter:5,diagnosticMarker:'nexus-real-diagnostics.marker',completionMarker:'nexus-real-completion.marker',savedMarker:'nexus-lsp-saved.marker',server:'pylsp-1.10.0'},
+    cpp:{filename:'nexus-real-lsp.cpp',initial:'int broken = missing_nexus_cpp;\nstruct NexusCompletion { int nexus_value; };\nvoid probe() {\n    NexusCompletion item;\n    item',suffix:'.nexus_value',symbol:'missing_nexus_cpp',line:0,character:13,label:'nexus_value',completionLine:4,completionCharacter:9,diagnosticMarker:'nexus-cpp-diagnostics.marker',completionMarker:'nexus-cpp-completion.marker',savedMarker:'nexus-cpp-saved.marker',server:'clangd-18.1.3'}
+};
+const sessions=new Map(),accepted=new Set(),completed=new Set();
+let stopping=false, collection;
+function marker(name,value){fs.writeFileSync(path.join(ROOT,name),value);}
+function supported(doc){
+    return !stopping&&vscode.workspace.isTrusted&&doc.uri.scheme==='file'&&profileFor(doc.languageId)&&
+        path.resolve(doc.uri.fsPath).startsWith(ROOT+'/')&&Buffer.byteLength(doc.getText(),'utf8')<=131072;
 }
-function serialize(work) {
-    if(queued>=3)return Promise.reject(Error('LSP queue full'));
-    queued++;
-    const task=tail.then(work);
-    tail=task.catch(()=>{}).finally(()=>{queued--;});
-    return task;
+function snapshot(doc){return {uri:doc.uri.toString(),language:doc.languageId,version:doc.version,text:doc.getText()};}
+function session(language){
+    const key=profileFor(language);
+    let s=sessions.get(key);
+    if(!s||s.failure){
+        // No automatic restart loop. A new explicit editor operation may
+        // recover a failed process; acceptance counters preserve failures.
+        s=new Session(key);
+        const previous=sessions.get(key);
+        if(previous)s.restarted=true;
+        sessions.set(key,s);
+    }
+    return s;
 }
-async function request(doc, operation, pos) {
-    if(!supported(doc))throw Error('unsupported document');
-    const uri = doc.uri.toString(), text = doc.getText(), version = doc.version;
-    const test = acceptance && doc.uri.fsPath===path;
-    const child = spawn('/usr/bin/python3', ['-u','-m','pylsp'], {
-        cwd: dir, stdio: ['pipe','pipe','ignore'],
-        env: {PATH:'/usr/bin:/bin', HOME:'/root', LANG:'C.UTF-8', PYTHONFAULTHANDLER:'1'}
+function fixture(doc){
+    const f=fixtures[doc.languageId];
+    return f&&accepted.has(f.filename)&&doc.uri.fsPath===path.join(ROOT,f.filename)?f:null;
+}
+function validPos(doc,p){
+    return p&&Number.isInteger(p.line)&&Number.isInteger(p.character)&&p.line>=0&&p.line<doc.lineCount&&p.character>=0&&p.character<=doc.lineAt(p.line).text.length;
+}
+function project(doc,rows,source){
+    return rows.slice(0,200).flatMap(d=>{
+        const a=d.range?.start,b=d.range?.end;
+        if(!validPos(doc,a)||!validPos(doc,b)||a.line>b.line||(a.line===b.line&&a.character>b.character)||typeof d.message!=='string')return [];
+        const severity=({1:vscode.DiagnosticSeverity.Error,2:vscode.DiagnosticSeverity.Warning,3:vscode.DiagnosticSeverity.Information,4:vscode.DiagnosticSeverity.Hint})[d.severity]??vscode.DiagnosticSeverity.Warning;
+        const item=new vscode.Diagnostic(new vscode.Range(a.line,a.character,b.line,b.character),d.message.slice(0,2048),severity);
+        item.source=source;
+        return [item];
     });
-    let buffer = Buffer.alloc(0), pending = null, error = null, diagnostic = null, notify = null;
-    const closed = new Promise(resolve => child.once('close', resolve));
-    function fail(e) {
-        error = e;
-        if (pending) { const p=pending; pending=null; p.reject(e); }
-        if (notify) { const n=notify; notify=null; n.reject(e); }
+}
+async function diagnostics(doc){
+    if(!supported(doc))return;
+    const snap=snapshot(doc),f=fixture(doc);
+    const server=session(doc.languageId);
+    try{
+        const rows=await server.diagnostic(snap);
+        if(doc.version!==snap.version||doc.isClosed||stopping)return;
+        const projected=project(doc,rows,server.profile.name);
+        collection.set(doc.uri,projected);
+        if(f&&snap.text===f.initial&&projected.some(d=>d.message.includes(f.symbol)&&d.range.start.line===f.line&&d.range.start.character===f.character)){
+            if(doc.languageId==='python')marker('nexus-editor-saved.marker','saved');
+            marker(f.diagnosticMarker,f.server);
+        }
+    }catch(_){if(f&&!stopping)vscode.window.showWarningMessage('Real language server diagnostics failed');}
+}
+function completionItem(doc,pos,row){
+    if(!row||typeof row.label!=='string'||row.label.length>160||row.command||row.additionalTextEdits||
+       (row.insertTextFormat!==undefined&&row.insertTextFormat!==1))return null;
+    let text=row.insertText??row.label.trim(),range;
+    if(row.textEdit){
+        const edit=row.textEdit;
+        const a=edit.range?.start,b=edit.range?.end;
+        if(!validPos(doc,a)||!validPos(doc,b)||a.line!==pos.line||b.line!==pos.line||
+            a.character>pos.character||b.character!==pos.character)return null;
+        text=edit.newText;range=new vscode.Range(a.line,a.character,b.line,b.character);
+    }else{
+        const word=doc.getWordRangeAtPosition(pos,/[A-Za-z_][A-Za-z0-9_]*/);
+        range=word&&word.start.isBeforeOrEqual(pos)&&word.end.isEqual(pos)?new vscode.Range(word.start,pos):new vscode.Range(pos,pos);
     }
-    child.on('error', fail); child.stdin.on('error', fail);
-    child.once('close', () => fail(Error('pylsp closed')));
-    child.stdout.on('data', data => {
-        try {
-            buffer=Buffer.concat([buffer,data]);
-            if (buffer.length>1048576) throw Error('LSP buffer limit');
-            while (true) {
-                const end=buffer.indexOf('\r\n\r\n'); if(end<0) return;
-                const match=/^Content-Length: ([0-9]+)(?:\r\nContent-Type: [^\r\n]+)?$/i.exec(buffer.subarray(0,end).toString());
-                if(!match || +match[1]>524288) throw Error('LSP header');
-                const n=+match[1], start=end+4; if(buffer.length<start+n) return;
-                const r=JSON.parse(buffer.subarray(start,start+n).toString());
-                buffer=buffer.subarray(start+n);
-                if(r.jsonrpc!=='2.0') throw Error('protocol');
-                if(r.method==='textDocument/publishDiagnostics' && r.params.uri===uri) {
-                    if(r.params.version!==undefined && r.params.version!==version) throw Error('stale diagnostic');
-                    if(!Array.isArray(r.params.diagnostics)) throw Error('diagnostics');
-                    if(!test || operation!=='diagnostic' || r.params.diagnostics.some(d=>typeof d.message==='string'&&d.message.includes('missing_nexus_symbol')&&d.range?.start?.line===0&&d.range.start.character===0)){
-                        diagnostic=r.params.diagnostics;
-                        if(notify){const n=notify;notify=null;n.resolve(diagnostic);}
-                    }
-                } else if(r.method && r.id!==undefined) {
-                    // No server-initiated file access, commands or dynamic registration.
-                    send({id:r.id,error:{code:-32601,message:'Not supported'}});
-                } else if(r.method) {
-                    continue; // server log/progress notifications
-                } else {
-                    if(!pending || r.id!==pending.id || r.error) throw Error('LSP reply');
-                    const p=pending;pending=null;p.resolve(r.result);
-                }
-            }
-        } catch(e){fail(e);child.kill();}
-    });
-    function send(msg) {
-        const bytes=Buffer.from(JSON.stringify({jsonrpc:'2.0',...msg}));
-        child.stdin.write(Buffer.concat([Buffer.from('Content-Length: '+bytes.length+'\r\n\r\n'),bytes]));
+    if(typeof text!=='string'||!/^[A-Za-z_][A-Za-z0-9_]*$/.test(text))return null;
+    const item=new vscode.CompletionItem(row.label.trim());
+    item.insertText=text;item.range=range;
+    return item;
+}
+async function stopAll(writeEvidence=false){
+    stopping=true;
+    const reports={};
+    await Promise.all([...sessions].map(async ([key,s])=>{
+        reports[key]={...await s.stop(),restarted:!!s.restarted};
+    }));
+    collection?.clear();
+    if(writeEvidence&&accepted.has(fixtures.python.filename)&&accepted.has(fixtures.cpp.filename)){
+        const p=reports.python,c=reports.clangd;
+        // Evidence must reflect actual initialized server processes, not just
+        // successful marker writes or completion text.
+        const ok=[p,c].every(s=>s&&s.launches===1&&s.initializes===1&&s.diagnostics>=1&&s.completions>=1&&s.shutdownClean&&!s.restarted&&s.opens>=1&&s.closes===s.opens)&&
+            p.snapshotRefreshes>=1&&c.changes>=1&&completed.has(fixtures.python.filename)&&completed.has(fixtures.cpp.filename);
+        marker('nexus-persistent-lsp.json',JSON.stringify({ok,python:p,clangd:c,languages:['python','c','cpp']}));
     }
-    function call(id,method,params){
-        if(error||pending) return Promise.reject(error||Error('busy'));
-        return new Promise((resolve,reject)=>{pending={id,resolve,reject};send({id,method,params});});
-    }
-    let timer;
-    try {
-        const work=(async()=>{
-            const init=await call(1,'initialize',{processId:null,rootUri:'file:///root/nexus-workbench',capabilities:{textDocument:{completion:{completionItem:{snippetSupport:false}},publishDiagnostics:{versionSupport:true}}}});
-            if(init.serverInfo?.name!=='pylsp'||init.serverInfo?.version!=='1.10.0'||!init.capabilities.completionProvider) throw Error('real server identity');
-            send({method:'initialized',params:{}});
-            send({method:'textDocument/didOpen',params:{textDocument:{uri,languageId:'python',version,text}}});
-            let result;
-            if(operation==='diagnostic'){
-                result=diagnostic||await new Promise((resolve,reject)=>{notify={resolve,reject};});
-            }else{
-                const reply=await call(2,'textDocument/completion',{textDocument:{uri},position:{line:pos.line,character:pos.character},context:{triggerKind:1}});
-                const items=Array.isArray(reply)?reply:reply?.items;
-                if(!Array.isArray(items))throw Error('invalid completion response');
-                // Narrow initial projection: plain identifiers only; no snippets,
-                // server commands, extra edits or arbitrary textEdit application.
-                result=items.filter(i=>typeof i.label==='string'&&typeof i.insertText==='string'&&i.label.length<=160&&/^[A-Za-z_][A-Za-z0-9_]*$/.test(i.insertText)&&!i.textEdit&&!i.additionalTextEdits&&!i.command&&(i.insertTextFormat===undefined||i.insertTextFormat===1)).slice(0,100);
-                if(test && !result.some(i=>i.label==='nexus_value'&&i.insertText==='nexus_value'))throw Error('missing real Jedi completion');
-            }
-            send({method:'textDocument/didClose',params:{textDocument:{uri}}});
-            await call(3,'shutdown',null);
-            send({method:'exit'});child.stdin.end();
-            if(await closed!==0) throw Error('pylsp exit');
-            if(doc.version!==version||doc.getText()!==text) throw Error('editor changed');
-            return result;
-        })();
-        return await Promise.race([work,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('pylsp timeout')),120000);})]);
-    } finally {clearTimeout(timer);if(child.exitCode===null&&child.signalCode===null)child.kill();}
 }
 exports.activate=function(context){
-    const diagnostics=vscode.languages.createDiagnosticCollection('nexus-real-pylsp');
-    context.subscriptions.push(diagnostics);
-    function boundedPosition(doc,p){
-        return p && Number.isInteger(p.line)&&Number.isInteger(p.character)&&p.line>=0&&p.line<doc.lineCount&&p.character>=0&&p.character<=doc.lineAt(p.line).text.length;
-    }
-    function project(doc,rows){
-        return rows.slice(0,200).flatMap(d=>{
-            const a=d.range?.start,b=d.range?.end;
-            if(!boundedPosition(doc,a)||!boundedPosition(doc,b)||a.line>b.line||(a.line===b.line&&a.character>b.character)||typeof d.message!=='string')return [];
-            const severity=({1:vscode.DiagnosticSeverity.Error,2:vscode.DiagnosticSeverity.Warning,3:vscode.DiagnosticSeverity.Information,4:vscode.DiagnosticSeverity.Hint})[d.severity]??vscode.DiagnosticSeverity.Warning;
-            const item=new vscode.Diagnostic(new vscode.Range(a.line,a.character,b.line,b.character),d.message.slice(0,2048),severity);
-            item.source='pylsp';
-            return [item];
-        });
-    }
-    context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(e=>diagnostics.delete(e.document.uri)));
-    context.subscriptions.push(vscode.workspace.onDidCloseTextDocument(doc=>diagnostics.delete(doc.uri)));
-    context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(async doc=>{
+    collection=vscode.languages.createDiagnosticCollection('nexus-reviewed-lsp');
+    context.subscriptions.push(collection);
+    const scheduled=new Map();
+    // On-save diagnostics and explicit completion are bounded; a stale
+    // result never reaches a newer editor snapshot. Clear on every edit.
+    context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(e=>collection.delete(e.document.uri)));
+    context.subscriptions.push(vscode.workspace.onDidCloseTextDocument(doc=>{
+        collection.delete(doc.uri);
+        const s=sessions.get(profileFor(doc.languageId));if(s)s.closeDocument(doc.uri.toString()).catch(()=>{});
+    }));
+    context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(doc=>{
         if(!supported(doc))return;
-        const text=doc.getText(), version=doc.version;
-        const test=acceptance&&doc.uri.fsPath===path;
-        if(test&&text===final&&completed){
-            fs.writeFileSync(dir+'/nexus-lsp-saved.marker','saved');
-            return;
+        const f=fixture(doc),text=doc.getText();
+        if(f&&text===f.initial+f.suffix&&completed.has(f.filename)){
+            marker(f.savedMarker,'saved');return;
         }
-        try{
-            const rows=await serialize(()=>{
-                if(doc.version!==version||doc.getText()!==text)throw Error('snapshot changed');
-                return request(doc,'diagnostic');
-            });
-            if(doc.version!==version||doc.isClosed)return;
-            const projected=project(doc,rows);
-            diagnostics.set(doc.uri,projected);
-            if(test&&text===initial&&projected.some(d=>d.message.includes('missing_nexus_symbol')&&d.range.start.line===0&&d.range.start.character===0)){
-                fs.writeFileSync(dir+'/nexus-editor-saved.marker','saved');
-                fs.writeFileSync(dir+'/nexus-real-diagnostics.marker','pylsp-1.10.0');
-            }
-        }catch(_){if(test)vscode.window.showWarningMessage('Real pylsp diagnostics failed');}
+        const key=doc.uri.toString();
+        if(scheduled.has(key))clearTimeout(scheduled.get(key));
+        scheduled.set(key,setTimeout(()=>{scheduled.delete(key);diagnostics(doc);},150));
     }));
-    let running=null, runningKey='';
-    context.subscriptions.push(vscode.languages.registerCompletionItemProvider({scheme:'file',language:'python'},{
-        async provideCompletionItems(doc,pos,token){
-            if(!supported(doc)||token.isCancellationRequested)return [];
-            const text=doc.getText(), version=doc.version, key=doc.uri.toString()+':'+version+':'+pos.line+':'+pos.character;
-            const test=acceptance&&doc.uri.fsPath===path;
-            if(test&&(text!==initial+'.'||pos.line!==4||pos.character!==5))return [];
-            if(running&&runningKey!==key)return [];
-            if(!running){
-                runningKey=key;
-                running=serialize(()=>{
-                    if(doc.version!==version||doc.getText()!==text)throw Error('snapshot changed');
-                    return request(doc,'completion',pos);
-                }).finally(()=>{running=null;runningKey='';});
+    context.subscriptions.push({dispose(){for(const timer of scheduled.values())clearTimeout(timer);scheduled.clear();}});
+    for(const language of ['python','c','cpp']){
+        context.subscriptions.push(vscode.languages.registerCompletionItemProvider({scheme:'file',language},{
+            async provideCompletionItems(doc,pos,token){
+                if(!supported(doc)||token.isCancellationRequested)return [];
+                const f=fixture(doc),snap=snapshot(doc);
+                if(f&&(snap.text!==f.initial+'.'||pos.line!==f.completionLine||pos.character!==f.completionCharacter))return [];
+                try{
+                    const rows=await session(language).complete(snap,{line:pos.line,character:pos.character},token);
+                    if(doc.version!==snap.version||doc.isClosed||token.isCancellationRequested||stopping)return [];
+                    let items=rows.map(r=>completionItem(doc,pos,r)).filter(Boolean).slice(0,100);
+                    if(f){
+                        items=items.filter(i=>i.label===f.label&&i.insertText===f.label);
+                        if(items.length){
+                            completed.add(f.filename);marker(f.completionMarker,f.server);
+                            if(language==='python')marker('nexus-lsp-transport.marker','completed');
+                        }
+                    }
+                    return items;
+                }catch(_){return [];}
             }
-            try{
-                const returned=await running;
-                if(doc.version!==version||doc.isClosed||token.isCancellationRequested)return [];
-                const word=doc.getWordRangeAtPosition(pos,/[A-Za-z_][A-Za-z0-9_]*/);
-                const range=word&&word.start.isBeforeOrEqual(pos)&&word.end.isEqual(pos)?new vscode.Range(word.start,pos):new vscode.Range(pos,pos);
-                const items=returned.map(row=>{
-                    const item=new vscode.CompletionItem(row.label);
-                    item.insertText=row.insertText;
-                    item.range=range;
-                    return item;
-                });
-                if(test&&items.some(i=>i.label==='nexus_value'&&i.insertText==='nexus_value')){
-                    completed=true;
-                    fs.writeFileSync(dir+'/nexus-lsp-transport.marker','completed');
-                    fs.writeFileSync(dir+'/nexus-real-completion.marker','pylsp-1.10.0');
-                }
-                return test?items.filter(i=>i.label==='nexus_value'):items;
-            }catch(_){return [];}
-        }
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand('nexus.fixture.open',async()=>{
-        if(!vscode.workspace.isTrusted){vscode.window.showWarningMessage('Trust the reviewed guest workspace first.');return;}
-        if(fs.existsSync(path)){vscode.window.showWarningMessage('Acceptance file already exists. Use a fresh reviewed guest or remove that test file yourself.');return;}
-        acceptance=true;
-        completed=false;
-        fs.writeFileSync(dir+'/nexus-extension-activated.marker','activated');
-        const uri=vscode.Uri.file(path);
-        fs.writeFileSync(path,'# Nexus real LSP acceptance',{flag:'wx'});
-        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri));
+        }));
+    }
+    async function openFixture(f){
+        if(!vscode.workspace.isTrusted||stopping)return;
+        const filename=path.join(ROOT,f.filename);
+        if(fs.existsSync(filename)){vscode.window.showWarningMessage('Acceptance file exists. Use fresh reviewed guest.');return;}
+        fs.writeFileSync(filename,'// Nexus real LSP acceptance',{flag:'wx'});
+        accepted.add(f.filename);completed.delete(f.filename);
+        if(f===fixtures.python)marker('nexus-extension-activated.marker','activated');
+        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(filename)));
+    }
+    context.subscriptions.push(vscode.commands.registerCommand('nexus.fixture.open',()=>openFixture(fixtures.python)));
+    context.subscriptions.push(vscode.commands.registerCommand('nexus.fixture.cpp',()=>openFixture(fixtures.cpp)));
+    context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.stop',()=>stopAll(true)));
+    context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.restart',async()=>{
+        await stopAll(false);sessions.clear();stopping=false;
     }));
 };
-exports.deactivate=function(){};
+exports.deactivate=()=>stopAll(false);
