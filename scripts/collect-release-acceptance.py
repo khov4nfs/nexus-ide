@@ -57,6 +57,8 @@ def gates(variant, full_vm=False):
         rows[f"persist-{phase}"] = ("macOS guest persistence", {"ok": True, "verified": True, "shutdownClean": True})
     if variant == "workbench":
         rows["workbench"] = ("macOS guest Chromium editor, synthetic VSIX and synthetic stdio LSP server", {"ok": True, "shutdownClean": True, "nodeRuntimeVerified": True, "extensionDigestVerified": True, "extensionInstallVerified": True, "browserRequested": True, "extensionActivationVerified": True, "editorVerified": True, "lspVerified": True, "lspFixtureOnly": True})
+    if variant == "workbench":
+        rows["workbench-real-lsp"] = ("macOS guest Chromium editor and real Python LSP 1.10.0 via installed acceptance VSIX", {"ok": True, "shutdownClean": True, "nodeRuntimeVerified": True, "extensionDigestVerified": True, "extensionInstallVerified": True, "browserRequested": True, "extensionActivationVerified": True, "editorVerified": True, "lspVerified": True, "lspFixtureOnly": False, "realDiagnosticsVerified": True, "realCompletionVerified": True, "realServerVersion": "1.10.0"})
     if full_vm:
         rows["full-vm-host"] = ("Linux ARM64 host TCI kernel Docker Compose restricted networking", {"ok": True, "tciBuildVerified": True, "linuxKernelBootVerified": True, "dockerEngineInHostTCIVerified": True, "composeInHostTCIVerified": True, "composeNetworkVerified": True, "loopbackForwardVerified": True, "internetTLSVerified": True, "registryPullVerified": True, "cleanShutdown": True, "physicalDeviceVerified": False})
         rows["full-vm-build"] = ("iPhoneOS Release app VM framework and source inventory", {"ok": True, "iosBackendCompiled": True, "physicalDeviceVerified": False, "ownerDistributionRecordMatched": True})
@@ -95,6 +97,7 @@ def collect(evidence, package, commit, variant):
     if type(full_vm) is not bool:
         raise ValueError("Invalid VM build scope")
     reports = []
+    real_vsix_sha = None
     for name, (scope, required) in gates(variant, full_vm).items():
         path = evidence / ("nexus-" + name + ".json")
         obj, digest = read_json(path)
@@ -103,11 +106,20 @@ def collect(evidence, package, commit, variant):
                 raise ValueError(f"Failed evidence: {path.name} / {key}")
         if full_vm and name == "full-vm-build" and (obj.get("commit") != commit or obj.get("sourceInventorySHA256") != build.get("fullVMSourceInventorySHA256") or obj.get("ipaSha256") != sha):
             raise ValueError("VM evidence not bound to exact IPA and inventory")
+        if name == "workbench-real-lsp":
+            extension = package / "nexus-real-pylsp.vsix"
+            if not extension.is_file() or extension.is_symlink():
+                raise ValueError("Missing exact tested real LSP VSIX")
+            with extension.open("rb") as stream:
+                real_vsix_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+            if obj.get("vsixSha256") != real_vsix_sha:
+                raise ValueError("Real LSP VSIX digest does not match guest test")
         reports.append({"file": path.name, "sha256": digest, "scope": scope, "passed": True})
     return {
         "schemaVersion": 1, "commit": commit, "variant": variant,
         "ipa": archive.name, "ipaSha256": sha, "buildJsonSha256": build_sha,
         "ciAcceptancePassed": True, "checks": reports,
+        "workbenchRealVSIXSha256": real_vsix_sha,
         "physicalDeviceVerified": False, "realProviderAuthVerified": False,
         "realProviderInferenceVerified": False, "productionReady": False,
         "fullVMIncluded": full_vm, "containerBackend": "embedded-user-mode-and-qemu-tci-candidate" if full_vm else "embedded-user-mode", "dockerEngineVerified": False, "composeVerified": False, "fullSystemVMVerified": False,
