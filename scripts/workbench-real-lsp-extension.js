@@ -10,7 +10,7 @@ const fixtures={
     cpp:{filename:'nexus-real-lsp.cpp',initial:'int broken = missing_nexus_cpp;\nstruct NexusCompletion { int nexus_value; };\nvoid probe() {\n    NexusCompletion item;\n    item',suffix:'.nexus_value',symbol:'missing_nexus_cpp',line:0,character:13,label:'nexus_value',completionLine:4,completionCharacter:9,diagnosticMarker:'nexus-cpp-diagnostics.marker',completionMarker:'nexus-cpp-completion.marker',savedMarker:'nexus-cpp-saved.marker',server:'clangd-18.1.3'}
 };
 const sessions=new Map(),accepted=new Set(),completed=new Set();
-let stopping=false, collection;
+let stopping=false, collection, stopInProgress=null;
 function marker(name,value){fs.writeFileSync(path.join(ROOT,name),value);}
 function supported(doc){
     return !stopping&&!doc.isClosed&&vscode.workspace.isTrusted&&doc.uri.scheme==='file'&&profileFor(doc.languageId)&&
@@ -20,12 +20,10 @@ function snapshot(doc){return {uri:doc.uri.toString(),language:doc.languageId,ve
 function session(language){
     const key=profileFor(language);
     let s=sessions.get(key);
-    if(!s||s.failure){
-        // No automatic restart loop. A new explicit editor operation may
-        // recover a failed process; acceptance counters preserve failures.
+    if(!s){
+        // Failed servers stay failed until the user explicitly restarts.
+        // A live document edit must not create a crash/restart loop.
         s=new Session(key);
-        const previous=sessions.get(key);
-        if(previous)s.restarted=true;
         sessions.set(key,s);
     }
     return s;
@@ -83,6 +81,8 @@ function completionItem(doc,pos,row){
 }
 async function stopAll(writeEvidence=false){
     stopping=true;
+    if(stopInProgress)return stopInProgress;
+    stopInProgress=(async()=>{
     const reports={};
     await Promise.all([...sessions].map(async ([key,s])=>{
         reports[key]={...await s.stop(),restarted:!!s.restarted};
@@ -92,10 +92,13 @@ async function stopAll(writeEvidence=false){
         const p=reports.python,c=reports.clangd;
         // Evidence must reflect actual initialized server processes, not just
         // successful marker writes or completion text.
-        const ok=[p,c].every(s=>s&&s.launches===1&&s.initializes===1&&s.diagnostics>=1&&s.completions>=1&&s.shutdownClean&&!s.restarted&&s.opens>=1&&s.closes===s.opens)&&
+        const ok=[p,c].every(s=>s&&s.launches===1&&s.initializes===1&&s.diagnostics>=1&&s.completions>=1&&s.shutdownClean&&s.processExited&&!s.restarted&&s.opens>=1&&s.closes===s.opens)&&
             p.snapshotRefreshes>=1&&c.changes>=2&&c.completions>=2&&c.peakDocuments>=2&&Object.values(fixtures).every(f=>completed.has(f.filename));
         marker('nexus-persistent-lsp.json',JSON.stringify({ok,python:p,clangd:c,languages:['python','c','cpp']}));
     }
+    return Object.values(reports).every(r=>r.launches===0||r.processExited===true);
+    })();
+    try{return await stopInProgress;}finally{stopInProgress=null;}
 }
 exports.activate=function(context){
     collection=vscode.languages.createDiagnosticCollection('nexus-reviewed-lsp');
@@ -165,7 +168,9 @@ exports.activate=function(context){
     context.subscriptions.push(vscode.commands.registerCommand('nexus.fixture.c',()=>openFixture(fixtures.c)));
     context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.stop',()=>stopAll(true)));
     context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.restart',async()=>{
-        await stopAll(false);sessions.clear();stopping=false;
+        if(!await stopAll(false)){vscode.window.showWarningMessage('A language server did not exit. Relaunch the guest before restarting.');return;}
+        sessions.clear();stopping=false;
+        accepted.clear();completed.clear();
     }));
 };
 exports.deactivate=()=>stopAll(false);
