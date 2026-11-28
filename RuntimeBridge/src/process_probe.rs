@@ -1411,6 +1411,33 @@ pub(crate) async fn live_lsp(guest:&IshInstance,env:&HashMap<String,String>,requ
     }
 }
 
+// CI-only installation of a real distribution package in a disposable guest.
+// APT verifies Ubuntu archive signatures. Nothing is installed in the IPA.
+#[cfg(test)]
+pub(crate) async fn install_pylsp_for_ci(guest:&IshInstance,env:&HashMap<String,String>)->Result<String,String>{
+    let script=r#"
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+test ! -e /usr/bin/pylsp
+printf '%s\n' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://ports.ubuntu.com/ubuntu-ports noble main universe' >/tmp/nexus-pylsp.list
+apt-get -q -o Dir::Etc::sourcelist=/tmp/nexus-pylsp.list -o Dir::Etc::sourceparts=- -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update >/tmp/nexus-apt.log 2>&1
+apt-get -q -y --no-install-recommends -o Dir::Etc::sourcelist=/tmp/nexus-pylsp.list -o Dir::Etc::sourceparts=- install python3-pylsp=1.10.0-1 python3-pyflakes >>/tmp/nexus-apt.log 2>&1
+test "$(dpkg-query -W -f='${Version}' python3-pylsp)" = 1.10.0-1
+test -x /usr/bin/pylsp
+/usr/bin/python3 -c 'import pylsp, pyflakes; assert pylsp.__version__ == "1.10.0"'
+printf '%s\n' NEXUS_PYLSP_1_10_0
+"#;
+    let mut opts=shell(script,env);opts.pipe_stdin=false;
+    let session=guest.spawn(opts).map_err(|_|"APT process spawn failed")?;
+    let mut capture=Capture::default();
+    let result=drain(&session,&mut capture,Instant::now()+Duration::from_secs(420)).await;
+    if result.is_err(){let _=session.terminate().await;let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;}
+    if result.is_err()||!capture.closed||capture.code!=Some(0)||capture.signal.unwrap_or(0)!=0||capture.stdout!=b"NEXUS_PYLSP_1_10_0\n"{
+        return Err("Pinned Python LSP Server installation or version check failed".into());
+    }
+    Ok("1.10.0-1".into())
+}
+
 pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,String>,request:&crate::local_jobs::LspInput,fixture:bool)->Value{
     let mut opts=SpawnOpts::cmd(request.argv.iter().map(String::as_str));
     #[cfg(test)]
