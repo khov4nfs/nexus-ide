@@ -169,7 +169,13 @@ class Session{
             const caps=result?.capabilities,sync=caps?.textDocumentSync;
             const kind=typeof sync==='number'?sync:sync?.openClose===true?sync.change:undefined;
             const identity=result?.serverInfo;
-            const verified=p.optional?(!identity||(identity.name===p.name&&(!identity.version||identity.version===p.reviewedVersion))):identity?.name===p.name&&p.version.test(identity.version);
+            // gopls reports a JSON build-info object, rather than a bare version.
+            let version=identity?.version;
+            if(this.key==='go'&&typeof version==='string'&&version.startsWith('{')){
+                try{const info=JSON.parse(version);version=info.Version??info.version;}catch(_){throw Error('invalid gopls build identity');}
+                if(typeof version!=='string')throw Error('missing gopls version');
+            }
+            const verified=p.optional?(!identity||(identity.name===p.name&&(!version||version===p.reviewedVersion))):identity?.name===p.name&&p.version.test(identity.version);
             if(!verified||!caps?.completionProvider||
                 ![1,2].includes(kind)||(caps.positionEncoding&&caps.positionEncoding!=='utf-16')||(result.offsetEncoding&&result.offsetEncoding!=='utf-16'))throw Error('unexpected server identity or capabilities');
             this.capabilities=caps;this.stats.initializes++;this.notify('initialized',{});
