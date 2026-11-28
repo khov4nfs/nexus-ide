@@ -1,4 +1,5 @@
 """Build the reviewable real-pylsp acceptance VSIX; no synthetic LSP server."""
+import json
 import subprocess
 import sys
 import tempfile
@@ -13,5 +14,10 @@ with tempfile.TemporaryDirectory() as tmp:
         for entry in source.infolist():
             if entry.filename in ("extension/extension.js", "extension/server.js"):
                 continue
-            target.writestr(entry.filename, source.read(entry))
+            if entry.filename == "extension/package.json":
+                manifest = json.loads(source.read(entry))
+                manifest.update(displayName="Nexus reviewed Python LSP", description="Guest-only real pylsp diagnostics on save and completion", activationEvents=["onLanguage:python", "onCommand:nexus.fixture.open"], capabilities={"untrustedWorkspaces":{"supported":False}})
+                target.writestr(entry.filename, json.dumps(manifest))
+            else:
+                target.writestr(entry.filename, source.read(entry))
         target.writestr("extension/extension.js", (here / "workbench-real-lsp-extension.js").read_bytes())
