@@ -11,6 +11,12 @@ public struct LocalGuestStore: Sendable {
     private var provenance: URL { directory.appendingPathComponent("provenance.txt") }
     public init(directory: URL) { self.directory = directory }
 
+    /// Preserve the existing Gemini store name; a Google store cannot reuse it.
+    public static func agentDirectoryName(digest: String, google: Bool) throws -> String {
+        guard AGYImportFormat.validDigest(digest) else { throw Failure.invalid }
+        return (google ? "google-guest-" : "guest-") + digest
+    }
+
     private func regular(_ url: URL) -> Bool {
         guard let v = try? url.resourceValues(forKeys: [.isRegularFileKey,.isSymbolicLinkKey]) else { return false }
         return v.isRegularFile == true && v.isSymbolicLink != true

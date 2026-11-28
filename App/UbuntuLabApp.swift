@@ -60,6 +60,8 @@ struct UbuntuLabView: View {
     @State private var useGemini = false
     @State private var useGoogle = false
     @State private var keepAgentGuest = false
+    @State private var keepGoogleGuest = false
+    @State private var resetGoogleGuest = false
     @State private var persistentActive = false
     @State private var supportsLoad = false
     @State private var sessionHandle = ""
@@ -132,8 +134,11 @@ struct UbuntuLabView: View {
                         Text(importStatus).font(.caption)
                     }
                     Toggle("Keep separate AGY guest (Gemini key only)", isOn: $keepAgentGuest).disabled(attempted || model.guestClaimed)
-                    Text("Optional: retains guest files and agent history, which may contain secrets. Only clean explicit close allows reuse; Google sign-in stays disposable. Never shared with other tools.").font(.caption)
-                    Button("Reset saved AGY guest", role: .destructive) { confirmResetAgent = true }.disabled(attempted || model.guestClaimed || digest == nil)
+                    Text("Optional: retains Gemini guest files and agent history, which may contain secrets. Only clean explicit close allows reuse. Never shared with other tools.").font(.caption)
+                    Toggle("Keep separate Google AGY guest", isOn: $keepGoogleGuest).disabled(attempted || model.guestClaimed)
+                    Text("Off by default. Keeps AGY-owned login cache, history and other guest files privately on this device. Official sign-in is required again on every boot; session resume requires advertised ACP support. Reset deletes the guest, not Google account authorization.").font(.caption)
+                    Button("Reset saved Gemini AGY guest", role: .destructive) { resetGoogleGuest = false; confirmResetAgent = true }.disabled(attempted || model.guestClaimed || digest == nil)
+                    Button("Reset saved Google AGY guest", role: .destructive) { resetGoogleGuest = true; confirmResetAgent = true }.disabled(attempted || model.guestClaimed || digest == nil)
                     Toggle("Enable read-only ACP attachment tool", isOn: $enableSnapshotRead)
                         .disabled(attempted || model.guestClaimed)
                     Toggle("Enable staged ACP editor edits", isOn: $enableSnapshotWrite)
@@ -377,10 +382,10 @@ struct UbuntuLabView: View {
             .alert("Delete saved AGY guest?", isPresented: $confirmResetAgent) {
                 Button("Delete guest files", role: .destructive) {
                     guard !attempted, !model.guestClaimed, let sha = digest else { return }
-                    report = UbuntuRunner.resetAgentGuest(sha)
+                    report = UbuntuRunner.resetAgentGuest(sha, google: resetGoogleGuest)
                 }
                 Button("Cancel", role: .cancel) {}
-            } message: { Text("Deletes the separate saved guest for this binary digest, including its conversation data. Native files and Keychain are not affected.") }
+            } message: { Text("Deletes the separate saved " + (resetGoogleGuest ? "Google" : "Gemini") + " guest for this binary digest, including its conversation data and any guest-owned credentials. Native files, the other guest and Keychain are not affected. Does not revoke provider authorization.") }
             .confirmationDialog("Resume this saved AGY session?", isPresented: $confirmResume) {
                 Button("Resume") {
                     guard persistentActive, supportsLoad, Self.validHandle(resumeHandle) else { return }
@@ -479,7 +484,7 @@ struct UbuntuLabView: View {
                 Button("Verify digest and connect") { if let sha = digest { run(sha: sha, gemini: useGemini, google: useGoogle) } }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text(useGoogle ? "AGY will start its official Google terminal sign-in in a disposable local guest. Safari opens only a Google OAuth URL; paste the authorization code here. Credentials may be cached by AGY in guest storage. No key or project is supplied. Not a security sandbox." : useGemini ? "Your saved key will enter the local agent process environment. AGY may connect to Google and write its own logs. The emulator is not a security sandbox. Only use a reviewed official binary and a restricted key. No project or prompt is supplied." : "AGY may make startup network requests. No credentials, user project, prompts or permission grants are supplied. This emulator is not a security sandbox. Run only a reviewed official binary.")
+                Text(useGoogle ? "AGY will start its official Google terminal sign-in. Safari opens only a Google OAuth URL; paste the authorization code here. Credentials may be cached by AGY in guest storage. No key or project is supplied. Not a security sandbox." + (keepGoogleGuest ? " Retain this digest-scoped Google guest and its credentials after successful explicit close. Sign in again next boot." : " Use disposable guest.") : useGemini ? "Your saved key will enter the local agent process environment. AGY may connect to Google and write its own logs. The emulator is not a security sandbox. Only use a reviewed official binary and a restricted key. No project or prompt is supplied." : "AGY may make startup network requests. No credentials, user project, prompts or permission grants are supplied. This emulator is not a security sandbox. Run only a reviewed official binary.")
             }
         }
     }
@@ -514,7 +519,7 @@ struct UbuntuLabView: View {
         let writeSnapshot = enableSnapshotWrite && (gemini || google)
         let readSnapshot = enableSnapshotRead || writeSnapshot
         let terminal = enableTerminal && gemini
-        let persistent = keepAgentGuest && gemini && !google && sha != nil
+        let persistent = sha != nil && (google ? keepGoogleGuest : gemini && keepAgentGuest)
         persistentActive = persistent
         attempted = true
         running = true
@@ -522,7 +527,7 @@ struct UbuntuLabView: View {
         Task {
             let result = await Task.detached(priority: .userInitiated) { UbuntuRunner.run(sha: sha, gemini: gemini, google: google, imported: selected, readSnapshot: readSnapshot, writeSnapshot: writeSnapshot, terminal: terminal, persistent: persistent) }.value
             loginURL = ""; loginCode = ""; loginRunning = false
-            // Keep the separately reviewed binary; never persist OAuth tokens with it.
+            // Binary import remains separate from provider-owned guest state.
             report = result.report
             agentStatus = result.status
             active = result.active
@@ -770,16 +775,16 @@ private enum UbuntuRunner {
     private static let trialLock = NSLock()
     private static var activeTrial: URL?
     private static var activeSaved: LocalGuestStore?
-    private static func agentStore(_ sha: String) throws -> LocalGuestStore {
+    private static func agentStore(_ sha: String, google: Bool = false) throws -> LocalGuestStore {
         guard AGYImportFormat.validDigest(sha) else { throw LocalGuestStore.Failure.invalid }
         let parent = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
         var root = parent.appendingPathComponent("NexusAgentGuest", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700, .protectionKey: FileProtectionType.complete])
         var v = URLResourceValues(); v.isExcludedFromBackup = true; try root.setResourceValues(v)
-        return LocalGuestStore(directory: root.appendingPathComponent("guest-" + sha, isDirectory: true))
+        return LocalGuestStore(directory: root.appendingPathComponent(try LocalGuestStore.agentDirectoryName(digest: sha, google: google), isDirectory: true))
     }
-    static func resetAgentGuest(_ sha: String) -> String {
-        do { try agentStore(sha).reset(); return "Saved AGY guest deleted" } catch { return "Saved AGY guest reset failed" }
+    static func resetAgentGuest(_ sha: String, google: Bool = false) -> String {
+        do { try agentStore(sha, google: google).reset(); return "Saved AGY guest deleted" } catch { return "Saved AGY guest reset failed" }
     }
     private static func rememberTrial(_ url: URL) {
         trialLock.lock(); defer { trialLock.unlock() }; activeTrial = url
@@ -816,8 +821,8 @@ private enum UbuntuRunner {
                     if UUID(uuidString: suffix) != nil, let v = try? url.resourceValues(forKeys: [.isDirectoryKey,.isSymbolicLinkKey]), v.isDirectory == true, v.isSymbolicLink != true { try? fm.removeItem(at: url) }
                 }
             }
-            if persistent, gemini, !google, let sha {
-                let store = try agentStore(sha)
+            if persistent, (gemini || google), let sha {
+                let store = try agentStore(sha, google: google)
                 _ = try store.prepare(from: bundled)
                 trial = store.directory
                 trialLock.lock(); activeSaved = store; trialLock.unlock()
@@ -841,7 +846,7 @@ private enum UbuntuRunner {
                     return sha.withCString { digest in
                         request.withCString { wire in
                             if let key { return key.withCString { nexus_acp_start_gemini(path, digest, wire, $0) } }
-                            if google { return nexus_acp_start_google(path, digest, wire) }
+                            if google { return persistent ? nexus_acp_start_google_saved(path, digest, wire) : nexus_acp_start_google(path, digest, wire) }
                             return nexus_acp_start(path, digest, wire)
                         }
                     }

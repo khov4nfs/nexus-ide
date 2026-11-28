@@ -27,6 +27,7 @@ def gates(variant):
         "acp-hooks": ("success", "beforeFailure", "afterFailure"),
         "adapter": ("success", "resume", "unexpectedCallback", "unsupportedResume"),
         "acp-resume": ("create", "resume"),
+        "google-resume": ("create", "resume", "disposable"),
         "codex-turn": ("success", "policy", "mismatch"),
         "claude": ("signedIn", "signedOut", "success", "error"),
         "conversation-codex": ("create", "resume"),
@@ -39,6 +40,8 @@ def gates(variant):
     for group, phases in groups.items():
         for phase in phases:
             required = {"ok": True, "fixtureOnly": True, "shutdownClean": True, "phase": phase}
+            if group == "google-resume":
+                required.update({"freshLogin": True, "replayWithheld": True})
             if group.startswith("conversation-"):
                 required["turnsCompleted"] = 2
             rows[f"{group}-{phase}"] = ("synthetic protocol peer", required)
