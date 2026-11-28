@@ -832,6 +832,7 @@ jobs:
           export NEXUS_WORKBENCH_CI_TRACE=1
           export NEXUS_WORKBENCH_BROWSER_PYTHON="$RUNNER_TEMP/nexus-browser/bin/python"
           export NEXUS_WORKBENCH_BROWSER_SCRIPT="$GITHUB_WORKSPACE/scripts/workbench-browser-probe.py"
+          node --check scripts/workbench-real-lsp-extension.js
           python3 scripts/build-real-workbench-vsix.py "$RUNNER_TEMP/nexus-real-pylsp.vsix"
           export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-real-pylsp.vsix" | awk '{print $1}')"
           cat "$RUNNER_TEMP/nexus-real-pylsp.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
