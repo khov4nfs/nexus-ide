@@ -361,6 +361,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let mut multi_document=None;
     let mut lsp_wire=None;
     if mode==12{
+        if input.len()>65536{return fail("LSP snapshot too large");}
         if let Ok(mut v)=serde_json::from_str::<Value>(input){
             if let Some(key)=v.as_object_mut().and_then(|o|o.remove("document")){
                 let Some(doc)=key.as_str().zip(v["text"].as_str()).and_then(|(key,text)|multi_lsp_document(key,text))else{return fail("Invalid multi-document snapshot");};
