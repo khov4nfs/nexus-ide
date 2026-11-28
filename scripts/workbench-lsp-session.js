@@ -81,7 +81,7 @@ class Session{
         const id=++this.id;
         return new Promise((resolve,reject)=>{
             const timer=setTimeout(()=>this.fail(Error('LSP request timeout')),this.timeout);
-            const p={resolve,reject,timer,cancellation:null,cancelled:false};
+            const p={resolve,reject,timer,method,cancellation:null,cancelled:false};
             this.pending.set(id,p);
             try{
                 this.send({id,method,params});
@@ -147,7 +147,15 @@ class Session{
         const p=this.pending.get(msg.id);
         if(!p)throw Error('unknown reply');
         this.pending.delete(msg.id);clearTimeout(p.timer);p.cancellation?.dispose();
-        if(p.cancelled||msg.error)p.reject(Error(p.cancelled?'cancelled':'server request rejected'));
+        if(p.cancelled)p.reject(Error('cancelled'));
+        else if(msg.error){
+            // Retain only the numeric protocol code and our own method name.
+            // Never include arbitrary server text/data (may contain source or paths).
+            const rpcCode=Number.isSafeInteger(msg.error.code)?msg.error.code:null;
+            const error=Error('server request rejected: '+p.method+' (JSON-RPC '+(rpcCode??'invalid code')+')');
+            error.rpcCode=rpcCode;error.rpcMethod=p.method;
+            p.reject(error);
+        }
         else if(Object.hasOwn(msg,'result'))p.resolve(msg.result);
         else {p.reject(Error('missing result'));throw Error('missing result');}
     }
