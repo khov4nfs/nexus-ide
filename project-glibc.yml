@@ -55,7 +55,8 @@ targets:
           done
           /usr/bin/ditto "$source/Firmware" "$dest/FullVMFirmware"
           mkdir -p "$dest/FullVMNotices"
-          for item in provenance.json QEMU-COPYING QEMU-LICENSE UTM-LICENSE; do
+          for item in provenance.json source-inventory.json QEMU-COPYING QEMU-LICENSE UTM-LICENSE; do
             cp "$source/$item" "$dest/FullVMNotices/$item"
           done
+          /usr/bin/ditto "$source/DependencyNotices" "$dest/FullVMNotices/DependencyNotices"
     scheme: {}
