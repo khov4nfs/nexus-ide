@@ -59,8 +59,13 @@ class Tests(unittest.TestCase):
                      "file": name, "bytes": ipa.stat().st_size, "sha256": digest,
                      "fullVMIncluded": True, "fullVMSourceInventorySHA256": "c" * 64}
             (pkg / "build.json").write_text(json.dumps(build))
+            vsix = pkg / "nexus-real-pylsp.vsix"
+            vsix.write_bytes(b"synthetic test VSIX")
             for key, (_, required) in a.gates("workbench").items():
-                (root / f"nexus-{key}.json").write_text(json.dumps(required))
+                fields = dict(required)
+                if key == "workbench-real-lsp":
+                    fields["vsixSha256"] = hashlib.sha256(vsix.read_bytes()).hexdigest()
+                (root / f"nexus-{key}.json").write_text(json.dumps(fields))
             with self.assertRaises(ValueError):
                 a.collect(root, pkg, commit, "workbench")
             for key in ("full-vm-host", "full-vm-build"):
