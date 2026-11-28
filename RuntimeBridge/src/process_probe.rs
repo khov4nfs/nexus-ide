@@ -1411,29 +1411,26 @@ pub(crate) async fn live_lsp(guest:&IshInstance,env:&HashMap<String,String>,requ
     }
 }
 
-// CI-only installation of a real distribution package in a disposable guest.
-// APT verifies Ubuntu archive signatures. Nothing is installed in the IPA.
+// CI-only: verify the real package inside the imported disposable ARM64 guest.
+// APT runs on the Linux preparation runner, never in the app or shipped rootfs.
 #[cfg(test)]
-pub(crate) async fn install_pylsp_for_ci(guest:&IshInstance,env:&HashMap<String,String>)->Result<String,String>{
+pub(crate) async fn verify_pylsp_for_ci(guest:&IshInstance,env:&HashMap<String,String>)->Result<String,String>{
     let script=r#"
 set -eu
-export DEBIAN_FRONTEND=noninteractive
-test ! -e /usr/bin/pylsp
-printf '%s\n' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://ports.ubuntu.com/ubuntu-ports noble main universe' >/tmp/nexus-pylsp.list
-apt-get -q -o Dir::Etc::sourcelist=/tmp/nexus-pylsp.list -o Dir::Etc::sourceparts=- -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update >/tmp/nexus-apt.log 2>&1
-apt-get -q -y --no-install-recommends -o Dir::Etc::sourcelist=/tmp/nexus-pylsp.list -o Dir::Etc::sourceparts=- install python3-pylsp=1.10.0-1 python3-pyflakes >>/tmp/nexus-apt.log 2>&1
 test "$(dpkg-query -W -f='${Version}' python3-pylsp)" = 1.10.0-1
 test -x /usr/bin/pylsp
-/usr/bin/python3 -c 'import pylsp, pyflakes; assert pylsp.__version__ == "1.10.0"'
+/usr/bin/python3 -c 'import pylsp, pyflakes; from importlib.metadata import version; assert version("python-lsp-server") == "1.10.0"'
 printf '%s\n' NEXUS_PYLSP_1_10_0
 "#;
     let mut opts=shell(script,env);opts.pipe_stdin=false;
-    let session=guest.spawn(opts).map_err(|_|"APT process spawn failed")?;
+    let session=guest.spawn(opts).map_err(|_|"Package verification process spawn failed")?;
     let mut capture=Capture::default();
-    let result=drain(&session,&mut capture,Instant::now()+Duration::from_secs(420)).await;
+    let result=drain(&session,&mut capture,Instant::now()+Duration::from_secs(60)).await;
     if result.is_err(){let _=session.terminate().await;let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;}
     if result.is_err()||!capture.closed||capture.code!=Some(0)||capture.signal.unwrap_or(0)!=0||capture.stdout!=b"NEXUS_PYLSP_1_10_0\n"{
-        return Err("Pinned Python LSP Server installation or version check failed".into());
+        // This guest has only CI packages and fixed synthetic source, no user credentials.
+        eprintln!("CI pylsp package verification: {:?}",capture.evidence());
+        return Err("Prepared Python LSP Server guest verification failed".into());
     }
     Ok("1.10.0-1".into())
 }
@@ -1481,7 +1478,15 @@ pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,Strin
     }.await;
     match result{
         Ok(mut d)=>{d["ok"]=json!(true);d["snapshotOnly"]=json!(true);d["transportClosed"]=json!(true);d},
-        Err(_)=>{let _=session.terminate().await;let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;json!({"ok":false,"error":"LSP request rejected, unsupported, cancelled or timed out","transportClosed":closed})}
+        Err(error)=>{
+            #[cfg(test)]
+            eprintln!("CI LSP failure: {}",error);
+            #[cfg(not(test))]
+            let _=error;
+            let _=session.terminate().await;
+            let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;
+            json!({"ok":false,"error":"LSP request rejected, unsupported, cancelled or timed out","transportClosed":closed})
+        }
     }
 }
 

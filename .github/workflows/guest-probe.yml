@@ -29,6 +29,7 @@ on:
       - 'scripts/verify-device-acceptance.py'
       - 'scripts/test-device-acceptance.py'
       - 'scripts/build-glibc-rootfs.sh'
+      - 'scripts/prepare-ci-pylsp-rootfs.sh'
       - 'scripts/verify-glibc-evidence.py'
       - 'scripts/verify-acp-transport.py'
       - 'Sources/NexusCore/**'
@@ -53,7 +54,24 @@ on:
 permissions:
   contents: read
 jobs:
+  prepare-real-pylsp:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare signed Ubuntu packages in CI-only ARM64 rootfs
+        run: bash scripts/prepare-ci-pylsp-rootfs.sh "$RUNNER_TEMP/nexus-pylsp-stage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-pylsp-rootfs
+          path: ${{ runner.temp }}/nexus-pylsp-stage/*
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
   cross-build:
+    needs: prepare-real-pylsp
     strategy:
       fail-fast: false
       matrix:
@@ -616,13 +634,19 @@ jobs:
           name: lsp-diagnostics-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-lsp-*.json
           if-no-files-found: error
+      - name: Download CI-only ARM64 rootfs prepared on Linux
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-pylsp-rootfs
+          path: ${{ runner.temp }}/nexus-pylsp-stage
       - name: Verify actual pinned Python LSP Server diagnostics in disposable Ubuntu guest
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
           export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
           export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
           export CC="$(xcrun --sdk macosx --find clang)"
-          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-real-pylsp-fs"
+          (cd "$RUNNER_TEMP/nexus-pylsp-stage" && shasum -a 256 -c SHA256SUMS)
+          Vendor/litter-ish/build/host-fakefsify/tools/fakefsify "$RUNNER_TEMP/nexus-pylsp-stage/pylsp-rootfs.tar.gz" "$RUNNER_TEMP/nexus-real-pylsp-fs"
           export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-real-pylsp-fs/data"
           export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-real-pylsp.json"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_pylsp_snapshot -- --ignored --nocapture --test-threads=1
