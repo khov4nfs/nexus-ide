@@ -1395,7 +1395,19 @@ pub(crate) async fn live_lsp(guest:&IshInstance,env:&HashMap<String,String>,requ
     }.await;
     match result{
         Ok(n)=>json!({"ok":true,"versions":n,"transportClosed":true}),
-        Err(_)=>{let _=session.terminate().await;let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;json!({"ok":false,"error":"Live LSP stopped, unsupported or invalid versioned diagnostics"})}
+        Err(error)=>{
+            // Keep the production report generic; the fixture needs to prove
+            // the exact rejection rather than pass on any unrelated failure.
+            #[cfg(test)]
+            let fixture_error=if fixture{Some(error.as_str())}else{None};
+            #[cfg(not(test))]
+            let fixture_error:Option<&str>=None;
+            let _=session.terminate().await;
+            let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;
+            let mut report=json!({"ok":false,"transportClosed":closed,"error":"Live LSP stopped, unsupported or invalid versioned diagnostics"});
+            if let Some(reason)=fixture_error{report["fixtureError"]=json!(reason);}
+            report
+        }
     }
 }
 

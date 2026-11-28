@@ -4,6 +4,7 @@ read_frame() {
     IFS= read -r header
     len=$(printf '%s' "$header" | tr -d '\r' | cut -d ' ' -f 2)
     IFS= read -r blank
+    test "$(printf '%s' "$blank" | tr -d '\r')" = ""
     body=$(dd bs=1 count="$len" 2>/dev/null)
 }
 send_frame() { printf 'Content-Length: %s\r\n\r\n%s' "${#1}" "$1"; }
@@ -14,17 +15,25 @@ send_frame '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding"
 read_frame
 case "$body" in *'"method":"initialized"'*) ;; *) exit 2;; esac
 read_frame
-case "$body" in *'"method":"textDocument/didOpen"'*'"text":"x = 1\n"'*'"version":1'*) ;; *) exit 3;; esac
+# JSON member order is not part of LSP. Match each required field independently.
+case "$body" in *'"method":"textDocument/didOpen"'*) ;; *) exit 3;; esac
+case "$body" in *'"text":"x = 1\n"'*) ;; *) exit 3;; esac
+case "$body" in *'"version":1'*) ;; *) exit 3;; esac
+case "$body" in *'"uri":"file:///tmp/nexus-lsp.py"'*) ;; *) exit 3;; esac
 diag 1 'version one'
 read_frame
-case "$body" in *'"text":"x = 2\n"'*'"method":"textDocument/didChange"'*'"version":2'*) ;; *) exit 4;; esac
+case "$body" in *'"method":"textDocument/didChange"'*) ;; *) exit 4;; esac
+case "$body" in *'"contentChanges":[{"text":"x = 2\n"}]'*) ;; *) exit 4;; esac
+case "$body" in *'"version":2'*) ;; *) exit 4;; esac
+case "$body" in *'"uri":"file:///tmp/nexus-lsp.py"'*) ;; *) exit 4;; esac
 diag 1 'stale ignored'
 if [ "$NEXUS_LIVE_LSP_PHASE" = future ]; then diag 3 'wrong version'; IFS= read -r unexpected; exit 5; fi
 diag 2 'version two'
 read_frame
 case "$body" in *'"method":"textDocument/didClose"'*) ;; *) exit 6;; esac
 read_frame
-case "$body" in *'"id":2'*'"method":"shutdown"'*) ;; *) exit 7;; esac
+case "$body" in *'"id":2'*) ;; *) exit 7;; esac
+case "$body" in *'"method":"shutdown"'*) ;; *) exit 7;; esac
 send_frame '{"jsonrpc":"2.0","id":2,"result":null}'
 read_frame
 case "$body" in *'"method":"exit"'*) exit 0;; *) exit 8;; esac

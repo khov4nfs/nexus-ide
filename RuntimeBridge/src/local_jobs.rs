@@ -747,12 +747,12 @@ mod tests {
                     assert_eq!(lsp_control(1,Some("x = 2\n".into()))["ok"],true);
                     assert_eq!(lsp_control(1,Some("duplicate".into()))["ok"],false);sent=true;
                 }else if p["waiting"]==true&&p["version"]==2{
-                    return p["diagnostics"][0]["message"]=="version two"&&lsp_control(2,None)["ok"]==true;
+                    return (sent,p["diagnostics"][0]["message"]=="version two"&&lsp_control(2,None)["ok"]==true);
                 }
-                if !STATE.lock().unwrap().running{return false;}
+                if !STATE.lock().unwrap().running{return (sent,false);}
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            let _=enqueue(Control::Stop);false
+            let _=enqueue(Control::Stop);(sent,false)
         });
         let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
@@ -760,9 +760,13 @@ mod tests {
         let r=rt.block_on(process_probe::live_lsp(&guest,&env,&input,true));
         let clean=rt.block_on(guest.shutdown()).is_ok();
         STATE.lock().unwrap().running=false;
-        let driven=driver.join().unwrap();
+        let (sent,driven)=driver.join().unwrap();
         *LIVE_LSP.lock().unwrap()=None;
-        let ok=clean&&if phase=="success"{driven&&r["ok"]==true&&r["versions"]==2}else{r["ok"]==false&&!driven};
+        let ok=clean&&sent&&r["transportClosed"]==true&&match phase.as_str(){
+            "success"=>driven&&r["ok"]==true&&r["versions"]==2,
+            "future"=>r["ok"]==false&&!driven&&r["fixtureError"]=="LSP diagnostic document mismatch",
+            _=>false,
+        };
         std::fs::write(evidence,serde_json::to_vec_pretty(&json!({"ok":ok,"phase":phase,"fixtureOnly":true,"shutdownClean":clean})).unwrap()).unwrap();
         assert!(ok,"live LSP fixture failed: {r}");
     }
