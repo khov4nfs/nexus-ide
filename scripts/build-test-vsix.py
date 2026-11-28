@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 import zipfile
 
-manifest = {"name":"fixture","publisher":"nexus","version":"0.0.1","displayName":"Nexus CI fixture","engines":{"vscode":"^1.80.0"},"main":"./extension.js","activationEvents":["onCommand:nexus.fixture.open"],"contributes":{"commands":[{"command":"nexus.fixture.open","title":"Nexus: Open CI Fixture"}]}}
+manifest = {"name":"fixture","publisher":"nexus","version":"0.0.1","displayName":"Nexus CI fixture","engines":{"vscode":"^1.80.0"},"main":"./extension.js","extensionKind":["workspace"],"capabilities":{"untrustedWorkspaces":{"supported":True}},"activationEvents":["onCommand:nexus.fixture.open"],"contributes":{"commands":[{"command":"nexus.fixture.open","title":"Nexus: Open CI Fixture"}]}}
 vsix = """<?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
   <Metadata><Identity Language="en-US" Id="fixture" Version="0.0.1" Publisher="nexus"/>
