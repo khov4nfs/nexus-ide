@@ -25,7 +25,7 @@ CHECKS = (
     "agy_session_resume_and_hooks", "codex_cli_auth_real", "codex_native_multiturn_resume",
     "claude_cli_auth_real", "claude_native_multiturn_resume",
     "claude_upstream_acp_real", "batch_transfer_conflict",
-    "native_lsp_real_server", "live_lsp_refresh_real_server",
+    "native_lsp_real_server", "live_lsp_refresh_real_server", "native_lsp_multi_document_real_server",
     "suspend_relaunch_resources", "license_source_notices_review",
 )
 WORKBENCH = ("wkwebview_loopback", "workbench_editor_save_relaunch",
