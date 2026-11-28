@@ -48,3 +48,7 @@ Physical iPhone acceptance must separately test re-launch and persistent disk, c
 ## Additional Workbench language dependencies
 
 The persistent Workbench lane adds Ubuntu noble clangd-18=1:18.1.3-1 (LLVM/Clang, generally Apache-2.0 with LLVM exceptions, file-specific notices and separate transitive dependencies). Review the exact llvm-toolchain-18 source package, LLVM exceptions, libclang-cpp18/libllvm18, gRPC, protobuf and other selected dependencies and their corresponding source obligations. The same-run rootfs records /opt/nexus-lsp-package-inventory.tsv for the actual packages, including Python LSP and clangd. The existing owner review is not automatically extended or approved by this inventory. No public release is authorized by adding these packages.
+
+## Optional reviewed Workbench server bundles
+
+TypeScript/JavaScript, Rust, Go and Bash profiles can now be staged using a separately owner-reviewed offline bundle. This is not part of the default release workflow; no new optional binaries are bundled or licensed by this change. If used, review exact TypeScript and typescript-language-server packages, npm lockfiles, rust-analyzer/rustc/cargo/std source, gopls/Go module dependencies, bash-language-server/shellcheck and all actually redistributed components, including notices and corresponding source where required. The bundle manifest and hashes are integrity inputs, not license approval.
