@@ -16,8 +16,10 @@ with tempfile.TemporaryDirectory() as tmp:
                 continue
             if entry.filename == "extension/package.json":
                 manifest = json.loads(source.read(entry))
-                manifest.update(displayName="Nexus reviewed Python LSP", description="Guest-only real pylsp diagnostics on save and completion", activationEvents=["onLanguage:python", "onCommand:nexus.fixture.open"], capabilities={"untrustedWorkspaces":{"supported":False}})
+                manifest.update(displayName="Nexus persistent language servers", description="Guest-local Python and C/C++ diagnostics and completion", activationEvents=["onLanguage:python", "onLanguage:c", "onLanguage:cpp", "onCommand:nexus.fixture.open", "onCommand:nexus.fixture.cpp", "onCommand:nexus.lsp.stop", "onCommand:nexus.lsp.restart"], capabilities={"untrustedWorkspaces":{"supported":False}})
+                manifest["contributes"]["commands"] += [{"command":"nexus.fixture.cpp","title":"Nexus: Open C++ CI Fixture"},{"command":"nexus.lsp.stop","title":"Nexus: Stop Language Servers"},{"command":"nexus.lsp.restart","title":"Nexus: Restart Language Servers"}]
                 target.writestr(entry.filename, json.dumps(manifest))
             else:
                 target.writestr(entry.filename, source.read(entry))
         target.writestr("extension/extension.js", (here / "workbench-real-lsp-extension.js").read_bytes())
+        target.writestr("extension/lsp-session.js", (here / "workbench-lsp-session.js").read_bytes())
