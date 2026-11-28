@@ -6,6 +6,8 @@ test "$$" -eq 1
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
 export DOCKER_HOST=unix:///run/docker.sock
+# Keep Compose progress readable in serial evidence on the guest console.
+export COMPOSE_ANSI=never COMPOSE_PROGRESS=plain
 unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
 daemon=
 containerd_pid=
