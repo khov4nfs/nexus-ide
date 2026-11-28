@@ -7,6 +7,10 @@ on:
         type: choice
         options: [ubuntu, workbench]
         default: ubuntu
+      full_vm:
+        description: Include reviewed full-system TCI backend (main only, requires exact owner distribution record and all gates)
+        type: boolean
+        default: false
       license_reviewed:
         description: I have reviewed redistribution rights and will satisfy all source/notice obligations for the public IPA
         type: boolean
@@ -55,6 +59,24 @@ on:
 permissions:
   contents: read
 jobs:
+  vm-release-review:
+    if: github.event_name == 'workflow_dispatch' && inputs.full_vm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require main and explicit license review
+        env:
+          LICENSE_REVIEWED: ${{ inputs.license_reviewed }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$LICENSE_REVIEWED" = true
+          python3 scripts/verify-full-vm-distribution.py
+  vm-host:
+    needs: vm-release-review
+    if: github.event_name == 'workflow_dispatch' && inputs.full_vm
+    uses: ./.github/workflows/vm-tci-research.yml
   prepare-real-pylsp:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
@@ -72,13 +94,14 @@ jobs:
           retention-days: 3
           compression-level: 0
   cross-build:
-    needs: prepare-real-pylsp
+    needs: [prepare-real-pylsp, vm-release-review, vm-host]
+    if: always() && !cancelled() && needs.prepare-real-pylsp.result == 'success' && (!inputs.full_vm || (needs.vm-release-review.result == 'success' && needs.vm-host.result == 'success'))
     strategy:
       fail-fast: false
       matrix:
         variant: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu","workbench"]') || fromJSON(format('["{0}"]', inputs.variant || 'ubuntu')) }}
-    runs-on: macos-15
-    timeout-minutes: 60
+    runs-on: ${{ inputs.full_vm && 'macos-26' || 'macos-15' }}
+    timeout-minutes: ${{ inputs.full_vm && 180 || 60 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -836,12 +859,57 @@ jobs:
           name: workbench-loopback-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-workbench.json
           if-no-files-found: warn
+      - name: Download successful full-system regression from this run
+        if: github.event_name == 'workflow_dispatch' && inputs.full_vm
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-tci-host-research
+          path: ${{ runner.temp }}/full-vm-host
+      - name: Cross-compile reviewed full-system backend for final Release
+        if: github.event_name == 'workflow_dispatch' && inputs.full_vm
+        run: |
+          cp "$RUNNER_TEMP/full-vm-host/vm-tci-host-evidence.json" "$RUNNER_TEMP/nexus-full-vm-host.json"
+          brew install bison pkg-config gettext glib-utils libgpg-error nasm make cmake spirv-llvm-translator libxcb libxrandr
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix gettext)/bin:$PATH"
+          python3 -m venv "$RUNNER_TEMP/nexus-vm-python"
+          "$RUNNER_TEMP/nexus-vm-python/bin/python" -m pip install six pyparsing pyyaml setuptools distlib mako
+          export PATH="$RUNNER_TEMP/nexus-vm-python/bin:$PATH"
+          bash scripts/build-ios-vm.sh
+          python3 scripts/verify-full-vm-distribution.py --inventory RuntimeAssets/full-vm/source-inventory.json
+          source_url="$(python3 scripts/verify-full-vm-distribution.py --print-source-url)"
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location --max-filesize 2147483648 --max-time 600 "$source_url" -o "$RUNNER_TEMP/vm-corresponding-source"
+          python3 scripts/verify-full-vm-distribution.py --inventory RuntimeAssets/full-vm/source-inventory.json --archive "$RUNNER_TEMP/vm-corresponding-source"
       - name: Build and verify integrated Release IPA
         env:
           VARIANT: ${{ matrix.variant }}
+          FULL_VM: ${{ inputs.full_vm && 'true' || 'false' }}
         run: |
-          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.8.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
+          vm_flags=""
+          if [[ "$FULL_VM" == true ]]; then vm_flags=NEXUS_FULL_VM; fi
+          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.8.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" NEXUS_VM_SWIFT_FLAGS="$vm_flags" build
           python3 scripts/package-ipa.py --app "$RUNNER_TEMP/nexus-integrated/Build/Products/Release-iphoneos/NexusIDEUbuntuLab.app" --output "$RUNNER_TEMP/nexus-integrated-ipa" --variant "$VARIANT" --commit "$GITHUB_SHA"
+      - name: Bind full VM build scope and distribution record
+        env:
+          FULL_VM: ${{ inputs.full_vm && 'true' || 'false' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, shutil
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          package = root / "nexus-integrated-ipa"
+          build = json.loads((package / "build.json").read_text())
+          expected = os.environ["FULL_VM"] == "true"
+          assert build["fullVMIncluded"] is expected
+          if expected:
+              review = pathlib.Path("docs/full-vm-distribution-review.json")
+              approved = json.loads(review.read_text())
+              assert build["fullVMSourceInventorySHA256"] == approved["sourceInventorySHA256"]
+              shutil.copyfile(review, package / "full-vm-distribution-review.json")
+              (root / "nexus-full-vm-build.json").write_text(json.dumps({
+                  "ok": True, "iosBackendCompiled": True, "physicalDeviceVerified": False,
+                  "ownerDistributionRecordMatched": True, "commit": build["commit"],
+                  "ipaSha256": build["sha256"], "sourceInventorySHA256": build["fullVMSourceInventorySHA256"]
+              }, indent=2))
+          PY
       - name: Bind completed CI evidence to exact integrated IPA
         env:
           VARIANT: ${{ matrix.variant }}
@@ -887,12 +955,21 @@ jobs:
       - name: Reverify downloaded IPA, CI scope and untouched device template
         env:
           VARIANT: ${{ inputs.variant }}
-        run: python3 scripts/verify-device-acceptance.py --package release --record release/device-record-template.json --verify-release-template --expected-commit "$GITHUB_SHA" --expected-variant "$VARIANT"
+          FULL_VM: ${{ inputs.full_vm && 'true' || 'false' }}
+        run: |
+          python3 scripts/verify-device-acceptance.py --package release --record release/device-record-template.json --verify-release-template --expected-commit "$GITHUB_SHA" --expected-variant "$VARIANT"
+          python3 -c 'import json, os; b=json.load(open("release/build.json")); assert b["fullVMIncluded"] is (os.environ["FULL_VM"]=="true")'
+          if [[ "$FULL_VM" == true ]]; then
+            cmp docs/full-vm-distribution-review.json release/full-vm-distribution-review.json
+            python3 scripts/verify-full-vm-distribution.py
+          fi
       - name: Publish reviewed test candidate (not production)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd release
           sha256sum -c SHA256SUMS
-          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json acceptance.json device-record-template.json
+          extra=()
+          if [[ -f full-vm-distribution-review.json ]]; then extra+=(full-vm-distribution-review.json); fi
+          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json acceptance.json device-record-template.json "${extra[@]}"
 
