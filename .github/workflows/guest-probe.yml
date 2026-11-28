@@ -60,6 +60,7 @@ on:
       - 'scripts/lsp-typescript/**'
       - 'scripts/prepare-typescript-lsp-bundle.py'
       - 'scripts/test-real-typescript-lsp.js'
+      - 'scripts/test-real-native-language-lsp.js'
       - 'scripts/test-workbench-lsp-edits.js'
       - 'scripts/workbench-browser-probe.py'
       - 'scripts/test-agy-import.py'
@@ -115,9 +116,44 @@ jobs:
           if-no-files-found: error
           retention-days: 3
           compression-level: 0
+  native-language-host:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.6'
+          cache: false
+      - name: Verify real gopls and rust-analyzer on ARM64 Linux host
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          export GOTOOLCHAIN=local GOTELEMETRY=off
+          export GOPATH="$RUNNER_TEMP/nexus-go"
+          export GOBIN="$RUNNER_TEMP/nexus-go-tools/bin"
+          mkdir -p "$GOBIN"
+          go install golang.org/x/tools/gopls@v0.18.0
+          ln -s "$(go env GOROOT)/bin/go" "$GOBIN/go"
+          node scripts/test-real-native-language-lsp.js go "$RUNNER_TEMP/nexus-go-tools" v0.18.0 | tee "$RUNNER_TEMP/nexus-go-host.json"
+          rustup toolchain install 1.88.0 --profile minimal --component rust-analyzer --component rust-src
+          rust_tools="$(rustc +1.88.0 --print sysroot)"
+          rust_version="$("$rust_tools/bin/rust-analyzer" --version | sed 's/^rust-analyzer //')"
+          node scripts/test-real-native-language-lsp.js rust "$rust_tools" "$rust_version" | tee "$RUNNER_TEMP/nexus-rust-host.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-language-host-evidence
+          path: |
+            ${{ runner.temp }}/nexus-go-host.json
+            ${{ runner.temp }}/nexus-rust-host.json
+          if-no-files-found: warn
+          retention-days: 3
   cross-build:
-    needs: [prepare-real-pylsp, vm-release-review, vm-host]
-    if: always() && !cancelled() && needs.prepare-real-pylsp.result == 'success' && (!inputs.full_vm || (needs.vm-release-review.result == 'success' && needs.vm-host.result == 'success'))
+    needs: [prepare-real-pylsp, native-language-host, vm-release-review, vm-host]
+    if: always() && !cancelled() && needs.prepare-real-pylsp.result == 'success' && needs.native-language-host.result == 'success' && (!inputs.full_vm || (needs.vm-release-review.result == 'success' && needs.vm-host.result == 'success'))
     strategy:
       fail-fast: false
       matrix:
