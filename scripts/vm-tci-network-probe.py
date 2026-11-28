@@ -63,7 +63,7 @@ with serial.open("wb") as log:
         markers = []
         with serial.open("rb") as reader:
             for line in reader:
-                line = line.strip()
+                line = re.sub(rb"^(?:\x1b\[\?25[hl])+|(?:\x1b\[\?25[hl])+$", b"", line.rstrip(b"\r\n"))
                 if len(line) <= 200 and re.fullmatch(rb"NEXUS_VM_[A-Z0-9_]+(?::[A-Za-z0-9_./:+@-]+)?", line):
                     if len(markers) < 128:
                         markers.append(line.decode("ascii"))
