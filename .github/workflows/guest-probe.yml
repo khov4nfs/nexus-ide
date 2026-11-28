@@ -696,21 +696,21 @@ jobs:
           export NEXUS_PYLSP_TRACE=1
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_pylsp_snapshot -- --ignored --nocapture --test-threads=1
           python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","pythonThreadsVerified","diagnosticVerified","transportClosed","shutdownClean"]) and r["fixtureOnly"] is False and r["physicalDeviceVerified"] is False and r["packageVersion"] == "1.10.0-1"' "$NEXUS_LOCAL_EVIDENCE"
-      - name: Verify actual Python LSP completion and live editor refresh in independent guest boots
-        timeout-minutes: 15
+      - name: Verify actual Python LSP completion and single/multi-document refresh in independent guest boots
+        timeout-minutes: 25
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
           export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
           export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
           export CC="$(xcrun --sdk macosx --find clang)"
           export NEXUS_PYLSP_TRACE=1
-          for phase in completion live-refresh; do
+          for phase in completion live-refresh multi-document; do
             Vendor/litter-ish/build/host-fakefsify/tools/fakefsify "$RUNNER_TEMP/nexus-pylsp-stage/pylsp-rootfs.tar.gz" "$RUNNER_TEMP/nexus-pylsp-$phase-fs"
             export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-pylsp-$phase-fs/data"
             export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-real-pylsp-$phase.json"
             test_name="real_pylsp_${phase//-/_}"
             cargo test --manifest-path RuntimeBridge/Cargo.toml --lib "$test_name" -- --ignored --nocapture --test-threads=1
-            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); fields=["completionVerified"] if sys.argv[2]=="completion" else ["initialDiagnosticVerified","refreshedDiagnosticVerified","snapshotUriRefresh"]; assert all(r[k] is True for k in ["ok","transportClosed","shutdownClean",*fields]) and r["fixtureOnly"] is False and r["physicalDeviceVerified"] is False and r["packageVersion"]=="1.10.0-1"; assert sys.argv[2]=="completion" or r["versions"]==2' "$NEXUS_LOCAL_EVIDENCE" "$phase"
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); fields=["completionVerified"] if sys.argv[2]=="completion" else ["documentCorrelationVerified","multiDocument","snapshotUriRefresh"] if sys.argv[2]=="multi-document" else ["initialDiagnosticVerified","refreshedDiagnosticVerified","snapshotUriRefresh"]; assert all(r[k] is True for k in ["ok","transportClosed","shutdownClean",*fields]) and r["fixtureOnly"] is False and r["physicalDeviceVerified"] is False and r["packageVersion"]=="1.10.0-1"; assert sys.argv[2]=="completion" or (r["versions"]==3 and r["documents"]==2 if sys.argv[2]=="multi-document" else r["versions"]==2)' "$NEXUS_LOCAL_EVIDENCE" "$phase"
           done
       - uses: actions/upload-artifact@v4
         if: always()
