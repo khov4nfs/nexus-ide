@@ -190,7 +190,7 @@ struct LocalToolsView: View {
                             TextField("Zero-based line", text: $lspLine).keyboardType(.numberPad).disabled(model.guestClaimed)
                             TextField("Zero-based UTF-16 character", text: $lspCharacter).keyboardType(.numberPad).disabled(model.guestClaimed)
                         }
-                        if mode == 12 { Text("Keep server alive for up to ten saved versions. Return to Files editor, save and tap Refresh LSP to send a reviewed version. Full-sync servers must provide versioned diagnostics; incremental servers use a new virtual document URI for each reviewed snapshot. No project file writes.").font(.caption) }
+                        if mode == 12 { Text("Keep one reviewed server alive for up to 8 files and 64 saved snapshots in the same language family. Open any supported file, save and tap Refresh LSP. Snapshots use distinct virtual URIs, not a project mount; no native file writes or cross-file semantics.").font(.caption) }
                         Text("Snapshot diagnostics or one completion request. Only plain single-range edits may be reviewed; no snippets, commands, automatic edits or native path. Server may use network or retain data.").font(.caption)
                         Toggle("Use saved local-tools guest", isOn: $keepGuest).disabled(model.guestClaimed)
                     } else if mode == 6 {
@@ -307,6 +307,7 @@ struct LocalToolsView: View {
                             guard let snapshot = lspSnapshot, let approved = try? ACPTerminalApproval.parse(Data(lspArgv.utf8)) else { report = "Select a saved snapshot and valid argv"; return }
                             let ext = (snapshot.path as NSString).pathExtension.lowercased()
                             var request: [String: Any] = ["argv":approved.arguments,"language":lspLanguage,"extension":ext,"text":snapshot.text]
+                            if mode == 12 { request["document"] = snapshot.path }
                             if mode == 8 && lspCompletion {
                                 guard let line = Int(lspLine), let character = Int(lspCharacter), LSPTextEdit.offset(.init(line: line, character: character), in: snapshot.text) != nil else { report = "Invalid UTF-16 cursor"; return }
                                 request["completion"] = ["line":line,"character":character]
