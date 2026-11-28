@@ -1,6 +1,6 @@
 #!/bin/sh
 # Runs ONLY as PID 1 in the disposable full-system Linux VM.
-# No network, registry pulls, user data or host Docker socket.
+# Restricted SLIRP only on explicit nexus.net=1; no registry pulls or host Docker socket.
 set -eu
 test "$$" -eq 1
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -42,13 +42,38 @@ test "$(cat /proc/1/comm)" != ""
 echo "NEXUS_VM_KERNEL:$(uname -r)"
 echo "NEXUS_VM_CGROUP2_OK"
 dpkg-query -W docker.io docker-compose-v2 busybox-static
-# Deliberately use the vfs driver and no networking; these are a
-# prerequisite smoke test, not evidence for overlay2 or port forwarding.
+# Retain the vfs prerequisite. In network mode verify actual bridge NAT
+# and published ports, not a host Docker daemon or fake proxy.
+case " $(cat /proc/cmdline) " in
+    *" nexus.net=1 "*)
+        network=1
+        modprobe virtio_net || true
+        i=0
+        iface=
+        while [ -z "$iface" ]; do
+            for candidate in /sys/class/net/*; do
+                [ "${candidate##*/}" = lo ] || iface="${candidate##*/}"
+            done
+            i=$((i+1)); test "$i" -lt 30
+            [ -n "$iface" ] || sleep 1
+        done
+        ip link set lo up
+        ip link set "$iface" up
+        ip addr add 10.0.2.15/24 dev "$iface"
+        ip route replace default via 10.0.2.2
+        # No external DNS or Internet is required for this gate.
+        set -- --iptables=true --ip6tables=false --ip-forward=true --ip-masq=true --userland-proxy=false
+        echo NEXUS_VM_NET_CONFIG_OK
+        ;;
+    *)
+        network=0
+        set -- --iptables=false --ip6tables=false --bridge=none --ip-forward=false --ip-masq=false --userland-proxy=false
+        ;;
+esac
 dockerd --host "$DOCKER_HOST" --data-root /var/lib/docker \
     --exec-root /run/docker --pidfile /run/docker.pid \
     --exec-opt native.cgroupdriver=cgroupfs --storage-driver vfs \
-    --iptables=false --ip6tables=false --bridge=none --ip-forward=false \
-    --ip-masq=false --userland-proxy=false >/run/nexus-dockerd.log 2>&1 &
+    "$@" >/run/nexus-dockerd.log 2>&1 &
 daemon=$!
 i=0
 until docker info >/dev/null 2>&1; do
@@ -98,6 +123,50 @@ test "$(docker logs "$consumer")" = NEXUS_COMPOSE_42
 docker compose -p nexus-vm down --volumes
 test -z "$(docker ps -aq)"
 echo NEXUS_VM_COMPOSE_OK
+if [ "$network" -eq 1 ]; then
+    mkdir -p /tmp/nexus-web/bin /tmp/nexus-web/www/cgi-bin
+    cp "$(command -v busybox)" /tmp/nexus-web/bin/busybox
+    ln -s busybox /tmp/nexus-web/bin/sh
+    cat >/tmp/nexus-web/www/cgi-bin/probe <<'CGI'
+#!/bin/sh
+printf '%s\n' NEXUS_FORWARD_ACK >/tmp/nexus-forward-proof
+printf 'Content-Type: text/plain\r\n\r\nNEXUS_VM_HTTP_42\n'
+CGI
+    chmod 755 /tmp/nexus-web/www/cgi-bin/probe
+    mkdir -p /tmp/nexus-web/tmp
+    tar --numeric-owner -C /tmp/nexus-web -cf - . | docker import - nexus-vm-web:local >/dev/null
+    mkdir -p /tmp/nexus-network-compose
+    cd /tmp/nexus-network-compose
+    cat >compose.yaml <<'YAML'
+services:
+  web:
+    image: nexus-vm-web:local
+    command: ["/bin/busybox", "httpd", "-f", "-p", "8080", "-h", "/www"]
+    ports: ["8080:8080"]
+  client:
+    image: nexus-vm-smoke:local
+    command: ["/bin/busybox", "sh", "-c", "for i in $\(/bin/busybox seq 1 60); do /bin/busybox wget -qO- http://web:8080/cgi-bin/probe && exit 0; /bin/busybox sleep 1; done; exit 1"]
+YAML
+    docker compose -p nexus-network up -d --no-build --pull never
+    client=$(docker compose -p nexus-network ps -a -q client)
+    web=$(docker compose -p nexus-network ps -q web)
+    test -n "$client" && test -n "$web"
+    test "$(docker wait "$client")" = 0
+    test "$(docker logs "$client")" = NEXUS_VM_HTTP_42
+    echo NEXUS_VM_COMPOSE_NETWORK_OK
+    # Remove the internal client acknowledgement. Only the external
+    # loopback request after this marker can satisfy the next assertion.
+    docker exec "$web" /bin/busybox rm -f /tmp/nexus-forward-proof
+    echo NEXUS_VM_FORWARD_READY
+    i=0
+    until docker exec "$web" /bin/busybox test -f /tmp/nexus-forward-proof; do
+        i=$((i+1)); test "$i" -lt 180; sleep 1
+    done
+    test "$(docker exec "$web" /bin/busybox cat /tmp/nexus-forward-proof)" = NEXUS_FORWARD_ACK
+    echo NEXUS_VM_FORWARD_OK
+    docker compose -p nexus-network down --volumes
+    test -z "$(docker ps -aq)"
+fi
 kill -TERM "$daemon"
 wait "$daemon"
 daemon=
