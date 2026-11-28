@@ -10,7 +10,7 @@ import re
 
 # Old independent verifiers and all detailed checks run earlier in the same
 # workflow. This gate also refuses incomplete/failed evidence inventories.
-def gates(variant):
+def gates(variant, full_vm=False):
     rows = {}
     for name in ("guest-evidence", "glibc-evidence"):
         rows[name] = ("macOS guest", {"ok": True, "shutdownError": None})
@@ -19,6 +19,10 @@ def gates(variant):
     for name in ("local-pty", "local-mcp", "local-call"):
         rows[name] = ("macOS guest local job", {"ok": True, "shutdownClean": True})
     rows["real-pylsp"] = ("macOS-hosted Ubuntu guest, real pinned Python LSP Server", {"ok": True, "fixtureOnly": False, "package": "python3-pylsp", "packageVersion": "1.10.0-1", "pythonThreadsVerified": True, "diagnosticVerified": True, "transportClosed": True, "shutdownClean": True, "physicalDeviceVerified": False})
+    pylsp = {"ok": True, "fixtureOnly": False, "package": "python3-pylsp", "packageVersion": "1.10.0-1", "transportClosed": True, "shutdownClean": True, "physicalDeviceVerified": False}
+    rows["real-pylsp-completion"] = ("macOS-hosted Ubuntu guest, real pinned Python LSP completion", {**pylsp, "completionVerified": True})
+    rows["real-pylsp-live-refresh"] = ("macOS-hosted Ubuntu guest, real pinned Python LSP distinct snapshot URI refresh", {**pylsp, "initialDiagnosticVerified": True, "refreshedDiagnosticVerified": True, "snapshotUriRefresh": True, "versions": 2})
+    rows["real-pylsp-multi-document"] = ("macOS-hosted Ubuntu guest, real Python LSP native multi-document snapshots", {**pylsp, "documentCorrelationVerified": True, "multiDocument": True, "documents": 2, "versions": 3, "snapshotUriRefresh": True})
     rows["container-capabilities"] = ("macOS guest prerequisite diagnostic only", {"ok": True, "shutdownClean": True, "diagnosticOnly": True, "dockerEngineVerified": False, "composeVerified": False, "fullSystemVMVerified": False})
     rows["slot-evidence"] = ("Ubuntu ELF fixture, not AGY", {"ok": True, "shutdownClean": True, "digestVerified": True})
     for name in ("google", "google-edit", "snapshot", "mcp-session", "terminal", "codex-probe"):
@@ -54,6 +58,11 @@ def gates(variant):
         rows[f"persist-{phase}"] = ("macOS guest persistence", {"ok": True, "verified": True, "shutdownClean": True})
     if variant == "workbench":
         rows["workbench"] = ("macOS guest Chromium editor, synthetic VSIX and synthetic stdio LSP server", {"ok": True, "shutdownClean": True, "nodeRuntimeVerified": True, "extensionDigestVerified": True, "extensionInstallVerified": True, "browserRequested": True, "extensionActivationVerified": True, "editorVerified": True, "lspVerified": True, "lspFixtureOnly": True})
+    if variant == "workbench":
+        rows["workbench-real-lsp"] = ("macOS guest Chromium editor and persistent real Python 1.10.0 / clangd 18.1.3 for C and C++ via installed VSIX", {"ok": True, "shutdownClean": True, "nodeRuntimeVerified": True, "extensionDigestVerified": True, "extensionInstallVerified": True, "browserRequested": True, "extensionActivationVerified": True, "editorVerified": True, "lspVerified": True, "lspFixtureOnly": False, "realDiagnosticsVerified": True, "realCompletionVerified": True, "realServerVersion": "1.10.0", "persistentMultiLanguageVerified": True, "crossFileDefinitionReferencesRenameVerified": True, "typescriptJavaScriptRealVerified": True, "clangdVersion": "18.1.3"})
+    if full_vm:
+        rows["full-vm-host"] = ("Linux ARM64 host TCI kernel Docker Compose restricted networking", {"ok": True, "tciBuildVerified": True, "linuxKernelBootVerified": True, "dockerEngineInHostTCIVerified": True, "composeInHostTCIVerified": True, "composeNetworkVerified": True, "loopbackForwardVerified": True, "internetTLSVerified": True, "registryPullVerified": True, "restrictedRegistryEgressBlocked": True, "cleanShutdown": True, "physicalDeviceVerified": False})
+        rows["full-vm-build"] = ("iPhoneOS Release app VM framework and source inventory", {"ok": True, "iosBackendCompiled": True, "physicalDeviceVerified": False, "ownerDistributionRecordMatched": True})
     return rows
 
 def read_json(path):
@@ -85,24 +94,39 @@ def collect(evidence, package, commit, variant):
         sha = hashlib.file_digest(stream, "sha256").hexdigest()
     if sha != build.get("sha256") or archive.stat().st_size != build.get("bytes"):
         raise ValueError("IPA integrity mismatch")
+    full_vm = build.get("fullVMIncluded", False)
+    if type(full_vm) is not bool:
+        raise ValueError("Invalid VM build scope")
     reports = []
-    for name, (scope, required) in gates(variant).items():
+    real_vsix_sha = None
+    for name, (scope, required) in gates(variant, full_vm).items():
         path = evidence / ("nexus-" + name + ".json")
         obj, digest = read_json(path)
         for key, expected in required.items():
             if key not in obj or not equal(obj[key], expected):
                 raise ValueError(f"Failed evidence: {path.name} / {key}")
+        if full_vm and name == "full-vm-build" and (obj.get("commit") != commit or obj.get("sourceInventorySHA256") != build.get("fullVMSourceInventorySHA256") or obj.get("ipaSha256") != sha):
+            raise ValueError("VM evidence not bound to exact IPA and inventory")
+        if name == "workbench-real-lsp":
+            extension = package / "nexus-real-pylsp.vsix"
+            if not extension.is_file() or extension.is_symlink():
+                raise ValueError("Missing exact tested real LSP VSIX")
+            with extension.open("rb") as stream:
+                real_vsix_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+            if obj.get("vsixSha256") != real_vsix_sha:
+                raise ValueError("Real LSP VSIX digest does not match guest test")
         reports.append({"file": path.name, "sha256": digest, "scope": scope, "passed": True})
     return {
         "schemaVersion": 1, "commit": commit, "variant": variant,
         "ipa": archive.name, "ipaSha256": sha, "buildJsonSha256": build_sha,
         "ciAcceptancePassed": True, "checks": reports,
+        "workbenchRealVSIXSha256": real_vsix_sha,
         "physicalDeviceVerified": False, "realProviderAuthVerified": False,
         "realProviderInferenceVerified": False, "productionReady": False,
-        "containerBackend": "embedded-user-mode", "dockerEngineVerified": False, "composeVerified": False, "fullSystemVMVerified": False,
+        "fullVMIncluded": full_vm, "containerBackend": "embedded-user-mode-and-qemu-tci-candidate" if full_vm else "embedded-user-mode", "dockerEngineVerified": False, "composeVerified": False, "fullSystemVMVerified": False,
         "remaining": ["signed physical iPhone acceptance", "real imported provider binaries and auth/inference",
                       "workbench editor/extension activation and LSP", "license and source obligations",
-                      "full-system VM/Docker not implemented"],
+                      "full-system VM/Docker physical-device acceptance" if full_vm else "full-system VM/Docker not included"],
     }
 
 if __name__ == "__main__":

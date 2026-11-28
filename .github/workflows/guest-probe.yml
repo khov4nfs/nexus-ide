@@ -7,6 +7,10 @@ on:
         type: choice
         options: [ubuntu, workbench]
         default: ubuntu
+      full_vm:
+        description: Include reviewed full-system TCI backend (main only, requires exact owner distribution record and all gates)
+        type: boolean
+        default: false
       license_reviewed:
         description: I have reviewed redistribution rights and will satisfy all source/notice obligations for the public IPA
         type: boolean
@@ -28,6 +32,16 @@ on:
       - 'scripts/test-release-acceptance.py'
       - 'scripts/verify-device-acceptance.py'
       - 'scripts/test-device-acceptance.py'
+      - 'scripts/test-full-vm-distribution.py'
+      - 'scripts/verify-full-vm-distribution.py'
+      - 'App/FullVMView.swift'
+      - 'scripts/build-ios-vm.sh'
+      - 'scripts/stage-ios-vm.py'
+      - 'scripts/prepare-full-vm-image.sh'
+      - 'scripts/vm-tci-*'
+      - '.github/workflows/vm-tci-research.yml'
+      - 'docs/full-vm-distribution-review.json'
+      - 'LICENSE'
       - 'scripts/build-glibc-rootfs.sh'
       - 'scripts/prepare-ci-pylsp-rootfs.sh'
       - 'scripts/ci-pylsp-native-probe.py'
@@ -38,6 +52,16 @@ on:
       - 'scripts/prepare-workbench-rootfs.py'
       - 'scripts/test-workbench-import.py'
       - 'scripts/build-test-vsix.py'
+      - 'scripts/build-real-workbench-vsix.py'
+      - 'scripts/workbench-real-lsp-extension.js'
+      - 'scripts/workbench-lsp-session.js'
+      - 'scripts/test-workbench-lsp-session.js'
+      - 'scripts/workbench-lsp-edits.js'
+      - 'scripts/lsp-typescript/**'
+      - 'scripts/prepare-typescript-lsp-bundle.py'
+      - 'scripts/test-real-typescript-lsp.js'
+      - 'scripts/test-real-native-language-lsp.js'
+      - 'scripts/test-workbench-lsp-edits.js'
       - 'scripts/workbench-browser-probe.py'
       - 'scripts/test-agy-import.py'
       - 'scripts/stage-ubuntu-device.sh'
@@ -54,7 +78,28 @@ on:
       - '.github/workflows/guest-probe.yml'
 permissions:
   contents: read
+concurrency:
+  group: guest-probe-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  vm-release-review:
+    if: github.event_name == 'workflow_dispatch' && inputs.full_vm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require main and explicit license review
+        env:
+          LICENSE_REVIEWED: ${{ inputs.license_reviewed }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$LICENSE_REVIEWED" = true
+          python3 scripts/verify-full-vm-distribution.py
+  vm-host:
+    needs: vm-release-review
+    if: github.event_name == 'workflow_dispatch' && inputs.full_vm
+    uses: ./.github/workflows/vm-tci-research.yml
   prepare-real-pylsp:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
@@ -71,14 +116,50 @@ jobs:
           if-no-files-found: error
           retention-days: 3
           compression-level: 0
+  native-language-host:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.6'
+          cache: false
+      - name: Verify real gopls and rust-analyzer on ARM64 Linux host
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          export GOTOOLCHAIN=local GOTELEMETRY=off
+          export GOPATH="$RUNNER_TEMP/nexus-go"
+          export GOBIN="$RUNNER_TEMP/nexus-go-tools/bin"
+          mkdir -p "$GOBIN"
+          go install golang.org/x/tools/gopls@v0.18.0
+          ln -s "$(go env GOROOT)/bin/go" "$GOBIN/go"
+          node scripts/test-real-native-language-lsp.js go "$RUNNER_TEMP/nexus-go-tools" v0.18.0 | tee "$RUNNER_TEMP/nexus-go-host.json"
+          rustup toolchain install 1.88.0 --profile minimal --component rust-analyzer --component rust-src
+          rust_tools="$(rustc +1.88.0 --print sysroot)"
+          rust_version="$("$rust_tools/bin/rust-analyzer" --version | sed 's/^rust-analyzer //')"
+          node scripts/test-real-native-language-lsp.js rust "$rust_tools" "$rust_version" | tee "$RUNNER_TEMP/nexus-rust-host.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-language-host-evidence
+          path: |
+            ${{ runner.temp }}/nexus-go-host.json
+            ${{ runner.temp }}/nexus-rust-host.json
+          if-no-files-found: warn
+          retention-days: 3
   cross-build:
-    needs: prepare-real-pylsp
+    needs: [prepare-real-pylsp, native-language-host, vm-release-review, vm-host]
+    if: always() && !cancelled() && needs.prepare-real-pylsp.result == 'success' && needs.native-language-host.result == 'success' && (!inputs.full_vm || (needs.vm-release-review.result == 'success' && needs.vm-host.result == 'success'))
     strategy:
       fail-fast: false
       matrix:
         variant: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu","workbench"]') || fromJSON(format('["{0}"]', inputs.variant || 'ubuntu')) }}
-    runs-on: macos-15
-    timeout-minutes: 60
+    runs-on: ${{ inputs.full_vm && 'macos-26' || 'macos-15' }}
+    timeout-minutes: ${{ inputs.full_vm && 260 || 150 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,6 +173,7 @@ jobs:
           python3 scripts/test-package-ipa.py
           python3 scripts/test-release-acceptance.py
           python3 scripts/test-device-acceptance.py
+          python3 scripts/test-full-vm-distribution.py
       - name: Install guest build dependencies
         run: brew install meson ninja llvm lld libarchive sqlite xcodegen
       - name: Build pinned runtime and rootfs
@@ -653,11 +735,27 @@ jobs:
           export NEXUS_PYLSP_TRACE=1
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_pylsp_snapshot -- --ignored --nocapture --test-threads=1
           python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","pythonThreadsVerified","diagnosticVerified","transportClosed","shutdownClean"]) and r["fixtureOnly"] is False and r["physicalDeviceVerified"] is False and r["packageVersion"] == "1.10.0-1"' "$NEXUS_LOCAL_EVIDENCE"
+      - name: Verify actual Python LSP completion and single/multi-document refresh in independent guest boots
+        timeout-minutes: 25
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          export NEXUS_PYLSP_TRACE=1
+          for phase in completion live-refresh multi-document; do
+            Vendor/litter-ish/build/host-fakefsify/tools/fakefsify "$RUNNER_TEMP/nexus-pylsp-stage/pylsp-rootfs.tar.gz" "$RUNNER_TEMP/nexus-pylsp-$phase-fs"
+            export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-pylsp-$phase-fs/data"
+            export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-real-pylsp-$phase.json"
+            test_name="real_pylsp_${phase//-/_}"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib "$test_name" -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); fields=["completionVerified"] if sys.argv[2]=="completion" else ["documentCorrelationVerified","multiDocument","snapshotUriRefresh"] if sys.argv[2]=="multi-document" else ["initialDiagnosticVerified","refreshedDiagnosticVerified","snapshotUriRefresh"]; assert all(r[k] is True for k in ["ok","transportClosed","shutdownClean",*fields]) and r["fixtureOnly"] is False and r["physicalDeviceVerified"] is False and r["packageVersion"]=="1.10.0-1"; assert sys.argv[2]=="completion" or (r["versions"]==3 and r["documents"]==2 if sys.argv[2]=="multi-document" else r["versions"]==2)' "$NEXUS_LOCAL_EVIDENCE" "$phase"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: real-pylsp-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
-          path: ${{ runner.temp }}/nexus-real-pylsp.json
+          path: ${{ runner.temp }}/nexus-real-pylsp*.json
           if-no-files-found: warn
       - name: Verify original CLI import slots (Ubuntu ELF fixture only)
         run: |
@@ -730,7 +828,10 @@ jobs:
           for name in LICENSE.txt ThirdPartyNotices.txt; do
             curl --proto '=https' --tlsv1.2 --fail --location --retry 2 "$source/$name" -o "$RUNNER_TEMP/$name"
           done
-          python3 scripts/prepare-workbench-rootfs.py --archive "$asset" --source-license "$RUNNER_TEMP/LICENSE.txt" --source-notices "$RUNNER_TEMP/ThirdPartyNotices.txt" --confirm-local-use
+          pylsp="$RUNNER_TEMP/nexus-pylsp-stage/pylsp-rootfs.tar.gz"
+          (cd "$RUNNER_TEMP/nexus-pylsp-stage" && shasum -a 256 -c SHA256SUMS)
+          python3 scripts/prepare-typescript-lsp-bundle.py "$RUNNER_TEMP/typescript-lsp.tar.gz"
+          python3 scripts/prepare-workbench-rootfs.py --lsp-bundle "$RUNNER_TEMP/typescript-lsp.tar.gz" --lsp-bundle-sha256 "$(shasum -a 256 "$RUNNER_TEMP/typescript-lsp.tar.gz" | awk '{print $1}')" --archive "$asset" --source-license "$RUNNER_TEMP/LICENSE.txt" --source-notices "$RUNNER_TEMP/ThirdPartyNotices.txt" --pylsp-rootfs "$pylsp" --pylsp-rootfs-sha256 "$(shasum -a 256 "$pylsp" | awk '{print $1}')" --confirm-local-use
           mv RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/plain-ubuntu-staged"
           bash scripts/stage-ubuntu-device.sh --workbench
       - name: Prepare pinned CI-only Chromium browser harness
@@ -760,6 +861,30 @@ jobs:
           touch "$RUNNER_TEMP/nexus-workbench-start"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
           python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["nodeRuntimeVerified"] is True and r["extensionDigestVerified"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is True and r["lspFixtureOnly"] is True' "$NEXUS_WORKBENCH_EVIDENCE"
+      - name: Verify persistent real Workbench Python C and C++ LSP through Chromium
+        if: matrix.variant == 'workbench'
+        timeout-minutes: 48
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-workbench-real-fs"
+          export NEXUS_WORKBENCH_ROOTFS="$RUNNER_TEMP/nexus-workbench-real-fs/data"
+          export NEXUS_WORKBENCH_EVIDENCE="$RUNNER_TEMP/nexus-workbench-real-lsp.json"
+          export NEXUS_WORKBENCH_REAL_LSP=1
+          export NEXUS_WORKBENCH_CI_TRACE=1
+          export NEXUS_WORKBENCH_BROWSER_PYTHON="$RUNNER_TEMP/nexus-browser/bin/python"
+          export NEXUS_WORKBENCH_BROWSER_SCRIPT="$GITHUB_WORKSPACE/scripts/workbench-browser-probe.py"
+          node --check scripts/workbench-real-lsp-extension.js
+          node --check scripts/workbench-lsp-session.js
+          node --check scripts/workbench-lsp-edits.js
+          node --test scripts/test-workbench-lsp-session.js scripts/test-workbench-lsp-edits.js
+          python3 scripts/build-real-workbench-vsix.py "$RUNNER_TEMP/nexus-real-pylsp.vsix"
+          export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-real-pylsp.vsix" | awk '{print $1}')"
+          cat "$RUNNER_TEMP/nexus-real-pylsp.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","shutdownClean","extensionActivationVerified","editorVerified","lspVerified","realDiagnosticsVerified","realCompletionVerified"]) and r["lspFixtureOnly"] is False and r["realServerVersion"]=="1.10.0" and r["persistentMultiLanguageVerified"] is True and r["crossFileDefinitionReferencesRenameVerified"] is True and r["typescriptJavaScriptRealVerified"] is True and r["clangdVersion"]=="18.1.3"' "$NEXUS_WORKBENCH_EVIDENCE"
       - name: Collect bounded native crash stack (CI-only)
         if: failure() && matrix.variant == 'workbench' && steps.workbench_gate.outcome == 'failure'
         timeout-minutes: 2
@@ -818,14 +943,66 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: workbench-loopback-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
-          path: ${{ runner.temp }}/nexus-workbench.json
+          path: |
+            ${{ runner.temp }}/nexus-workbench.json
+            ${{ runner.temp }}/nexus-workbench-real-lsp.json
           if-no-files-found: warn
+      - name: Download successful full-system regression from this run
+        if: github.event_name == 'workflow_dispatch' && inputs.full_vm
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-tci-host-research
+          path: ${{ runner.temp }}/full-vm-host
+      - name: Cross-compile reviewed full-system backend for final Release
+        if: github.event_name == 'workflow_dispatch' && inputs.full_vm
+        run: |
+          cp "$RUNNER_TEMP/full-vm-host/vm-tci-host-evidence.json" "$RUNNER_TEMP/nexus-full-vm-host.json"
+          brew install bison pkg-config gettext glib-utils libgpg-error nasm make cmake spirv-llvm-translator libxcb libxrandr
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix gettext)/bin:$PATH"
+          python3 -m venv "$RUNNER_TEMP/nexus-vm-python"
+          "$RUNNER_TEMP/nexus-vm-python/bin/python" -m pip install six pyparsing pyyaml setuptools distlib mako
+          export PATH="$RUNNER_TEMP/nexus-vm-python/bin:$PATH"
+          bash scripts/build-ios-vm.sh
+          python3 scripts/verify-full-vm-distribution.py --inventory RuntimeAssets/full-vm/source-inventory.json
+          source_url="$(python3 scripts/verify-full-vm-distribution.py --print-source-url)"
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location --max-filesize 2147483648 --max-time 600 "$source_url" -o "$RUNNER_TEMP/vm-corresponding-source"
+          python3 scripts/verify-full-vm-distribution.py --inventory RuntimeAssets/full-vm/source-inventory.json --archive "$RUNNER_TEMP/vm-corresponding-source"
       - name: Build and verify integrated Release IPA
         env:
           VARIANT: ${{ matrix.variant }}
+          FULL_VM: ${{ inputs.full_vm && 'true' || 'false' }}
         run: |
-          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.8.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
+          vm_flags=""
+          if [[ "$FULL_VM" == true ]]; then vm_flags=NEXUS_FULL_VM; fi
+          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.8.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" NEXUS_VM_SWIFT_FLAGS="$vm_flags" build
           python3 scripts/package-ipa.py --app "$RUNNER_TEMP/nexus-integrated/Build/Products/Release-iphoneos/NexusIDEUbuntuLab.app" --output "$RUNNER_TEMP/nexus-integrated-ipa" --variant "$VARIANT" --commit "$GITHUB_SHA"
+      - name: Stage exact tested real-LSP extension for optional reviewed device delivery
+        if: matrix.variant == 'workbench'
+        run: |
+          cp "$RUNNER_TEMP/nexus-real-pylsp.vsix" "$RUNNER_TEMP/nexus-integrated-ipa/nexus-real-pylsp.vsix"
+          (cd "$RUNNER_TEMP/nexus-integrated-ipa" && shasum -a 256 nexus-real-pylsp.vsix > WORKBENCH-VSIX-SHA256)
+      - name: Bind full VM build scope and distribution record
+        env:
+          FULL_VM: ${{ inputs.full_vm && 'true' || 'false' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, shutil
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          package = root / "nexus-integrated-ipa"
+          build = json.loads((package / "build.json").read_text())
+          expected = os.environ["FULL_VM"] == "true"
+          assert build["fullVMIncluded"] is expected
+          if expected:
+              review = pathlib.Path("docs/full-vm-distribution-review.json")
+              approved = json.loads(review.read_text())
+              assert build["fullVMSourceInventorySHA256"] == approved["sourceInventorySHA256"]
+              shutil.copyfile(review, package / "full-vm-distribution-review.json")
+              (root / "nexus-full-vm-build.json").write_text(json.dumps({
+                  "ok": True, "iosBackendCompiled": True, "physicalDeviceVerified": False,
+                  "ownerDistributionRecordMatched": True, "commit": build["commit"],
+                  "ipaSha256": build["sha256"], "sourceInventorySHA256": build["fullVMSourceInventorySHA256"]
+              }, indent=2))
+          PY
       - name: Bind completed CI evidence to exact integrated IPA
         env:
           VARIANT: ${{ matrix.variant }}
@@ -871,12 +1048,25 @@ jobs:
       - name: Reverify downloaded IPA, CI scope and untouched device template
         env:
           VARIANT: ${{ inputs.variant }}
-        run: python3 scripts/verify-device-acceptance.py --package release --record release/device-record-template.json --verify-release-template --expected-commit "$GITHUB_SHA" --expected-variant "$VARIANT"
+          FULL_VM: ${{ inputs.full_vm && 'true' || 'false' }}
+        run: |
+          python3 scripts/verify-device-acceptance.py --package release --record release/device-record-template.json --verify-release-template --expected-commit "$GITHUB_SHA" --expected-variant "$VARIANT"
+          python3 -c 'import json, os; b=json.load(open("release/build.json")); assert b["fullVMIncluded"] is (os.environ["FULL_VM"]=="true")'
+          if [[ "$FULL_VM" == true ]]; then
+            cmp docs/full-vm-distribution-review.json release/full-vm-distribution-review.json
+            python3 scripts/verify-full-vm-distribution.py
+          fi
       - name: Publish reviewed test candidate (not production)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd release
           sha256sum -c SHA256SUMS
-          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json acceptance.json device-record-template.json
+          extra=()
+          if [[ -f nexus-real-pylsp.vsix ]]; then
+            sha256sum -c WORKBENCH-VSIX-SHA256
+            extra+=(nexus-real-pylsp.vsix WORKBENCH-VSIX-SHA256)
+          fi
+          if [[ -f full-vm-distribution-review.json ]]; then extra+=(full-vm-distribution-review.json); fi
+          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json acceptance.json device-record-template.json "${extra[@]}"
 

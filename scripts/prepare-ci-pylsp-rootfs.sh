@@ -26,8 +26,11 @@ test "$(uname -m)" = aarch64
 test ! -e /usr/bin/pylsp
 printf "%s\n" "deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://ports.ubuntu.com/ubuntu-ports noble main universe" >/tmp/nexus-pylsp.list
 apt-get -q -o Dir::Etc::sourcelist=/tmp/nexus-pylsp.list -o Dir::Etc::sourceparts=- -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update
-apt-get -q -y --no-install-recommends -o Dir::Etc::sourcelist=/tmp/nexus-pylsp.list -o Dir::Etc::sourceparts=- install python3-pylsp=1.10.0-1 python3-pyflakes
+apt-get -q -y --no-install-recommends -o Dir::Etc::sourcelist=/tmp/nexus-pylsp.list -o Dir::Etc::sourceparts=- install python3-pylsp=1.10.0-1 python3-pyflakes clangd-18=1:18.1.3-1
 test "$(dpkg-query -W -f="\${Version}" python3-pylsp)" = 1.10.0-1
+test "$(dpkg-query -W -f="\${Version}" clangd-18)" = 1:18.1.3-1
+/usr/bin/clangd-18 --version
+dpkg-query -W -f="\${Package}\t\${Version}\n" > /opt/nexus-lsp-package-inventory.tsv
 /usr/bin/python3 -c "import pylsp, pyflakes; from importlib.metadata import version; assert version(\"python-lsp-server\") == \"1.10.0\""
 /usr/bin/python3 /tmp/nexus-pylsp-native-probe.py
 rm -f /tmp/nexus-pylsp-native-probe.py

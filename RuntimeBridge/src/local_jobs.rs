@@ -54,9 +54,30 @@ fn agent_send(ticket:u32,text:Option<String>)->Value{
     json!({"ok":true})
 }
 #[derive(Default)]
-struct LiveLsp {version:u32,waiting:bool,pending:Option<String>,finish:bool,diagnostics:Vec<Value>}
+struct LiveLsp {version:u32,waiting:bool,pending:Option<String>,finish:bool,diagnostics:Vec<Value>,multi:bool,document:Option<String>,pending_document:Option<MultiLspDocument>,language:Option<String>,documents:Vec<String>}
 static LIVE_LSP:Mutex<Option<LiveLsp>>=Mutex::new(None);
-pub(crate) enum LspNext {Change(String),Finish,Stop}
+pub(crate) enum LspNext {Change(String),Document(MultiLspDocument),Finish,Stop}
+#[derive(Clone)]
+pub(crate) struct MultiLspDocument {pub key:String,pub extension:String,pub language:String,pub text:String}
+fn multi_lsp_document(key:&str,text:&str)->Option<MultiLspDocument>{
+    if key.is_empty()||key.len()>256||!key.split('/').all(|p|!p.is_empty()&&!p.starts_with('.')&&p.bytes().all(|b|b.is_ascii_alphanumeric()||b"._+-".contains(&b)))||text.len()>8192||text.contains('\0'){return None;}
+    let extension=key.rsplit_once('.')?.1.to_ascii_lowercase();
+    let language=match extension.as_str(){
+        "py"=>"python","c"|"h"=>"c","cc"|"cpp"|"cxx"|"hpp"|"hh"|"hxx"=>"cpp",
+        "ts"=>"typescript","tsx"=>"typescriptreact","js"|"mjs"|"cjs"=>"javascript","jsx"=>"javascriptreact",
+        "rs"=>"rust","go"=>"go","sh"|"bash"=>"shellscript","swift"=>"swift","json"=>"json","html"=>"html","css"=>"css","yaml"|"yml"=>"yaml",
+        _=>return None,
+    };
+    Some(MultiLspDocument{key:key.into(),extension,language:language.into(),text:text.into()})
+}
+fn lsp_family(language:&str)->&str{match language{"c"|"cpp"=>"clangd","typescript"|"typescriptreact"|"javascript"|"javascriptreact"=>"typescript",other=>other}}
+pub(crate) fn same_lsp_family(a:&str,b:&str)->bool{lsp_family(a)==lsp_family(b)}
+pub(crate) fn lsp_publish_document(version:u32,key:&str,diagnostics:Vec<Value>)->bool{
+    if stop_requested(){return false;}
+    let Ok(mut slot)=LIVE_LSP.lock()else{return false;};
+    let Some(s)=slot.as_mut().filter(|s|s.multi)else{return false;};
+    s.version=version;s.document=Some(key.into());if !s.documents.iter().any(|k|k==key){s.documents.push(key.into());}s.diagnostics=diagnostics;s.waiting=version<64;true
+}
 pub(crate) fn lsp_publish(version:u32,diagnostics:Vec<Value>)->bool{
     if stop_requested(){return false;}
     let Ok(mut slot)=LIVE_LSP.lock()else{return false;};
@@ -70,8 +91,9 @@ pub(crate) async fn lsp_wait()->LspNext{
         {
             let Ok(mut slot)=LIVE_LSP.lock()else{return LspNext::Stop;};
             let Some(s)=slot.as_mut()else{return LspNext::Stop;};
+            if let Some(doc)=s.pending_document.take(){s.waiting=false;return LspNext::Document(doc);}
             if let Some(text)=s.pending.take(){s.waiting=false;return LspNext::Change(text);}
-            if s.finish||s.version>=10||std::time::Instant::now()>=until{s.waiting=false;return LspNext::Finish;}
+            if s.finish||s.version>=(if s.multi{64}else{10})||std::time::Instant::now()>=until{s.waiting=false;return LspNext::Finish;}
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -81,11 +103,22 @@ fn lsp_control(version:u32,text:Option<String>)->Value{
     let Ok(mut slot)=LIVE_LSP.lock()else{return fail("LSP unavailable");};
     let Some(s)=slot.as_mut()else{return fail("No live LSP");};
     if s.version!=version||!s.waiting||s.finish||s.pending.is_some(){return fail("Stale or busy LSP version");}
-    if let Some(text)=text{if text.len()>8192||text.contains('\0'){return fail("Invalid snapshot");}s.pending=Some(text);s.diagnostics.clear();}else{s.finish=true;}
+    if let Some(text)=text{if s.multi||text.len()>8192||text.contains('\0'){return fail("Invalid snapshot");}s.pending=Some(text);s.diagnostics.clear();}else{s.finish=true;}
     s.waiting=false;json!({"ok":true})
 }
+fn lsp_document_control(version:u32,input:&str)->Value{
+    if stop_requested()||input.len()>65536{return fail("LSP stopped or request too large");}
+    let Ok(v)=serde_json::from_str::<Value>(input)else{return fail("Invalid document JSON");};
+    if v.as_object().map(|o|o.len())!=Some(2){return fail("Invalid document fields");}
+    let Some(doc)=v["document"].as_str().zip(v["text"].as_str()).and_then(|(key,text)|multi_lsp_document(key,text))else{return fail("Invalid document snapshot");};
+    let Ok(mut slot)=LIVE_LSP.lock()else{return fail("LSP unavailable");};
+    let Some(s)=slot.as_mut().filter(|s|s.multi)else{return fail("No multi-document LSP");};
+    if s.version!=version||!s.waiting||s.finish||s.pending_document.is_some(){return fail("Stale or busy LSP version");}
+    if !s.language.as_deref().is_some_and(|lang|same_lsp_family(lang,&doc.language))||(!s.documents.contains(&doc.key)&&s.documents.len()>=8){return fail("Unsupported document family or limit");}
+    s.pending_document=Some(doc);s.waiting=false;s.diagnostics.clear();json!({"ok":true})
+}
 fn lsp_status()->Value{
-    LIVE_LSP.lock().ok().and_then(|slot|slot.as_ref().map(|s|json!({"active":true,"version":s.version,"waiting":s.waiting,"diagnostics":s.diagnostics}))).unwrap_or_else(||json!({"active":false}))
+    LIVE_LSP.lock().ok().and_then(|slot|slot.as_ref().map(|s|json!({"active":true,"version":s.version,"waiting":s.waiting,"document":s.document,"multiDocument":s.multi,"diagnostics":s.diagnostics}))).unwrap_or_else(||json!({"active":false}))
 }
 struct State {
     running: bool, ready: bool, mode: u8, output: String, raw: Vec<u8>, total: u64,
@@ -325,7 +358,19 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let hooks=if mode==5 {match parse_hooks(input) {Some(v)=>Some(v),None=>return fail("Invalid hook plan")}} else {None};
     let workbench=if mode==3 {match parse_workbench(input) {Some(v)=>Some(v),None=>return fail("Invalid workbench launch")}} else {None};
     let cli=if mode==6 {match parse_cli(input) {Some(v)=>Some(v),None=>return fail("Invalid CLI launch")}} else {None};
-    let lsp=if matches!(mode,8|12) {match parse_lsp(input){Some(v) if mode==8||v.completion.is_none()=>Some(v),_=>return fail("Invalid LSP snapshot request")}}else{None};
+    let mut multi_document=None;
+    let mut lsp_wire=None;
+    if mode==12{
+        if input.len()>65536{return fail("LSP snapshot too large");}
+        if let Ok(mut v)=serde_json::from_str::<Value>(input){
+            if let Some(key)=v.as_object_mut().and_then(|o|o.remove("document")){
+                let Some(doc)=key.as_str().zip(v["text"].as_str()).and_then(|(key,text)|multi_lsp_document(key,text))else{return fail("Invalid multi-document snapshot");};
+                if v["extension"]!=doc.extension||!v["language"].as_str().is_some_and(|lang|same_lsp_family(lang,&doc.language)){return fail("Document language mismatch");}
+                multi_document=Some(doc);lsp_wire=Some(v.to_string());
+            }
+        }
+    }
+    let lsp=if matches!(mode,8|12) {match parse_lsp(lsp_wire.as_deref().unwrap_or(input)){Some(v) if mode==8||v.completion.is_none()=>Some(v),_=>return fail("Invalid LSP snapshot request")}}else{None};
     let transfer=if mode==9 {match parse_transfer(input){Some(v)=>Some(v),None=>return fail("Invalid workspace transfer")}}else{None};
     let adapter=if mode==10 {match parse_adapter(input){Some(v)=>Some(v),None=>return fail("Invalid reviewed ACP adapter request")}}else{None};
     let batch=if mode==11 {match parse_batch(input){Some(v)=>Some(v),None=>return fail("Invalid batch transfer")}}else{None};
@@ -345,7 +390,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     *s = State { running:true,ready:false,mode:if native{7}else if matches!(mode,5|6) {1}else{mode},output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false,agent:if native{Some(AgentMailbox::default())}else{None} };
     drop(s);
     let _guard = Guard;
-    if mode==12{if let Ok(mut slot)=LIVE_LSP.lock(){*slot=Some(LiveLsp::default());}else{return fail("LSP mailbox unavailable");}}
+    if mode==12{if let Ok(mut slot)=LIVE_LSP.lock(){*slot=Some(LiveLsp{multi:multi_document.is_some(),language:multi_document.as_ref().map(|d|d.language.clone()),..Default::default()});}else{return fail("LSP mailbox unavailable");}}
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt, Err(_) => return fail("Runtime creation failed; restart app"),
     };
@@ -361,7 +406,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         else if let Some(request)=adapter.as_ref(){rt.block_on(crate::persistent_acp::local_adapter_session(&guest,&env,request,false))}
         else if let Some(request)=batch.as_ref(){rt.block_on(run_batch(&guest,&env,request))}
         else if let Some(request)=transfer.as_ref(){rt.block_on(process_probe::workspace_transfer(&guest,&env,request))}
-        else if let Some(request)=lsp.as_ref(){if mode==12{rt.block_on(process_probe::live_lsp(&guest,&env,request,false))}else{rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}}
+        else if let Some(request)=lsp.as_ref(){if mode==12{if let Some(doc)=multi_document.as_ref(){rt.block_on(process_probe::live_multi_lsp(&guest,&env,request,doc))}else{rt.block_on(process_probe::live_lsp(&guest,&env,request,false))}}else{rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}}
         else if let Some(plan)=hooks.as_ref() {
             let before=plan["before"].as_str();
             let after=plan["after"].as_str();
@@ -506,6 +551,8 @@ pub extern "C" fn nexus_live_lsp_status()->*mut c_char{ffi(lsp_status)}
 pub unsafe extern "C" fn nexus_live_lsp_change(version:u32,text:*const c_char)->*mut c_char{ffi(||match arg(text){Some(t)=>lsp_control(version,Some(t)),None=>fail("Missing snapshot")})}
 #[no_mangle]
 pub extern "C" fn nexus_live_lsp_finish(version:u32)->*mut c_char{ffi(||lsp_control(version,None))}
+#[no_mangle]
+pub unsafe extern "C" fn nexus_live_lsp_document(version:u32,input:*const c_char)->*mut c_char{ffi(||match arg(input){Some(t)=>lsp_document_control(version,t),None=>fail("Missing document snapshot")})}
 /// # Safety
 /// Pointer must be valid NUL-terminated UTF-8 for the duration of the call.
 #[no_mangle]
@@ -823,6 +870,12 @@ mod tests {
     }
     #[test]
     fn lsp_input_bounds(){
+        assert!(multi_lsp_document("src/main.rs","fn main() {}").is_some());
+        assert!(multi_lsp_document("../main.rs","").is_none());
+        assert!(multi_lsp_document("src/.hidden.go","").is_none());
+        assert!(multi_lsp_document("src/main.go","\0").is_none());
+        assert!(same_lsp_family("typescript","javascriptreact"));
+        assert!(!same_lsp_family("python","go"));
         let valid=json!({"argv":["/usr/bin/server","--stdio"],"language":"python","extension":"py","text":"x = 1"});
         assert!(parse_lsp(&valid.to_string()).is_some());
         let mut v=valid.clone();v["argv"]=json!(["../../server"]);assert!(parse_lsp(&v.to_string()).is_none());
@@ -851,6 +904,127 @@ mod tests {
         let report=json!({"ok":ok,"fixtureOnly":false,"scope":"macOS-hosted Ubuntu guest","package":"python3-pylsp","packageVersion":version.ok(),"pythonThreadsVerified":threads,"diagnosticVerified":diagnosed,"transportClosed":r["transportClosed"],"shutdownClean":clean,"physicalDeviceVerified":false});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         assert!(ok,"real pylsp snapshot gate: {report}; {}",r["error"]);
+    }
+    #[test]
+    #[ignore = "requires prepared real pylsp ARM64 Ubuntu fakefs"]
+    fn real_pylsp_completion(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into()),("PYTHONFAULTHANDLER".into(),"1".into())]);
+        {let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=8;}
+        let version=rt.block_on(process_probe::verify_pylsp_for_ci(&guest,&env));
+        let r=if version.as_deref()==Ok("1.10.0-1"){
+            let input=parse_lsp(&json!({"argv":["/usr/bin/python3","-u","-m","pylsp","-v"],"language":"python","extension":"py","text":"class NexusCompletion:\n    nexus_value = 42\nitem = NexusCompletion()\nitem.","completion":{"line":3,"character":5}}).to_string()).unwrap();
+            rt.block_on(process_probe::lsp_diagnostics(&guest,&env,&input,false))
+        }else{json!({"ok":false,"error":"Prepared server version failed"})};
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        STATE.lock().unwrap().running=false;
+        let completion=r["completions"].as_array().is_some_and(|a|a.iter().any(|c|c["label"]=="nexus_value"&&c["text"]=="nexus_value"&&c["range"]==json!({"start":{"line":3,"character":5},"end":{"line":3,"character":5}})));
+        let ok=version.as_deref()==Ok("1.10.0-1")&&r["ok"]==true&&r["transportClosed"]==true&&completion&&clean;
+        let report=json!({"ok":ok,"fixtureOnly":false,"scope":"macOS-hosted Ubuntu guest","package":"python3-pylsp","packageVersion":version.ok(),"completionVerified":completion,"transportClosed":r["transportClosed"],"shutdownClean":clean,"physicalDeviceVerified":false});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(ok,"real pylsp completion gate: {report}; {}",r["error"]);
+    }
+    #[test]
+    #[ignore = "requires prepared real pylsp ARM64 Ubuntu fakefs"]
+    fn real_pylsp_live_refresh(){
+        use std::time::{Duration,Instant};
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into()),("PYTHONFAULTHANDLER".into(),"1".into())]);
+        let version=rt.block_on(process_probe::verify_pylsp_for_ci(&guest,&env));
+        let input=parse_lsp(&json!({"argv":["/usr/bin/python3","-u","-m","pylsp","-v"],"language":"python","extension":"py","text":"x = missing_nexus_symbol"}).to_string()).unwrap();
+        *LIVE_LSP.lock().unwrap()=Some(LiveLsp::default());
+        {let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=12;}
+        let driver=std::thread::spawn(||{
+            fn has(p:&Value,needle:&str)->bool{
+                p["diagnostics"].as_array().is_some_and(|a|a.iter().any(|d|d["message"].as_str().is_some_and(|m|m.contains(needle))&&d["range"]["start"]["line"]==0&&d["range"]["start"]["character"]==4))
+            }
+            let until=Instant::now()+Duration::from_secs(270);
+            let mut first=false;
+            while Instant::now()<until{
+                let p=lsp_status();
+                if p["waiting"]==true&&p["version"]==1&&!first{
+                    if !has(&p,"missing_nexus_symbol"){let _=enqueue(Control::Stop);return (false,false);}
+                    assert_eq!(lsp_control(0,Some("stale".into()))["ok"],false);
+                    first=lsp_control(1,Some("x = second_nexus_symbol".into()))["ok"]==true;
+                    if !first{let _=enqueue(Control::Stop);return (false,false);}
+                }else if p["waiting"]==true&&p["version"]==2{
+                    let second=has(&p,"second_nexus_symbol")&&!has(&p,"missing_nexus_symbol");
+                    let finished=lsp_control(2,None)["ok"]==true;
+                    return (first,second&&finished);
+                }
+                if !STATE.lock().unwrap().running{return (first,false);}
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _=enqueue(Control::Stop);(first,false)
+        });
+        let r=if version.as_deref()==Ok("1.10.0-1"){rt.block_on(process_probe::live_lsp(&guest,&env,&input,false))}else{json!({"ok":false})};
+        STATE.lock().unwrap().running=false;
+        let (first,second)=driver.join().unwrap();
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        *LIVE_LSP.lock().unwrap()=None;
+        let ok=version.as_deref()==Ok("1.10.0-1")&&first&&second&&r["ok"]==true&&r["versions"]==2&&r["snapshotUriRefresh"]==true&&r["transportClosed"]==true&&clean;
+        let report=json!({"ok":ok,"fixtureOnly":false,"scope":"macOS-hosted Ubuntu guest","package":"python3-pylsp","packageVersion":version.ok(),"initialDiagnosticVerified":first,"refreshedDiagnosticVerified":second,"snapshotUriRefresh":r["snapshotUriRefresh"],"versions":r["versions"],"transportClosed":r["transportClosed"],"shutdownClean":clean,"physicalDeviceVerified":false});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(ok,"real pylsp refresh gate: {report}; {}",r["error"]);
+    }
+    #[test]
+    #[ignore = "requires prepared real pylsp ARM64 Ubuntu fakefs"]
+    fn real_pylsp_multi_document(){
+        use std::time::{Duration,Instant};
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into()),("PYTHONFAULTHANDLER".into(),"1".into())]);
+        let version=rt.block_on(process_probe::verify_pylsp_for_ci(&guest,&env));
+        let first=multi_lsp_document("src/a.py","x = missing_nexus_a").unwrap();
+        let input=parse_lsp(&json!({"argv":["/usr/bin/python3","-u","-m","pylsp"],"language":"python","extension":"py","text":first.text}).to_string()).unwrap();
+        *LIVE_LSP.lock().unwrap()=Some(LiveLsp{multi:true,language:Some("python".into()),..Default::default()});
+        {let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=12;}
+        let driver=std::thread::spawn(||{
+            let until=Instant::now()+Duration::from_secs(420);
+            let cases=[("src/a.py","missing_nexus_a"),("src/b.py","missing_nexus_b"),("src/a.py","refreshed_nexus_a")];
+            let mut seen=0usize;
+            while Instant::now()<until{
+                let p=lsp_status();
+                if p["waiting"]==true&&p["version"].as_u64()==Some((seen+1) as u64){
+                    let (key,needle)=cases[seen];
+                    let correct=p["document"]==key&&p["multiDocument"]==true&&p["diagnostics"].as_array().is_some_and(|a|a.iter().any(|d|
+                        d["message"].as_str().is_some_and(|m|m.contains(needle))&&d["range"]["start"]["line"]==0&&d["range"]["start"]["character"]==4));
+                    if !correct{let _=enqueue(Control::Stop);return false;}
+                    if seen==0{
+                        if lsp_document_control(0,&json!({"document":"src/b.py","text":"stale"}).to_string())["ok"]!=false||
+                           lsp_document_control(1,&json!({"document":"src/b.go","text":"package x"}).to_string())["ok"]!=false{
+                            let _=enqueue(Control::Stop);return false;
+                        }
+                    }
+                    seen+=1;
+                    if seen==cases.len(){return lsp_control(seen as u32,None)["ok"]==true;}
+                    let (next,symbol)=cases[seen];
+                    if lsp_document_control(seen as u32,&json!({"document":next,"text":format!("x = {symbol}")}).to_string())["ok"]!=true{
+                        let _=enqueue(Control::Stop);return false;
+                    }
+                }
+                if !STATE.lock().unwrap().running{return false;}
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _=enqueue(Control::Stop);false
+        });
+        let r=if version.as_deref()==Ok("1.10.0-1"){rt.block_on(process_probe::live_multi_lsp(&guest,&env,&input,&first))}else{json!({"ok":false})};
+        STATE.lock().unwrap().running=false;
+        let correlated=driver.join().unwrap();
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        *LIVE_LSP.lock().unwrap()=None;
+        let ok=version.as_deref()==Ok("1.10.0-1")&&correlated&&r["ok"]==true&&r["versions"]==3&&r["documents"]==2&&r["multiDocument"]==true&&r["snapshotUriRefresh"]==true&&r["transportClosed"]==true&&clean;
+        let report=json!({"ok":ok,"fixtureOnly":false,"scope":"macOS-hosted Ubuntu guest, native multi-document mailbox","package":"python3-pylsp","packageVersion":version.ok(),"documentCorrelationVerified":correlated,"multiDocument":r["multiDocument"],"documents":r["documents"],"versions":r["versions"],"snapshotUriRefresh":r["snapshotUriRefresh"],"transportClosed":r["transportClosed"],"shutdownClean":clean,"physicalDeviceVerified":false});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(ok,"native multi-document pylsp gate: {report}");
     }
     #[test]
     #[ignore = "requires separate Ubuntu fakefs"]
@@ -1029,12 +1203,28 @@ mod tests {
                             entry.path().join("package.json").is_file()
                     }))
         });
+        let real_lsp=std::env::var("NEXUS_WORKBENCH_REAL_LSP").as_deref()==Ok("1");
         let root=guest_path.join("root/nexus-workbench");
         let activated=browser_ok&&std::fs::read(root.join("nexus-extension-activated.marker")).ok().as_deref()==Some(b"activated");
         let editor_verified=activated&&std::fs::read(root.join("nexus-editor-saved.marker")).ok().as_deref()==Some(b"saved");
-        let lsp_verified=editor_verified&&std::fs::read(root.join("nexus-lsp-transport.marker")).ok().as_deref()==Some(b"completed")&&std::fs::read(root.join("nexus-lsp-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join("nexus-editor-fixture.txt")).ok().as_deref()==Some(b"NEXUS_BROWSER_EDITOR_SAVED\nNEXUS_LSP_COMPLETION");
+        let real_diagnostics=real_lsp&&editor_verified&&std::fs::read(root.join("nexus-real-diagnostics.marker")).ok().as_deref()==Some(b"pylsp-1.10.0");
+        let (file,expected):(&str,&[u8])=if real_lsp{
+            ("nexus-real-lsp.py",b"missing_nexus_symbol\nclass NexusCompletion:\n    nexus_value = 42\nitem = NexusCompletion()\nitem.nexus_value")
+        }else{("nexus-editor-fixture.txt",b"NEXUS_BROWSER_EDITOR_SAVED\nNEXUS_LSP_COMPLETION")};
+        let real_completion=real_lsp&&std::fs::read(root.join("nexus-real-completion.marker")).ok().as_deref()==Some(b"pylsp-1.10.0");
+        let persistent=std::fs::read(root.join("nexus-persistent-lsp.json")).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok()).unwrap_or(Value::Null);
+        let ts=std::fs::read(root.join("nexus-typescript-real.json")).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok()).unwrap_or(Value::Null);
+        let ts_verified=real_lsp&&ts["ok"]==true&&ts["server"]=="4.3.4"&&ts["typescript"]=="5.7.3"&&ts["entrySHA256"]=="557a242e685e6b49967597a8d33934190f391090c763a0d344b9e7211e55b5dd"&&ts["stats"]["launches"]==1&&ts["stats"]["initializes"]==1&&ts["stats"]["opens"]==4&&ts["stats"]["closes"]==4&&ts["stats"]["changes"]==2&&ts["stats"]["completions"]==2&&ts["stats"]["shutdownClean"]==true&&ts["stats"]["processExited"]==true;
+        let cross_file_verified=real_lsp&&persistent["projectAcceptance"]==true&&std::fs::read(root.join("nexus-project-lsp.marker")).ok().as_deref()==Some(b"definition-references-rename")&&std::fs::read(root.join("nexus-project-acceptance/shared.hpp")).ok().as_deref()==Some(b"inline int nexus_renamed(int x) { return x + 1; }\n")&&std::fs::read(root.join("nexus-project-acceptance/main.cpp")).ok().as_deref()==Some(b"#include \"shared.hpp\"\nint nexus_entry() { return nexus_renamed(1); }\n");
+        let persistent_verified=real_lsp&&cross_file_verified&&persistent["ok"]==true&&persistent["languages"]==json!(["python","c","cpp"])&&["python","clangd"].iter().all(|k| {
+            let s=&persistent[*k];s["launches"]==1&&s["initializes"]==1&&s["shutdownClean"]==true&&s["restarted"]==false&&s["opens"].as_u64().is_some_and(|n|n>0&&s["closes"].as_u64()==Some(n))
+        })&&persistent["python"]["snapshotRefreshes"].as_u64().is_some_and(|n|n>=1)&&persistent["clangd"]["changes"].as_u64().is_some_and(|n|n>=2)&&persistent["clangd"]["peakDocuments"].as_u64().is_some_and(|n|n>=2)&&persistent["clangd"]["completions"].as_u64().is_some_and(|n|n>=2);
+        let c_verified=real_lsp&&["c","cpp"].iter().all(|lang|std::fs::read(root.join(format!("nexus-{lang}-diagnostics.marker"))).ok().as_deref()==Some(b"clangd-18.1.3")&&std::fs::read(root.join(format!("nexus-{lang}-completion.marker"))).ok().as_deref()==Some(b"clangd-18.1.3")&&std::fs::read(root.join(format!("nexus-{lang}-saved.marker"))).ok().as_deref()==Some(b"saved"));
+        let cpp_bytes=std::fs::read(root.join("nexus-real-lsp.cpp")).ok().as_deref()==Some(b"int broken = missing_nexus_cpp;\nstruct NexusCompletion { int nexus_value; };\nvoid probe() {\n    NexusCompletion item;\n    item.nexus_value");
+        let c_bytes=std::fs::read(root.join("nexus-real-lsp.c")).ok().as_deref()==Some(b"int broken = missing_nexus_c;\nstruct NexusC { int nexus_c_value; };\nvoid probe_c(void) {\n    struct NexusC item;\n    item.nexus_c_value");
+        let lsp_verified=editor_verified&&std::fs::read(root.join("nexus-lsp-transport.marker")).ok().as_deref()==Some(b"completed")&&std::fs::read(root.join("nexus-lsp-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join(file)).ok().as_deref()==Some(expected)&&(!real_lsp||(real_diagnostics&&real_completion&&persistent_verified&&c_verified&&cpp_bytes&&c_bytes&&ts_verified));
         let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified&&lsp_verified)),
-            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"nodeRuntimeVerified":closed["nodeRuntimeVerified"],"extensionDigestVerified":closed["extensionDigestVerified"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":lsp_verified,"lspFixtureOnly":true});
+            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"nodeRuntimeVerified":closed["nodeRuntimeVerified"],"extensionDigestVerified":closed["extensionDigestVerified"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":lsp_verified,"lspFixtureOnly":!real_lsp,"realDiagnosticsVerified":real_diagnostics,"realCompletionVerified":real_completion,"realServerVersion":if real_diagnostics&&real_completion{Some("1.10.0")}else{None},"typescriptJavaScriptRealVerified":ts_verified,"typescriptSessionEvidence":ts,"crossFileDefinitionReferencesRenameVerified":cross_file_verified,"persistentMultiLanguageVerified":persistent_verified&&c_verified&&cpp_bytes&&c_bytes,"clangdVersion":if c_verified&&cpp_bytes&&c_bytes{Some("18.1.3")}else{None},"persistentSessionEvidence":persistent,"vsixSha256":vsix});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         println!("{report}");
         assert_eq!(report["ok"],true);

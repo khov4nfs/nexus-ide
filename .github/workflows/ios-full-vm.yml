@@ -1,0 +1,81 @@
+name: iOS full-system TCI integration
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'App/FullVMView.swift'
+      - 'App/NexusApp.swift'
+      - 'project-glibc.yml'
+      - 'scripts/build-ios-vm.sh'
+      - 'scripts/stage-ios-vm.py'
+      - '.github/workflows/ios-full-vm.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ios-full-vm-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  ios-device-build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify build scripts
+        run: |
+          bash -n scripts/build-ios-vm.sh
+          python3 -m py_compile scripts/stage-ios-vm.py
+          xcrun swiftc -frontend -parse -target arm64-apple-ios17.0 -D NEXUS_FULL_VM -D NEXUS_UBUNTU_LAB App/FullVMView.swift
+      - name: Install build dependencies
+        run: |
+          brew install meson ninja llvm lld libarchive sqlite xcodegen bison pkg-config gettext glib-utils libgpg-error nasm make cmake spirv-llvm-translator libxcb libxrandr
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          python3 -m venv "$RUNNER_TEMP/nexus-vm-python"
+          "$RUNNER_TEMP/nexus-vm-python/bin/python" -m pip install six pyparsing pyyaml setuptools distlib mako
+          echo "$RUNNER_TEMP/nexus-vm-python/bin" >> "$GITHUB_PATH"
+      - name: Cross-compile actual interpreter library and dependency closure
+        run: bash scripts/build-ios-vm.sh
+      - name: Build existing integrated Ubuntu runtime
+        run: |
+          bash scripts/build-guest-device.sh
+          bash scripts/build-glibc-rootfs.sh
+          bash scripts/stage-ubuntu-device.sh
+      - name: Compile existing native app with full VM backend enabled
+        run: |
+          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-vm-derived" CODE_SIGNING_ALLOWED=NO NEXUS_VM_SWIFT_FLAGS=NEXUS_FULL_VM build
+      - name: Verify embedded device framework closure and backend build
+        run: |
+          app="$RUNNER_TEMP/nexus-vm-derived/Build/Products/Debug-iphoneos/NexusIDEUbuntuLab.app"
+          test -d "$app"
+          python3 - "$app" <<'PY'
+          import hashlib, json, pathlib, subprocess, sys
+          app = pathlib.Path(sys.argv[1])
+          p = json.loads((app / "FullVMNotices/provenance.json").read_text())
+          assert p["platform"] == "iPhoneOS" and p["interpreterOnlyEntryPoint"] is True
+          assert p["qemuCommit"] == "6601422e1fff2da1376faafb1e4c2c5cdb2d8003"
+          assert p["physicalDeviceVerified"] is False
+          for name, expected in p["frameworkSHA256"].items():
+              with (app / "Frameworks" / (name + ".framework") / name).open("rb") as f:
+                  assert hashlib.file_digest(f, "sha256").hexdigest() == expected
+          assert (app / "FullVMFirmware").is_dir()
+          assert "nexus_qemu_tci_run" in subprocess.check_output(["nm", "-gU", str(app / "Frameworks/qemu-aarch64-softmmu.framework/qemu-aarch64-softmmu")], text=True)
+          report = {"ok": True, "scope": "unsigned iPhoneOS Debug compile and embedded framework integrity", "iosBackendCompiled": True,
+                    "qemuCommit": p["qemuCommit"], "physicalDeviceVerified": False, "linuxBootOnIOSVerified": False,
+                    "dockerEngineOnIOSVerified": False, "composeOnIOSVerified": False, "productionReady": False}
+          (pathlib.Path(__import__("os").environ["RUNNER_TEMP"]) / "nexus-ios-vm-build.json").write_text(json.dumps(report, indent=2))
+          print(json.dumps(report))
+          PY
+      - name: Upload build evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-full-vm-build-evidence
+          path: |
+            ${{ runner.temp }}/nexus-ios-vm-build.json
+            RuntimeAssets/full-vm/provenance.json
+            RuntimeAssets/full-vm/source-inventory.json
+            RuntimeAssets/full-vm/DependencyNotices/
+          if-no-files-found: warn
+          retention-days: 7

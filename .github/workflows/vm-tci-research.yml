@@ -1,0 +1,47 @@
+name: Full-system TCI research gate
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+    paths:
+      - 'scripts/prepare-full-vm-image.sh'
+      - 'scripts/vm-tci-network-probe.py'
+      - 'scripts/vm-tci-verify-evidence.py'
+      - 'scripts/test-vm-tci-evidence.py'
+      - 'scripts/vm-tci-host-smoke.sh'
+      - 'scripts/vm-tci-guest-smoke.sh'
+      - '.github/workflows/vm-tci-research.yml'
+permissions:
+  contents: read
+concurrency:
+  group: vm-tci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  host-tci:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate research scripts
+        run: |
+          bash -n scripts/prepare-full-vm-image.sh
+          python3 -m py_compile scripts/vm-tci-network-probe.py scripts/vm-tci-verify-evidence.py
+          python3 scripts/test-vm-tci-evidence.py
+          bash -n scripts/vm-tci-host-smoke.sh
+          sh -n scripts/vm-tci-guest-smoke.sh
+      - name: Install host-only build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev libffi-dev libslirp-dev python3-venv e2fsprogs
+      - name: Compile TCI and execute actual Linux kernel, Docker and Compose
+        run: bash scripts/vm-tci-host-smoke.sh "$RUNNER_TEMP/nexus-vm-tci"
+      - name: Preserve host research evidence (no disk or IPA)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-tci-host-research
+          path: ${{ runner.temp }}/nexus-vm-tci/
+          if-no-files-found: warn
+          retention-days: 7

@@ -31,11 +31,33 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Trusted guest Internet mode may access local network services only when you explicitly enable it."
         INFOPLIST_KEY_CFBundleDisplayName: Nexus IDE Ubuntu
         SWIFT_VERSION: '5.0'
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) NEXUS_UBUNTU_LAB"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) NEXUS_UBUNTU_LAB $(NEXUS_VM_SWIFT_FLAGS)"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
         SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/RuntimeBridge/include/NexusGuestBridge.h"
         OTHER_LDFLAGS: "$(inherited) $(SRCROOT)/RuntimeAssets/lib/libnexus_guest_bridge.a -lsqlite3 -lc++ -framework Foundation -framework CoreFoundation -framework Security -framework SystemConfiguration"
         SUPPORTED_PLATFORMS: iphoneos
         ARCHS: arm64
+    postBuildScripts:
+      - name: Embed reviewed optional full-system VM frameworks
+        basedOnDependencyAnalysis: false
+        script: |
+          set -eu
+          if [ "${NEXUS_VM_SWIFT_FLAGS:-}" != "NEXUS_FULL_VM" ]; then exit 0; fi
+          source="$SRCROOT/RuntimeAssets/full-vm"
+          dest="$TARGET_BUILD_DIR/$WRAPPER_NAME"
+          test -f "$source/provenance.json"
+          mkdir -p "$dest/Frameworks"
+          for framework in "$source"/Frameworks/*.framework; do
+            test -d "$framework"
+            /usr/bin/ditto "$framework" "$dest/Frameworks/$(basename "$framework")"
+          done
+          /usr/bin/ditto "$source/Firmware" "$dest/FullVMFirmware"
+          mkdir -p "$dest/FullVMNotices"
+          for item in provenance.json source-inventory.json QEMU-COPYING QEMU-LICENSE UTM-LICENSE; do
+            cp "$source/$item" "$dest/FullVMNotices/$item"
+          done
+          /usr/bin/ditto "$source/DependencyNotices" "$dest/FullVMNotices/DependencyNotices"
     scheme: {}

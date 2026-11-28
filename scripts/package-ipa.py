@@ -20,13 +20,13 @@ VARIANTS = {
 }
 WORKBENCH_SHA = "36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc"
 
-def validate_macho(data):
+def validate_macho(data, expected_kind=2):
     # Xcode device builds are intentionally single-slice ARM64. Reject FAT,
     # simulator, malformed and unknown deployment load commands.
     if len(data) < 32:
         raise ValueError("Truncated Mach-O")
     magic, cpu, subtype, kind, count, size, flags, reserved = struct.unpack_from("<8I", data)
-    if magic != 0xfeedfacf or cpu != 0x0100000c or kind != 2 or count > 4096 or size > len(data)-32:
+    if magic != 0xfeedfacf or cpu != 0x0100000c or kind != expected_kind or count > 4096 or size > len(data)-32:
         raise ValueError("Expected thin ARM64 Mach-O executable")
     pos, end, platforms = 32, 32+size, []
     for _ in range(count):
@@ -118,11 +118,67 @@ def verify(path, variant):
                 raise ValueError("Missing pinned workbench")
             if z.read(guest+"data/opt/nexus/extension.vsix") != b"NEXUS_VSIX_IMPORT_SLOT_V1\n":
                 raise ValueError("Expected empty VSIX import slot")
-            for entry in ("data/opt/nexus/workbench/node","data/opt/nexus/workbench/bin/openvscode-server"):
+            provenance = z.read(guest+"provenance.txt").decode()
+            if not re.search(r"^pylsp_rootfs_sha256=[0-9a-f]{64}$", provenance, re.M) or "pylsp_package_version=1.10.0-1\n" not in provenance or "clangd_package_version=1:18.1.3-1\n" not in provenance:
+                raise ValueError("Missing pinned real Workbench Python LSP provenance")
+            for entry in ("data/opt/nexus/workbench/node","data/opt/nexus/workbench/bin/openvscode-server","data/usr/bin/pylsp","data/usr/bin/clangd-18","data/opt/nexus-lsp-package-inventory.tsv"):
                 if guest+entry not in names:
                     raise ValueError("Missing workbench executable")
+            if not re.search(r"^reviewed_lsp_bundle_sha256=[0-9a-f]{64}$", provenance, re.M):
+                raise ValueError("Missing reviewed TypeScript bundle provenance")
+            tools = guest+"data/opt/nexus/lsp/"
+            manifest = json.loads(z.read(tools+"manifest.json"))
+            ts_entry = "557a242e685e6b49967597a8d33934190f391090c763a0d344b9e7211e55b5dd"
+            if manifest.get("servers",{}).get("typescript") != {"version":"4.3.4","entrySHA256":ts_entry}:
+                raise ValueError("TypeScript bundle manifest mismatch")
+            with z.open(tools+"typescript/node_modules/typescript-language-server/lib/cli.mjs") as stream:
+                if hashlib.file_digest(stream,"sha256").hexdigest() != ts_entry:
+                    raise ValueError("TypeScript entry mismatch")
+            for package,version in (("typescript","5.7.3"),("typescript-language-server","4.3.4")):
+                metadata = json.loads(z.read(tools+"typescript/node_modules/"+package+"/package.json"))
+                if metadata.get("version") != version:
+                    raise ValueError("TypeScript toolchain package version mismatch")
         elif guest+"workbench.sha256" in names:
             raise ValueError("Unexpected workbench in plain build")
+        vm_notice = prefix+"FullVMNotices/"
+        vm_present = vm_notice+"provenance.json" in names
+        vm_paths = any(n.startswith((prefix+"FullVMFirmware/",vm_notice,prefix+"Frameworks/qemu-aarch64-softmmu.framework/")) for n in names)
+        if vm_paths != vm_present or (vm_present and variant == "native"):
+            raise ValueError("Unexpected or incomplete full VM payload")
+        vm_inventory = None
+        if vm_present:
+            p = json.loads(z.read(vm_notice+"provenance.json"))
+            inventory = z.read(vm_notice+"source-inventory.json")
+            vm_inventory = hashlib.sha256(inventory).hexdigest()
+            if p.get("qemuCommit") != "6601422e1fff2da1376faafb1e4c2c5cdb2d8003" or p.get("interpreterOnlyEntryPoint") is not True or p.get("sourceInventorySHA256") != vm_inventory:
+                raise ValueError("VM provenance mismatch")
+            sources = json.loads(inventory)
+            hashes = p.get("frameworkSHA256", {})
+            if not isinstance(hashes, dict) or "qemu-aarch64-softmmu" not in hashes:
+                raise ValueError("Missing interpreter framework")
+            for name, expected in hashes.items():
+                if not re.fullmatch(r"[A-Za-z0-9_.+-]+", name) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+                    raise ValueError("Invalid framework inventory")
+                path = prefix+"Frameworks/"+name+".framework/"+name
+                with z.open(path) as stream:
+                    head = stream.read(32)
+                    if len(head) != 32: raise ValueError("Truncated VM framework")
+                    size = struct.unpack_from("<I", head, 20)[0]
+                    if size > 1024*1024: raise ValueError("Excessive framework load commands")
+                    validate_macho(head+stream.read(size), 6)
+                with z.open(path) as stream:
+                    if hashlib.file_digest(stream,"sha256").hexdigest() != expected:
+                        raise ValueError("VM framework hash mismatch")
+            for key, directory in (("noticeSHA256",vm_notice+"DependencyNotices/"),("firmwareSHA256",prefix+"FullVMFirmware/")):
+                entries = sources.get(key)
+                if not isinstance(entries,dict) or not entries:
+                    raise ValueError("Missing VM notices or firmware inventory")
+                for name, expected in entries.items():
+                    if PurePosixPath(name).is_absolute() or ".." in PurePosixPath(name).parts:
+                        raise ValueError("Invalid inventory path")
+                    with z.open(directory+name) as stream:
+                        if hashlib.file_digest(stream,"sha256").hexdigest() != expected:
+                            raise ValueError("VM resource hash mismatch")
         if z.testzip() is not None:
             raise ValueError("ZIP CRC failed")
         return {
@@ -134,6 +190,7 @@ def verify(path, variant):
             "signing":"unsigned; must be signed by a legitimate installer",
             "variant":variant,"physicalDeviceVerified":False,
             "agyBundled":False,"agyImportSlot":has_guest,"guestBundled":has_guest,
+            "fullVMIncluded":vm_present,"fullVMSourceInventorySHA256":vm_inventory,
         }
 
 def package(app, output, variant, commit):

@@ -25,12 +25,13 @@ CHECKS = (
     "agy_session_resume_and_hooks", "codex_cli_auth_real", "codex_native_multiturn_resume",
     "claude_cli_auth_real", "claude_native_multiturn_resume",
     "claude_upstream_acp_real", "batch_transfer_conflict",
-    "native_lsp_real_server", "live_lsp_refresh_real_server",
+    "native_lsp_real_server", "live_lsp_refresh_real_server", "native_lsp_multi_document_real_server",
     "suspend_relaunch_resources", "license_source_notices_review",
 )
 WORKBENCH = ("wkwebview_loopback", "workbench_editor_save_relaunch",
-             "workbench_real_extension_activation", "workbench_real_lsp")
+             "workbench_real_extension_activation", "workbench_real_lsp", "workbench_real_lsp_diagnostics_completion_relaunch", "workbench_persistent_python_c_cpp_sessions", "workbench_cross_file_rename_and_refactoring_review", "workbench_typescript_javascript_real_project")
 VERSIONS = ("agy", "codex", "claude", "claudeACP", "languageServer")
+FULL_VM = ("vm_kernel_boot_serial", "vm_disk_persistence_reboot", "vm_docker_engine_real", "vm_compose_volume_and_network", "vm_loopback_http_and_isolation", "vm_internet_dns_tls", "vm_registry_pull_arm64", "vm_clean_shutdown_resources")
 
 def sha_file(path):
     if not path.is_file() or path.is_symlink():
@@ -57,7 +58,10 @@ def package_identity(package, expected_commit=None, expected_variant=None):
         raise ValueError("IPA hash or size mismatch")
     if report.get("commit") != commit or report.get("variant") != variant or report.get("buildJsonSha256") != build_sha or report.get("ciAcceptancePassed") is not True:
         raise ValueError("CI manifest identity mismatch")
-    expected = {"nexus-" + key + ".json": scope for key, (scope, _) in ci.gates(variant).items()}
+    full_vm = build.get("fullVMIncluded", False)
+    if type(full_vm) is not bool or report.get("fullVMIncluded", False) is not full_vm:
+        raise ValueError("VM scope mismatch")
+    expected = {"nexus-" + key + ".json": scope for key, (scope, _) in ci.gates(variant, full_vm).items()}
     rows = report.get("checks")
     if not isinstance(rows, list) or len(rows) != len(expected) or any(
         not isinstance(row, dict) or not isinstance(row.get("file"), str) or row.get("scope") != expected.get(row["file"]) or row.get("passed") is not True or
@@ -67,18 +71,29 @@ def package_identity(package, expected_commit=None, expected_variant=None):
         raise ValueError("Incomplete CI manifest")
     if any(report.get(k) is not False for k in ("physicalDeviceVerified", "realProviderAuthVerified", "realProviderInferenceVerified", "productionReady", "dockerEngineVerified", "composeVerified", "fullSystemVMVerified")):
         raise ValueError("Unexpected CI scope")
-    return {"commit": commit, "variant": variant, "ipaSha256": sha, "ciManifestSha256": report_sha}
+    identity = {"commit": commit, "variant": variant, "ipaSha256": sha, "ciManifestSha256": report_sha}
+    if variant == "workbench":
+        vsix_sha = sha_file(package / "nexus-real-pylsp.vsix")
+        if report.get("workbenchRealVSIXSha256") != vsix_sha:
+            raise ValueError("Real Workbench VSIX hash mismatch")
+        identity["workbenchRealVSIXSha256"] = vsix_sha
+    if full_vm:
+        identity["fullVMIncluded"] = True
+    return identity
 
-def required(variant):
-    return CHECKS + (WORKBENCH if variant == "workbench" else ())
+def required(variant, full_vm=False):
+    return CHECKS + (WORKBENCH if variant == "workbench" else ()) + (FULL_VM if full_vm else ())
+
+def version_fields(identity):
+    return VERSIONS + (("clangd",) if identity["variant"] == "workbench" else ()) + (("qemu", "linuxKernel", "dockerEngine", "dockerCompose") if identity.get("fullVMIncluded", False) else ())
 
 def template(identity):
     return {
         "schemaVersion": 1, "package": identity,
         "operatorAcknowledgesManualReview": False,
         "device": {"model": "", "os": "", "installation": "", "testedDate": ""},
-        "versions": {k: "" for k in VERSIONS},
-        "checks": {k: {"passed": False, "evidenceSha256": ""} for k in required(identity["variant"])},
+        "versions": {k: "" for k in version_fields(identity)},
+        "checks": {k: {"passed": False, "evidenceSha256": ""} for k in required(identity["variant"], identity.get("fullVMIncluded", False))},
     }
 
 def verify_release_template(identity, record):
@@ -106,15 +121,15 @@ def validate(identity, record, evidence_dir):
         raise ValueError("Invalid test date")
     datetime.date.fromisoformat(device["testedDate"])
     versions = record["versions"]
-    if not isinstance(versions, dict) or set(versions) != set(VERSIONS) or any(
+    if not isinstance(versions, dict) or set(versions) != set(version_fields(identity)) or any(
         not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._+@/-]{0,79}", v) for v in versions.values()
     ):
         raise ValueError("Specify tested component versions, never secrets")
     checks = record["checks"]
-    if not isinstance(checks, dict) or set(checks) != set(required(identity["variant"])):
+    if not isinstance(checks, dict) or set(checks) != set(required(identity["variant"], identity.get("fullVMIncluded", False))):
         raise ValueError("Incomplete or unexpected device checks")
     pending = []
-    for key in required(identity["variant"]):
+    for key in required(identity["variant"], identity.get("fullVMIncluded", False)):
         item = checks[key]
         if not isinstance(item, dict) or set(item) != {"passed", "evidenceSha256"} or type(item["passed"]) is not bool:
             raise ValueError("Invalid check record")

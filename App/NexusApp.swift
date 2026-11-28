@@ -33,11 +33,13 @@ struct GuestEditPreview: Identifiable {
     @Published var liveLSPMessage = "Waiting for language server"
     private var liveLSPText = ""
     private var liveLSPVersion = UInt32(1)
+    private var liveLSPCache: [String: (text: String, message: String)] = [:]
     func beginLiveLSP(_ snap: WorkspaceSnapshot) {
         liveLSPPath = snap.path; liveLSPText = snap.text; liveLSPVersion = 1
+        liveLSPCache.removeAll()
         liveLSPReady = false; liveLSPMessage = "Waiting for diagnostics"
     }
-    func endLiveLSP() { liveLSPPath = nil; liveLSPReady = false; liveLSPText = ""; liveLSPMessage = "Language server closed" }
+    func endLiveLSP() { liveLSPPath = nil; liveLSPReady = false; liveLSPText = ""; liveLSPCache.removeAll(); liveLSPMessage = "Language server closed" }
     private func liveDecode(_ pointer: UnsafeMutablePointer<CChar>?) -> [String: Any] {
         guard let pointer else { return [:] }; defer { nexus_guest_free(pointer) }
         return (try? JSONSerialization.jsonObject(with: Data(String(cString: pointer).utf8)) as? [String: Any]) ?? [:]
@@ -46,20 +48,29 @@ struct GuestEditPreview: Identifiable {
         guard let file = liveLSPPath else { return }
         let obj = liveDecode(nexus_live_lsp_status())
         liveLSPReady = obj["active"] as? Bool == true && obj["waiting"] as? Bool == true && obj["version"] as? UInt32 == liveLSPVersion
-        guard file == path, Data(source.utf8) == Data(liveLSPText.utf8), obj["version"] as? UInt32 == liveLSPVersion, let rows = obj["diagnostics"] as? [[String: Any]], liveLSPReady else {
-            liveLSPMessage = "Diagnostics pending or stale; save and review refresh"; return
+        if obj["multiDocument"] as? Bool == true, obj["document"] as? String == file,
+           obj["version"] as? UInt32 == liveLSPVersion, let rows = obj["diagnostics"] as? [[String: Any]], liveLSPReady {
+            let message = rows.isEmpty ? "No diagnostics for this saved version" : rows.compactMap { row in
+                guard let range = row["range"] as? [String: Any], let start = range["start"] as? [String: Any], let line = start["line"] as? Int, let msg = row["message"] as? String else { return nil }
+                return "Line " + String(line + 1) + ": " + msg
+            }.joined(separator: "\n")
+            liveLSPCache[file] = (liveLSPText, message)
         }
-        liveLSPMessage = rows.isEmpty ? "No diagnostics for this saved version" : rows.compactMap { row in
-            guard let range = row["range"] as? [String: Any], let start = range["start"] as? [String: Any], let line = start["line"] as? Int, let msg = row["message"] as? String else { return nil }
-            return "Line " + String(line + 1) + ": " + msg
-        }.joined(separator: "\n")
+        if let cached = liveLSPCache[path], Data(cached.text.utf8) == Data(source.utf8) {
+            liveLSPMessage = cached.message
+        } else {
+            liveLSPMessage = "Diagnostics pending or stale; save and review refresh"
+        }
     }
     func sendLiveLSP(_ snap: WorkspaceSnapshot, version: UInt32) {
-        guard liveLSPReady, version == liveLSPVersion, liveLSPPath == snap.path, path == snap.path,
-              Data(source.utf8) == Data(snap.text.utf8), snap.text.utf8.count <= 8192, !snap.text.utf8.contains(0) else { status = "Snapshot or LSP version changed"; return }
-        let obj = snap.text.withCString { liveDecode(nexus_live_lsp_change(version,$0)) }
-        guard obj["ok"] as? Bool == true else { status = "LSP refresh rejected"; return }
-        liveLSPVersion += 1; liveLSPText = snap.text; liveLSPReady = false; liveLSPMessage = "Waiting for new version"
+        guard liveLSPReady, version == liveLSPVersion, liveLSPPath != nil, path == snap.path,
+              Data(source.utf8) == Data(snap.text.utf8), snap.text.utf8.count <= 8192, !snap.text.utf8.contains(0),
+              let data = try? JSONSerialization.data(withJSONObject: ["document":snap.path,"text":snap.text]), data.count <= 65536 else { status = "Snapshot or LSP version changed"; return }
+        let wire = String(decoding: data, as: UTF8.self)
+        let obj = wire.withCString { liveDecode(nexus_live_lsp_document(version,$0)) }
+        guard obj["ok"] as? Bool == true else { status = "LSP refresh rejected: incompatible language family, document limit or stale version"; return }
+        liveLSPCache.removeValue(forKey: snap.path)
+        liveLSPVersion += 1; liveLSPPath = snap.path; liveLSPText = snap.text; liveLSPReady = false; liveLSPMessage = "Waiting for new version"
     }
     var lspReviewVersion: UInt32 { liveLSPVersion }
     func finishLiveLSP() {
@@ -250,6 +261,9 @@ struct IDEView: View {
 #if NEXUS_UBUNTU_LAB && os(iOS) && !targetEnvironment(simulator)
             UbuntuLabView(model: model).tabItem { Label("Agent", systemImage: "cpu") }
             LocalToolsView(model: model).tabItem { Label("Local tools", systemImage: "terminal.fill") }
+#if NEXUS_FULL_VM
+            FullVMView(model: model).tabItem { Label("Full VM", systemImage: "server.rack") }
+#endif
 #else
             NavigationStack {
                 List {
@@ -277,9 +291,9 @@ struct IDEView: View {
             .navigationTitle(file).navigationBarTitleDisplayMode(.inline)
 #if NEXUS_UBUNTU_LAB && os(iOS) && !targetEnvironment(simulator)
             .safeAreaInset(edge: .bottom) {
-                if model.liveLSPPath == file { ScrollView { Text(verbatim: model.liveLSPMessage).font(.caption).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 100).padding(6).background(.regularMaterial) }
+                if model.liveLSPPath != nil { ScrollView { Text(verbatim: model.liveLSPMessage).font(.caption).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 100).padding(6).background(.regularMaterial) }
             }
-            .task(id: model.liveLSPPath) { while model.liveLSPPath == file && !Task.isCancelled { model.pollLiveLSP(); try? await Task.sleep(nanoseconds: 250_000_000) } }
+            .task(id: model.liveLSPPath) { while model.liveLSPPath != nil && !Task.isCancelled { model.pollLiveLSP(); try? await Task.sleep(nanoseconds: 250_000_000) } }
             .confirmationDialog("Send saved editor version to local LSP?", isPresented: $confirmLSPRefresh) {
                 Button("Send reviewed version") { if let snap = pendingLSPRefresh { model.sendLiveLSP(snap, version: pendingLSPVersion) }; pendingLSPRefresh = nil }
                 Button("Cancel", role: .cancel) { pendingLSPRefresh = nil }
@@ -288,7 +302,7 @@ struct IDEView: View {
             .toolbar {
                 Button("Save") { Task { await model.save() } }.disabled(model.path != file || model.reviewBusy)
 #if NEXUS_UBUNTU_LAB && os(iOS) && !targetEnvironment(simulator)
-                if model.liveLSPPath == file {
+                if model.liveLSPPath != nil {
                     Button("Refresh LSP") { Task { if let snap = try? await model.selectedSnapshot(), snap.path == file { pendingLSPRefresh = snap; pendingLSPVersion = model.lspReviewVersion; confirmLSPRefresh = true } else { model.status = "Save the file first" } } }.disabled(!model.liveLSPReady || model.reviewBusy)
                 }
 #endif

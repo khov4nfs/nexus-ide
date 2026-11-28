@@ -69,6 +69,23 @@ def probe():
                    for d in frame["params"]["diagnostics"]), frame
         print("Native control: actual undefined-symbol diagnostic verified", flush=True)
         send("textDocument/didClose", {"textDocument":{"uri":URI}})
+        second_uri = "file:///tmp/nexus-lsp-v2.py"
+        send("textDocument/didOpen", {"textDocument": {"uri": second_uri, "languageId": "python", "version": 1, "text": "x = second_nexus_symbol"}})
+        second = until(lambda f: f.get("method") == "textDocument/publishDiagnostics" and f["params"]["uri"] == second_uri)
+        assert any("second_nexus_symbol" in d["message"] and d["range"]["start"]=={"line":0,"character":4}
+                   for d in second["params"]["diagnostics"]), second
+        print("Native control: refreshed snapshot URI verified", flush=True)
+        send("textDocument/didClose", {"textDocument":{"uri":second_uri}})
+        completion_uri = "file:///tmp/nexus-lsp-completion.py"
+        completion_text = "class NexusCompletion:\n    nexus_value = 42\nitem = NexusCompletion()\nitem."
+        send("textDocument/didOpen", {"textDocument": {"uri": completion_uri, "languageId": "python", "version": 1, "text": completion_text}})
+        send("textDocument/completion", {"textDocument":{"uri":completion_uri},"position":{"line":3,"character":5},"context":{"triggerKind":1}}, 3)
+        items = until(lambda f: f.get("id")==3)["result"]
+        if isinstance(items, dict):
+            items = items["items"]
+        assert any(item.get("label")=="nexus_value" and item.get("insertText")=="nexus_value" for item in items)
+        print("Native control: actual Jedi completion verified", flush=True)
+        send("textDocument/didClose", {"textDocument":{"uri":completion_uri}})
         send("shutdown", id_=2)
         assert until(lambda f:f.get("id")==2)["result"] is None
         send("exit")
