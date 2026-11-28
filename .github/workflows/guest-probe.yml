@@ -32,6 +32,16 @@ on:
       - 'scripts/test-release-acceptance.py'
       - 'scripts/verify-device-acceptance.py'
       - 'scripts/test-device-acceptance.py'
+      - 'scripts/test-full-vm-distribution.py'
+      - 'scripts/verify-full-vm-distribution.py'
+      - 'App/FullVMView.swift'
+      - 'scripts/build-ios-vm.sh'
+      - 'scripts/stage-ios-vm.py'
+      - 'scripts/prepare-full-vm-image.sh'
+      - 'scripts/vm-tci-*'
+      - '.github/workflows/vm-tci-research.yml'
+      - 'docs/full-vm-distribution-review.json'
+      - 'LICENSE'
       - 'scripts/build-glibc-rootfs.sh'
       - 'scripts/prepare-ci-pylsp-rootfs.sh'
       - 'scripts/ci-pylsp-native-probe.py'
@@ -58,6 +68,9 @@ on:
       - '.github/workflows/guest-probe.yml'
 permissions:
   contents: read
+concurrency:
+  group: guest-probe-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   vm-release-review:
     if: github.event_name == 'workflow_dispatch' && inputs.full_vm
@@ -115,6 +128,7 @@ jobs:
           python3 scripts/test-package-ipa.py
           python3 scripts/test-release-acceptance.py
           python3 scripts/test-device-acceptance.py
+          python3 scripts/test-full-vm-distribution.py
       - name: Install guest build dependencies
         run: brew install meson ninja llvm lld libarchive sqlite xcodegen
       - name: Build pinned runtime and rootfs
