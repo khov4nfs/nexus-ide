@@ -33,7 +33,7 @@ printf "%s\n" \
  "deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://ports.ubuntu.com/ubuntu-ports noble-updates main universe" \
  "deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://ports.ubuntu.com/ubuntu-ports noble-security main universe" >/tmp/nexus-vm.list
 apt-get -q -o Dir::Etc::sourcelist=/tmp/nexus-vm.list -o Dir::Etc::sourceparts=- -o APT::Update::Error-Mode=any update
-apt-get -q -y --no-install-recommends -o Dir::Etc::sourcelist=/tmp/nexus-vm.list -o Dir::Etc::sourceparts=- install linux-image-generic initramfs-tools docker.io docker-compose-v2 busybox-static kmod iproute2 iptables systemd-sysv
+apt-get -q -y --no-install-recommends -o Dir::Etc::sourcelist=/tmp/nexus-vm.list -o Dir::Etc::sourceparts=- install linux-image-generic initramfs-tools docker.io docker-compose-v2 busybox-static kmod iproute2 iptables systemd-sysv curl ca-certificates
 printf "%s\n" virtio_mmio virtio_blk virtio_net ext4 >>/etc/initramfs-tools/modules
 kernel=$(ls /lib/modules | sort -V | tail -n 1)
 test -n "$kernel"
