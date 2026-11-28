@@ -29,7 +29,7 @@ CHECKS = (
     "suspend_relaunch_resources", "license_source_notices_review",
 )
 WORKBENCH = ("wkwebview_loopback", "workbench_editor_save_relaunch",
-             "workbench_real_extension_activation", "workbench_real_lsp", "workbench_real_lsp_diagnostics_completion_relaunch")
+             "workbench_real_extension_activation", "workbench_real_lsp", "workbench_real_lsp_diagnostics_completion_relaunch", "workbench_persistent_python_c_cpp_sessions")
 VERSIONS = ("agy", "codex", "claude", "claudeACP", "languageServer")
 FULL_VM = ("vm_kernel_boot_serial", "vm_disk_persistence_reboot", "vm_docker_engine_real", "vm_compose_volume_and_network", "vm_loopback_http_and_isolation", "vm_internet_dns_tls", "vm_registry_pull_arm64", "vm_clean_shutdown_resources")
 
@@ -85,7 +85,7 @@ def required(variant, full_vm=False):
     return CHECKS + (WORKBENCH if variant == "workbench" else ()) + (FULL_VM if full_vm else ())
 
 def version_fields(identity):
-    return VERSIONS + (("qemu", "linuxKernel", "dockerEngine", "dockerCompose") if identity.get("fullVMIncluded", False) else ())
+    return VERSIONS + (("clangd",) if identity["variant"] == "workbench" else ()) + (("qemu", "linuxKernel", "dockerEngine", "dockerCompose") if identity.get("fullVMIncluded", False) else ())
 
 def template(identity):
     return {
