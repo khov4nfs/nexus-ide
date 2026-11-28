@@ -25,7 +25,7 @@ class Session{
         this.pending=new Map();this.docs=new Map();this.wireDocs=new Map();
         this.buffer=Buffer.alloc(0);this.failure=null;this.child=null;this.starting=null;
         this.queue=Promise.resolve();this.queued=0;this.closing=false;this.closePromise=null;
-        this.stats={launches:0,initializes:0,opens:0,changes:0,snapshotRefreshes:0,diagnostics:0,completions:0,closes:0,shutdownClean:false,peakDocuments:0};
+        this.stats={launches:0,initializes:0,opens:0,changes:0,snapshotRefreshes:0,diagnostics:0,completions:0,closes:0,shutdownClean:false,processExited:false,peakDocuments:0};
     }
     enqueue(work){
         if(this.closing||this.failure||this.queued>=8)return Promise.reject(Error('session unavailable'));
@@ -123,7 +123,7 @@ class Session{
             this.child=this.spawnProcess(p.command,p.args,{cwd:this.root,stdio:['pipe','pipe','ignore'],
                 env:{PATH:'/usr/bin:/bin',HOME:'/root',LANG:'C.UTF-8',PYTHONFAULTHANDLER:'1'}});
             this.stats.launches++;
-            this.exited=new Promise(resolve=>this.child.once('close',(code,signal)=>resolve({code,signal})));
+            this.exited=new Promise(resolve=>this.child.once('close',(code,signal)=>{this.stats.processExited=true;resolve({code,signal});}));
             this.child.on('error',e=>this.fail(e));
             this.child.stdin.on('error',e=>this.fail(e));
             this.child.stdout.on('data',b=>this.receive(b));
