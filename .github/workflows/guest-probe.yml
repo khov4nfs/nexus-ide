@@ -662,7 +662,7 @@ jobs:
           export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-fixture.vsix" | awk '{print $1}')"
           cat "$RUNNER_TEMP/nexus-fixture.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
-          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is False' "$NEXUS_WORKBENCH_EVIDENCE"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is True and r["lspFixtureOnly"] is True' "$NEXUS_WORKBENCH_EVIDENCE"
       - name: Upload workbench loopback evidence
         if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
         uses: actions/upload-artifact@v4

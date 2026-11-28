@@ -899,9 +899,10 @@ mod tests {
         });
         let root=guest_path.join("root/nexus-workbench");
         let activated=browser_ok&&std::fs::read(root.join("nexus-extension-activated.marker")).ok().as_deref()==Some(b"activated");
-        let editor_verified=activated&&std::fs::read(root.join("nexus-editor-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join("nexus-editor-fixture.txt")).ok().as_deref()==Some(b"NEXUS_BROWSER_EDITOR_SAVED");
-        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified)),
-            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":false});
+        let editor_verified=activated&&std::fs::read(root.join("nexus-editor-saved.marker")).ok().as_deref()==Some(b"saved");
+        let lsp_verified=editor_verified&&std::fs::read(root.join("nexus-lsp-transport.marker")).ok().as_deref()==Some(b"completed")&&std::fs::read(root.join("nexus-lsp-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join("nexus-editor-fixture.txt")).ok().as_deref()==Some(b"NEXUS_BROWSER_EDITOR_SAVED\nNEXUS_LSP_COMPLETION");
+        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified&&lsp_verified)),
+            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":lsp_verified,"lspFixtureOnly":true});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         println!("{report}");
         assert_eq!(report["ok"],true);

@@ -48,7 +48,7 @@ def gates(variant):
     for phase in ("write", "read", "scroll"):
         rows[f"persist-{phase}"] = ("macOS guest persistence", {"ok": True, "verified": True, "shutdownClean": True})
     if variant == "workbench":
-        rows["workbench"] = ("macOS guest Chromium editor and synthetic VSIX activation", {"ok": True, "shutdownClean": True, "extensionInstallVerified": True, "browserRequested": True, "extensionActivationVerified": True, "editorVerified": True, "lspVerified": False})
+        rows["workbench"] = ("macOS guest Chromium editor, synthetic VSIX and synthetic stdio LSP server", {"ok": True, "shutdownClean": True, "extensionInstallVerified": True, "browserRequested": True, "extensionActivationVerified": True, "editorVerified": True, "lspVerified": True, "lspFixtureOnly": True})
     return rows
 
 def read_json(path):

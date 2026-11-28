@@ -42,6 +42,13 @@ def main():
             page.keyboard.press("Meta+S")
             # Wait for the save event and extension-host disk write; Rust checks
             # all markers and actual guest bytes after clean shutdown.
+            page.wait_for_timeout(1500)
+            page.keyboard.press("Enter")
+            page.keyboard.press("Control+Space")
+            suggestion = page.locator(".suggest-widget").get_by_text("NEXUS_LSP_COMPLETION", exact=True).first
+            suggestion.wait_for(state="visible")
+            page.keyboard.press("Enter")
+            page.keyboard.press("Meta+S")
             page.wait_for_timeout(3000)
             context.close()
             browser.close()

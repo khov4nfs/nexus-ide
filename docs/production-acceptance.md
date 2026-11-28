@@ -112,3 +112,6 @@ Explicit batch of up to 8 saved UTF-8 files, 8 KiB each/32 KiB total, relative p
 
 ## Live editor LSP candidate
 Mode 12 keeps one full-sync local language server and one virtual document open, up to ten explicitly reviewed saved versions, 180s idle timeout. Native Files editor Refresh LSP freezes exact saved text; version ticket, single pending update, didChange full text, stale diagnostic versions discarded, future/unversioned/wrong URI fail closed. UI hides results for modified editor bytes. No auto-send, no native mount, no editor callbacks or automatic writes. Snapshot completion remains separate; not a live completion implementation. Synthetic full-sync and future-version rejection fixtures. Real server compatibility and device UI pending.
+
+## Workbench LSP acceptance gate
+Optional Chromium workbench test now requires an actual extension-host child process speaking Content-Length LSP to a deterministic CI-only Node server bundled in the fixture VSIX. Browser triggers completion, accepts the returned item and saves; after guest shutdown verify server shutdown marker, extension save marker and exact final bytes. No marketplace packages or user credentials. This verifies a synthetic LSP peer end-to-end if the optional workflow passes; not a real language server or iPhone WKWebView test. Optional workflow has not yet been run.
