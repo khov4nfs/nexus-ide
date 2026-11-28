@@ -722,6 +722,10 @@ jobs:
         env:
           VARIANT: ${{ inputs.variant || 'ubuntu' }}
         run: python3 scripts/collect-release-acceptance.py --evidence "$RUNNER_TEMP" --package "$RUNNER_TEMP/nexus-integrated-ipa" --commit "$GITHUB_SHA" --variant "$VARIANT"
+      - name: Create untouched device acceptance template bound to exact IPA
+        env:
+          VARIANT: ${{ inputs.variant || 'ubuntu' }}
+        run: python3 scripts/verify-device-acceptance.py --package "$RUNNER_TEMP/nexus-integrated-ipa" --record "$RUNNER_TEMP/nexus-integrated-ipa/device-record-template.json" --initialize --expected-commit "$GITHUB_SHA" --expected-variant "$VARIANT"
       - name: Upload acceptance metadata (no IPA)
         uses: actions/upload-artifact@v4
         with:
@@ -729,6 +733,7 @@ jobs:
           path: |
             ${{ runner.temp }}/nexus-integrated-ipa/acceptance.json
             ${{ runner.temp }}/nexus-integrated-ipa/build.json
+            ${{ runner.temp }}/nexus-integrated-ipa/device-record-template.json
           if-no-files-found: error
       - name: Upload integrated unsigned IPA only after owner license review
         if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.license_reviewed
@@ -747,15 +752,23 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: NexusIDE-integrated-unsigned
           path: release
+      - name: Reverify downloaded IPA, CI scope and untouched device template
+        env:
+          VARIANT: ${{ inputs.variant }}
+        run: python3 scripts/verify-device-acceptance.py --package release --record release/device-record-template.json --verify-release-template --expected-commit "$GITHUB_SHA" --expected-variant "$VARIANT"
       - name: Publish reviewed test candidate (not production)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd release
           sha256sum -c SHA256SUMS
-          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json acceptance.json
+          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json acceptance.json device-record-template.json
 

@@ -26,9 +26,29 @@ class TestDeviceAcceptance(unittest.TestCase):
             (pkg / "acceptance.json").write_text(json.dumps(d.ci.collect(root,pkg,commit,"ubuntu")))
             ident = d.package_identity(pkg)
             record = d.template(ident)
+            d.verify_release_template(ident, record)
+            self.assertEqual(d.package_identity(pkg, commit, "ubuntu"), ident)
+            with self.assertRaises(ValueError):
+                d.package_identity(pkg, "b" * 40, "ubuntu")
+            with self.assertRaises(ValueError):
+                d.package_identity(pkg, commit, "workbench")
+            bad = d.template(ident)
+            bad["checks"]["agy_google_auth_real"]["passed"] = 0
+            with self.assertRaises(ValueError):
+                d.verify_release_template(ident, bad)
+            manifest = pkg / "acceptance.json"
+            original = manifest.read_bytes()
+            tampered = json.loads(original)
+            tampered["checks"][0]["scope"] = "physical device"
+            manifest.write_text(json.dumps(tampered))
+            with self.assertRaises(ValueError):
+                d.package_identity(pkg)
+            manifest.write_bytes(original)
             with self.assertRaises(ValueError):
                 d.validate(ident,record,root)
             record["operatorAcknowledgesManualReview"] = True
+            with self.assertRaises(ValueError):
+                d.verify_release_template(ident, record)
             record["device"] = {"model":"iPhone 16 Pro","os":"27.2.1","installation":"SideStore","testedDate":"2026-11-28"}
             record["versions"] = {key:"test-only" for key in d.VERSIONS}
             pending = d.validate(ident,record,root)
