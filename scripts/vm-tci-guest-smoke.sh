@@ -145,7 +145,7 @@ services:
     ports: ["8080:8080"]
   client:
     image: nexus-vm-smoke:local
-    command: ["/bin/busybox", "sh", "-c", "for i in $\(/bin/busybox seq 1 60); do /bin/busybox wget -qO- http://web:8080/cgi-bin/probe && exit 0; /bin/busybox sleep 1; done; exit 1"]
+    command: ["/bin/busybox", "sh", "-c", "for i in $$(/bin/busybox seq 1 60); do /bin/busybox wget -qO- http://web:8080/cgi-bin/probe && exit 0; /bin/busybox sleep 1; done; exit 1"]
 YAML
     docker compose -p nexus-network up -d --no-build --pull never
     client=$(docker compose -p nexus-network ps -a -q client)
