@@ -182,7 +182,7 @@ private enum VMEngine {
         }
         return (pair[0], pair[1])
     }
-    static func args(root: URL, firmware: URL, ram: Int, network: Bool, serial: Int32, monitor: Int32) throws -> [String] {
+    static func args(root: URL, firmware: URL, ram: Int, network: Bool, smoke: Bool, serial: Int32, monitor: Int32) throws -> [String] {
         let file: [String: Any] = ["driver": "file", "filename": VMStore.file(root, .disk).path, "node-name": "rootfile"]
         let raw: [String: Any] = ["driver": "raw", "file": "rootfile", "node-name": "rootdisk"]
         func encode(_ value: [String: Any]) throws -> String {
@@ -193,7 +193,7 @@ private enum VMEngine {
                 "-accel", "tcg,thread=single", "-smp", "1", "-m", String(ram),
                 "-nodefaults", "-no-user-config", "-display", "none", "-no-reboot",
                 "-kernel", VMStore.file(root, .kernel).path, "-initrd", VMStore.file(root, .initrd).path,
-                "-append", "root=/dev/vda rw rootwait console=ttyAMA0",
+                "-append", "root=/dev/vda rw rootwait console=ttyAMA0" + (smoke ? " init=/usr/local/sbin/nexus-vm-smoke" + (network ? " nexus.net=1" : "") : ""),
                 "-blockdev", try encode(file), "-blockdev", try encode(raw),
                 "-device", "virtio-blk-device,drive=rootdisk",
                 "-chardev", "socket,id=serial0,fd=\(serial)", "-serial", "chardev:serial0",
@@ -257,7 +257,7 @@ private enum VMEngine {
         do { try VMStore.reset(); status = "Private VM assets removed."; refresh() }
         catch { status = "Reset failed." }
     }
-    func start(ram: Int, network: Bool, claim: () -> Bool) {
+    func start(ram: Int, network: Bool, smoke: Bool, claim: () -> Bool) {
         guard !busy, !active, !consumed, ready, let root, [512, 768, 1024].contains(ram),
               let firmware = Bundle.main.resourceURL?.appendingPathComponent("FullVMFirmware"),
               FileManager.default.fileExists(atPath: firmware.path),
@@ -279,7 +279,7 @@ private enum VMEngine {
             do {
                 let s = try VMEngine.socketPair(); serialPair = s
                 let m = try VMEngine.socketPair(); monitorPair = m
-                let args = try VMEngine.args(root: root, firmware: firmware, ram: ram, network: network, serial: s.1, monitor: m.1)
+                let args = try VMEngine.args(root: root, firmware: firmware, ram: ram, network: network, smoke: smoke, serial: s.1, monitor: m.1)
                 try Data("dirty\n".utf8).write(to: VMStore.dirty(root), options: .atomic)
                 serial = s.0; monitor = m.0
                 active = true; busy = false; ready = false
@@ -375,6 +375,21 @@ private enum VMEngine {
               text.utf8.count <= 1024, !text.utf8.contains(0) else { return false }
         return writeSocket(serial, Data((text + "\r").utf8))
     }
+    func probeForward(_ url: URL) {
+        guard active, monitorReady, console.contains("NEXUS_VM_FORWARD_READY"), url.absoluteString == "http://127.0.0.1:18766/cgi-bin/probe" else { return }
+        Task {
+            do {
+                let config = URLSessionConfiguration.ephemeral
+                config.timeoutIntervalForRequest = 5
+                let session = URLSession(configuration: config)
+                defer { session.finishTasksAndInvalidate() }
+                let (data, response) = try await session.data(from: url)
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                      data == Data("NEXUS_VM_HTTP_42\n".utf8) else { status = "Unexpected forwarded HTTP response."; return }
+                if active { status = "Actual local container HTTP response verified; wait for guest shutdown." }
+            } catch { if active { status = "Local HTTP probe failed."; } }
+        }
+    }
     func interrupt() { if active && monitorReady && !forced && !powerRequested { _ = writeSocket(serial, Data([3])) } }
     func powerdown() {
         guard active, !powerRequested else { return }
@@ -422,6 +437,7 @@ private enum VMEngine {
     @State private var confirmForce = false
     @State private var ram = 768
     @State private var network = false
+    @State private var smoke = false
     @State private var command = ""
     var body: some View {
         NavigationStack {
@@ -450,11 +466,17 @@ private enum VMEngine {
                     Toggle("Restricted guest network and local HTTP forwarding", isOn: $network)
                         .disabled(vm.busy || model.guestClaimed)
                     Text("Optional: isolated SLIRP, no internet or LAN egress; host 127.0.0.1:18766 forwards to guest 10.0.2.15:8080. Other apps may reach the local port. Only expose trusted, non-sensitive services.").font(.caption)
+                    Toggle("Run prepared image acceptance on boot", isOn: $smoke)
+                        .disabled(vm.busy || model.guestClaimed)
+                    Text("For the Nexus acceptance image only. Runs real Docker/Compose checks and powers off. With networking enabled, open the local HTTP test after the forward-ready marker.").font(.caption)
                     Button("Boot reviewed VM") { confirmStart = true }
                         .disabled(!vm.ready || vm.busy || model.guestClaimed)
                     if vm.busy { ProgressView() }
                 }
                 Section("Serial console") {
+                    if network && smoke && vm.active, let url = URL(string: "http://127.0.0.1:18766/cgi-bin/probe") {
+                        Button("Verify local container HTTP") { vm.probeForward(url) }
+                    }
                     ScrollView {
                         Text(verbatim: vm.console.isEmpty ? "No guest output." : vm.console)
                             .font(.system(.caption, design: .monospaced))
@@ -482,7 +504,7 @@ private enum VMEngine {
             if case .success(let url) = result { vm.importFile(url, kind: frozenKind, digest: frozenDigest) }
         }
         .confirmationDialog("Boot trusted Linux image on this device?", isPresented: $confirmStart, titleVisibility: .visible) {
-            Button(network ? "Boot with restricted local network" : "Boot offline interpreter VM") { vm.start(ram: ram, network: network) { model.claimGuest() } }
+            Button(network ? "Boot with restricted local network" : "Boot offline interpreter VM") { vm.start(ram: ram, network: network, smoke: smoke) { model.claimGuest() } }
         }
         .confirmationDialog("Delete all private VM boot assets and disk?", isPresented: $confirmReset, titleVisibility: .visible) {
             Button("Delete VM files", role: .destructive) { vm.reset() }
