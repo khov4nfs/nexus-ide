@@ -447,7 +447,7 @@ impl PromptEvidence {
     }
 }
 
-fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, google: bool, commands: Receiver<Command>, ready: Reply) {
+fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, google: bool, saved_google: bool, commands: Receiver<Command>, ready: Reply) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt, Err(_) => { let _ = ready.send(failure("Runtime creation failed")); return; }
     };
@@ -500,6 +500,9 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
         let _ = rt.block_on(guest.shutdown());
         let _ = ready.send(failure("Gemini provider preparation failed")); return;
     }
+    // Retained Google guests still require the official login exchange on every boot.
+    // Only the freshly submitted authorization code is available for literal filtering.
+    let load_allowed=keyed||(google&&saved_google);
     let hook_env = env.clone();
     let mut agent_env = env;
     if let Some(key) = key { agent_env.insert("GEMINI_API_KEY".into(), key); }
@@ -574,7 +577,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
     // If the caller disappears, a bounded idle wait closes the process.
     WORKER_ACTIVE.store(true,Ordering::Release);
     let _active_guard = ActiveGuard;
-    if ready.send(json!({"ok":true,"active":true,"response":response,"supportsLoad":supports_load&&keyed&&!google,"credentialMode":if google {"google-terminal-login"} else if keyed {"gemini-api-key"} else {"none"}})).is_err() {
+    if ready.send(json!({"ok":true,"active":true,"response":response,"supportsLoad":supports_load&&load_allowed,"credentialMode":if google {"google-terminal-login"} else if keyed {"gemini-api-key"} else {"none"}})).is_err() {
         let _ = rt.block_on(exchange.close());
         let _ = rt.block_on(guest.shutdown());
         return;
@@ -606,7 +609,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                         }
                         session_id = frame["result"]["sessionId"].as_str().map(str::to_owned);
                         mcp_configured=mcp.is_some();
-                        let handle=session_id.as_deref().filter(|s|supports_load&&keyed&&!google&&!mcp_configured&&valid_session_handle(s)&&credential_filter.as_deref().is_some_and(|k|!s.contains(k)));
+                        let handle=session_id.as_deref().filter(|s|supports_load&&load_allowed&&!mcp_configured&&valid_session_handle(s)&&credential_filter.as_deref().is_some_and(|k|!s.contains(k)));
                         if reply.send(json!({"ok":true,"active":true,"sessionCreated":true,"responseId":2,"mcpConfigured":mcp_configured,"sessionHandle":handle})).is_err() {
                             break None;
                         }
@@ -618,7 +621,7 @@ fn worker(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, goog
                 }
             }
             Ok(Command::Load(handle,reply))=>{
-                if session_id.is_some()||!supports_load||!keyed||google||!valid_session_handle(&handle)||
+                if session_id.is_some()||!supports_load||!load_allowed||!valid_session_handle(&handle)||
                     credential_filter.as_deref().is_none_or(|k|handle.contains(k)){
                     let _=reply.send(json!({"ok":false,"active":true,"error":"Session load unavailable or invalid"}));continue;
                 }
@@ -896,6 +899,10 @@ pub(crate) async fn local_adapter_session(guest:&IshInstance,env:&HashMap<String
 }
 
 fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, google: bool) -> Value {
+    start_with_retention(path,mode,request,key,google,false)
+}
+fn start_with_retention(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, google: bool,saved_google:bool) -> Value {
+    if saved_google&&!google{return failure("Saved Google mode requires official login");}
     if google && key.is_some() { return failure("Choose one authentication method"); }
     if key.as_deref().is_some_and(|s| !valid_key(s)) { return failure("Invalid credential shape"); }
     if !process_probe::valid_initialize_request(&request) && !process_probe::snapshot_initialize_request(&request) && !process_probe::edit_initialize_request(&request) && !process_probe::terminal_initialize_request(&request) {
@@ -914,7 +921,7 @@ fn start(path: PathBuf, mode: Mode, request: Vec<u8>, key: Option<String>, googl
     let (tx, rx) = mpsc::sync_channel(1);
     let (reply, wait) = mpsc::sync_channel(1);
     if thread::Builder::new().name("nexus-acp-owner".into())
-        .spawn(move || worker(path, mode, request, key, google, rx, reply)).is_err() {
+        .spawn(move || worker(path, mode, request, key, google, saved_google, rx, reply)).is_err() {
         return failure("Worker creation failed");
     }
     match wait.recv_timeout(REPLY) {
@@ -985,6 +992,16 @@ pub unsafe extern "C" fn nexus_acp_start_gemini(path: *const c_char, digest: *co
 pub unsafe extern "C" fn nexus_acp_start_google(path:*const c_char,digest:*const c_char,request:*const c_char)->*mut c_char {
     ffi_result(||match (read_arg(path),read_arg(digest),read_arg(request)) {
         (Some(p),Some(sha),Some(req))=>start(PathBuf::from(p),Mode::Agy(sha),req.into_bytes(),None,true),
+        _=>failure("Missing connection arguments"),
+    })
+}
+/// # Safety
+/// All pointers must reference NUL-terminated UTF-8; caller must explicitly
+/// approve retention in a distinct clean, digest-scoped Google guest.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_acp_start_google_saved(path:*const c_char,digest:*const c_char,request:*const c_char)->*mut c_char {
+    ffi_result(||match (read_arg(path),read_arg(digest),read_arg(request)) {
+        (Some(p),Some(sha),Some(req))=>start_with_retention(PathBuf::from(p),Mode::Agy(sha),req.into_bytes(),None,true,true),
         _=>failure("Missing connection arguments"),
     })
 }
@@ -1209,6 +1226,38 @@ mod tests {
     }
     #[test]
     #[ignore = "requires two sequential fresh processes using same fakefs"]
+    fn real_saved_google_resume_transport(){
+        let path=std::env::var_os("NEXUS_ACP_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_ACP_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_ACP_RESUME_PHASE").expect("phase");
+        let saved=phase!="disposable";
+        let worker=thread::spawn(move||start_with_retention(PathBuf::from(path),Mode::Fixture,process_probe::AGY_INITIALIZE_REQUEST.to_vec(),None,true,saved));
+        let until=std::time::Instant::now()+Duration::from_secs(15);
+        let offered=loop{
+            if login_progress()["url"].as_str().is_some_and(|s|s.starts_with("https://accounts.google.com/o/oauth2/")){break true;}
+            if worker.is_finished()||std::time::Instant::now()>=until{break false;}
+            thread::sleep(Duration::from_millis(20));
+        };
+        let submitted=submit_login_code("NEXUS_FIXTURE_AUTH_CODE".into());
+        if !offered||submitted["ok"]!=true{let _=cancel_login();}
+        let init=worker.join().expect("worker");
+        assert_eq!(init["ok"],true,"fixture initialization");
+        assert_eq!(init["supportsLoad"],saved);
+        let r=if phase=="create"{command(Action::New(NEW_REQUEST.to_vec()))}else{command(Action::Load("fixture-resume".into()))};
+        let no_replay=prompt_progress()["text"]=="";
+        let prompt=if saved{command(Action::Chat("Continue fixture".into()))}else{json!({})};
+        let close=command(Action::Close);
+        let verified=offered&&submitted["ok"]==true&&no_replay&&close["ok"]==true&&close["shutdownClean"]==true&&close["transportClosed"]==true&&match phase.as_str(){
+            "create"|"resume"=>r["sessionHandle"]=="fixture-resume"&&prompt["chatCompleted"]==true&&(phase=="create"||(r["sessionLoaded"]==true&&r["replayUpdates"]==1)),
+            "disposable"=>r["ok"]==false&&r["active"]==true,
+            _=>false,
+        };
+        let report=json!({"ok":verified,"fixtureOnly":true,"phase":phase,"shutdownClean":close["shutdownClean"],"freshLogin":offered&&submitted["ok"]==true,"replayWithheld":no_replay});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(verified,"saved Google fixture failed: {phase}");
+    }
+    #[test]
+    #[ignore = "requires independent boot of same Ubuntu guest"]
     fn real_acp_resume_transport(){
         let path=std::env::var_os("NEXUS_ACP_ROOTFS").expect("rootfs");
         let evidence=std::env::var_os("NEXUS_ACP_EVIDENCE").expect("evidence");

@@ -20,6 +20,7 @@ CHECKS = (
     "signed_install_launch", "native_save_relaunch", "ubuntu_pty_shutdown",
     "persistent_guest_relaunch", "mcp_stdio_manual_call",
     "agy_reviewed_import", "agy_google_auth_real", "agy_google_inference_real",
+    "agy_google_saved_guest_fresh_login_resume_reset",
     "agy_gemini_auth_real", "agy_gemini_inference_real", "agy_cancel_and_reviewed_edit",
     "agy_session_resume_and_hooks", "codex_cli_auth_real", "codex_native_multiturn_resume",
     "claude_cli_auth_real", "claude_native_multiturn_resume",
@@ -37,12 +38,16 @@ def sha_file(path):
     with path.open("rb") as f:
         return hashlib.file_digest(f, "sha256").hexdigest()
 
-def package_identity(package):
+def package_identity(package, expected_commit=None, expected_variant=None):
     build, build_sha = ci.read_json(package / "build.json")
     report, report_sha = ci.read_json(package / "acceptance.json")
     commit, variant = build.get("commit"), build.get("variant")
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit) or variant not in ("ubuntu", "workbench"):
         raise ValueError("Invalid package identity")
+    if (expected_commit is not None and commit != expected_commit) or (expected_variant is not None and variant != expected_variant):
+        raise ValueError("Package is not the expected source revision or variant")
+    if build.get("physicalDeviceVerified") is not False or type(report.get("schemaVersion")) is not int or report["schemaVersion"] != 1:
+        raise ValueError("Unexpected build or CI scope")
     name = f"NexusIDE-{variant}-{commit[:12]}-unsigned.ipa"
     if build.get("file") != name or report.get("ipa") != name:
         raise ValueError("IPA name mismatch")
@@ -52,15 +57,15 @@ def package_identity(package):
         raise ValueError("IPA hash or size mismatch")
     if report.get("commit") != commit or report.get("variant") != variant or report.get("buildJsonSha256") != build_sha or report.get("ciAcceptancePassed") is not True:
         raise ValueError("CI manifest identity mismatch")
-    expected = {"nexus-" + key + ".json" for key in ci.gates(variant)}
+    expected = {"nexus-" + key + ".json": scope for key, (scope, _) in ci.gates(variant).items()}
     rows = report.get("checks")
     if not isinstance(rows, list) or len(rows) != len(expected) or any(
-        not isinstance(row, dict) or row.get("passed") is not True or
+        not isinstance(row, dict) or not isinstance(row.get("file"), str) or row.get("scope") != expected.get(row["file"]) or row.get("passed") is not True or
         not isinstance(row.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"])
         for row in rows
-    ) or {row.get("file") for row in rows} != expected:
+    ) or {row.get("file") for row in rows} != set(expected):
         raise ValueError("Incomplete CI manifest")
-    if any(report.get(k) is not False for k in ("physicalDeviceVerified", "realProviderAuthVerified", "realProviderInferenceVerified", "productionReady")):
+    if any(report.get(k) is not False for k in ("physicalDeviceVerified", "realProviderAuthVerified", "realProviderInferenceVerified", "productionReady", "dockerEngineVerified", "composeVerified", "fullSystemVMVerified")):
         raise ValueError("Unexpected CI scope")
     return {"commit": commit, "variant": variant, "ipaSha256": sha, "ciManifestSha256": report_sha}
 
@@ -75,6 +80,13 @@ def template(identity):
         "versions": {k: "" for k in VERSIONS},
         "checks": {k: {"passed": False, "evidenceSha256": ""} for k in required(identity["variant"])},
     }
+
+def verify_release_template(identity, record):
+    # Exact pristine template only: never ship an operator-completed record.
+    expected = template(identity)
+    if json.dumps(record, sort_keys=True) != json.dumps(expected, sort_keys=True):
+        raise ValueError("Release device record is not an untouched template")
+
 
 def validate(identity, record, evidence_dir):
     if set(record) != {"schemaVersion", "package", "operatorAcknowledgesManualReview", "device", "versions", "checks"} or type(record["schemaVersion"]) is not int or record["schemaVersion"] != 1 or record["package"] != identity:
@@ -127,15 +139,35 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--record", type=Path, required=True)
-    parser.add_argument("--initialize", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--initialize", action="store_true")
+    mode.add_argument("--verify-release-template", action="store_true")
+    parser.add_argument("--expected-commit")
+    parser.add_argument("--expected-variant", choices=("ubuntu", "workbench"))
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    identity = package_identity(args.package)
+    identity = package_identity(args.package, args.expected_commit, args.expected_variant)
     if args.initialize:
         with args.record.open("x") as f:
             json.dump(template(identity), f, indent=2, sort_keys=True)
             f.write("\n")
+    elif args.verify_release_template:
+        if args.expected_commit is None or args.expected_variant is None:
+            parser.error("Release verification requires expected commit and variant")
+        record, _ = ci.read_json(args.record)
+        verify_release_template(identity, record)
+        # Re-run the structural ZIP/Mach-O verifier on the downloaded archive,
+        # without signing or extracting any user files.
+        package_spec = importlib.util.spec_from_file_location("package_ipa", Path(__file__).with_name("package-ipa.py"))
+        package_ipa = importlib.util.module_from_spec(package_spec)
+        package_spec.loader.exec_module(package_ipa)
+        name = f"NexusIDE-{identity['variant']}-{identity['commit'][:12]}-unsigned.ipa"
+        facts = package_ipa.verify(args.package / name, identity["variant"])
+        build, _ = ci.read_json(args.package / "build.json")
+        if any(not ci.equal(build.get(key), value) for key, value in facts.items()):
+            raise ValueError("Downloaded IPA structure differs from build metadata")
+        print("Verified exact release candidate and untouched device acceptance template")
     else:
         if args.evidence is None or args.output is None:
             parser.error("--evidence and --output required")

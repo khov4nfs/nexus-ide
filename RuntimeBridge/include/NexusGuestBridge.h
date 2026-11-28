@@ -21,6 +21,7 @@ char *nexus_acp_start(const char *rootfs_data_path, const char *expected_agy_sha
 char *nexus_acp_start_gemini(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request, const char *key);
 // Google terminal auth: one worker owns the login and subsequent ACP process.
 char *nexus_acp_start_google(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request);
+char *nexus_acp_start_google_saved(const char *rootfs_data_path, const char *expected_agy_sha256, const char *initialize_request);
 char *nexus_google_login_progress(void);
 char *nexus_google_login_code(const char *code);
 char *nexus_google_login_cancel(void);

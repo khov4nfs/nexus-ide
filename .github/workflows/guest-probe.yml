@@ -398,6 +398,30 @@ jobs:
           name: acp-resume-fixture-evidence
           path: ${{ runner.temp }}/nexus-acp-resume-*.json
           if-no-files-found: error
+      - name: Verify saved Google AGY session load after fresh synthetic login
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-google-resume"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-google-disposable"
+          for phase in create resume disposable; do
+            if [ "$phase" = disposable ]; then
+              export NEXUS_ACP_ROOTFS="$RUNNER_TEMP/nexus-google-disposable/data"
+            else
+              export NEXUS_ACP_ROOTFS="$RUNNER_TEMP/nexus-google-resume/data"
+            fi
+            export NEXUS_ACP_RESUME_PHASE="$phase"
+            export NEXUS_ACP_EVIDENCE="$RUNNER_TEMP/nexus-google-resume-$phase.json"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_saved_google_resume_transport -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","shutdownClean","freshLogin","replayWithheld"])' "$NEXUS_ACP_EVIDENCE"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: google-resume-fixture-evidence
+          path: ${{ runner.temp }}/nexus-google-resume-*.json
+          if-no-files-found: error
       - name: Verify Codex app-server JSONL handshake (synthetic peer)
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
@@ -698,6 +722,10 @@ jobs:
         env:
           VARIANT: ${{ inputs.variant || 'ubuntu' }}
         run: python3 scripts/collect-release-acceptance.py --evidence "$RUNNER_TEMP" --package "$RUNNER_TEMP/nexus-integrated-ipa" --commit "$GITHUB_SHA" --variant "$VARIANT"
+      - name: Create untouched device acceptance template bound to exact IPA
+        env:
+          VARIANT: ${{ inputs.variant || 'ubuntu' }}
+        run: python3 scripts/verify-device-acceptance.py --package "$RUNNER_TEMP/nexus-integrated-ipa" --record "$RUNNER_TEMP/nexus-integrated-ipa/device-record-template.json" --initialize --expected-commit "$GITHUB_SHA" --expected-variant "$VARIANT"
       - name: Upload acceptance metadata (no IPA)
         uses: actions/upload-artifact@v4
         with:
@@ -705,6 +733,7 @@ jobs:
           path: |
             ${{ runner.temp }}/nexus-integrated-ipa/acceptance.json
             ${{ runner.temp }}/nexus-integrated-ipa/build.json
+            ${{ runner.temp }}/nexus-integrated-ipa/device-record-template.json
           if-no-files-found: error
       - name: Upload integrated unsigned IPA only after owner license review
         if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.license_reviewed
@@ -723,15 +752,23 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: NexusIDE-integrated-unsigned
           path: release
+      - name: Reverify downloaded IPA, CI scope and untouched device template
+        env:
+          VARIANT: ${{ inputs.variant }}
+        run: python3 scripts/verify-device-acceptance.py --package release --record release/device-record-template.json --verify-release-template --expected-commit "$GITHUB_SHA" --expected-variant "$VARIANT"
       - name: Publish reviewed test candidate (not production)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd release
           sha256sum -c SHA256SUMS
-          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json acceptance.json
+          gh release create "ios-integrated-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Nexus IDE integrated iPhone test" --notes "Unsigned ARM64 device test candidate. Owner confirmed license review and responsibility for corresponding source and notices. No proprietary AGY bundled. Re-sign using your own legitimate installer. Physical iPhone, workbench runtime and production readiness unverified." *.ipa SHA256SUMS build.json acceptance.json device-record-template.json
 

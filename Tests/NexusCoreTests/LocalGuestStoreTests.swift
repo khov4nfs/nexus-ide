@@ -25,3 +25,23 @@ final class LocalGuestStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: store.directory.path))
     }
 }
+
+extension LocalGuestStoreTests {
+    func testAgentAuthStoresSeparateAndResetScoped() throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let digest=String(repeating:"a",count:64)
+        let gemini=try LocalGuestStore.agentDirectoryName(digest:digest,google:false)
+        let google=try LocalGuestStore.agentDirectoryName(digest:digest,google:true)
+        XCTAssertEqual(gemini,"guest-"+digest)
+        XCTAssertEqual(google,"google-guest-"+digest)
+        XCTAssertThrowsError(try LocalGuestStore.agentDirectoryName(digest:"../bad",google:true))
+        let first=LocalGuestStore(directory:root.appendingPathComponent(gemini))
+        let second=LocalGuestStore(directory:root.appendingPathComponent(google))
+        try FileManager.default.createDirectory(at:first.directory,withIntermediateDirectories:true)
+        try FileManager.default.createDirectory(at:second.directory,withIntermediateDirectories:true)
+        try second.reset()
+        XCTAssertTrue(FileManager.default.fileExists(atPath:first.directory.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath:second.directory.path))
+    }
+}
