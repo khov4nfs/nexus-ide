@@ -147,6 +147,10 @@ async function captureBaselines(){
 function sameBaseline(uri,base){
     try{const now=currentBaseline(uri);return now.version===base.version&&now.text===base.text&&now.disk===base.disk;}catch(_){return false;}
 }
+async function sameProject(baselines){
+    const now=await captureBaselines();
+    return now.size===baselines.size&&[...baselines].every(([uri,base])=>{const current=now.get(uri);return current&&current.version===base.version&&current.text===base.text&&current.disk===base.disk;});
+}
 function sameOpen(snap){const doc=currentOpen(snap.uri);return !!doc&&doc.version===snap.version&&doc.getText()===snap.text;}
 async function projectRPC(doc,method,params,token){
     if(!supported(doc)||fixture(doc))throw Error('project operation unavailable');
@@ -200,7 +204,7 @@ async function reviewProjectEdit(editor,operation){
         }
         for(const [uri,base] of baselines)base.wireVersion=server.docs.get(uri)?.wireVersion??null;
         const rows=plan(response,baselines,ROOT);
-        if(!rows.every(r=>sameBaseline(r.uri,r.base)))throw Error('project files changed');
+        if(!await sameProject(baselines))throw Error('project files changed');
         // Full before/after content is shown in a read-only virtual editor.
         // No raw source is logged and no server command is executed.
         previewText=rows.map(r=>'FILE: '+checkedPath(r.uri,ROOT).slice(ROOT.length+1)+'\n--- BEFORE ---\n'+r.base.text+'\n--- AFTER ---\n'+r.replacement).join('\n\n');
@@ -209,7 +213,7 @@ async function reviewProjectEdit(editor,operation){
         await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(preview),{preview:true});
         const choice=await vscode.window.showWarningMessage('Apply reviewed text edits to '+rows.length+' file(s)? No automatic save.',{modal:true},'Apply reviewed edits');
         if(choice!=='Apply reviewed edits')return;
-        if(stopping||!vscode.workspace.isTrusted||!rows.every(r=>sameBaseline(r.uri,r.base)))throw Error('workspace changed during review');
+        if(stopping||!vscode.workspace.isTrusted||!await sameProject(baselines)||!rows.every(r=>sameBaseline(r.uri,r.base)))throw Error('workspace changed during review');
         const edit=new vscode.WorkspaceEdit();
         for(const r of rows){
             for(const e of r.rows){
@@ -379,7 +383,7 @@ exports.activate=function(context){
         const choice=await vscode.window.showWarningMessage('Enable clangd background project indexing? It uses guest CPU, RAM and disk. Only reviewed workspace/build database. Project configuration and clang-tidy remain disabled.',{modal:true},'Enable indexing');
         if(choice!=='Enable indexing')return;
         if(!await stopAll(false))return;
-        sessions.clear();accepted.clear();completed.clear();projectIndex=true;stopping=false;
+        sessions.clear();accepted.clear();completed.clear();projectAcceptance=false;projectIndex=true;stopping=false;
     }));
     async function openFixture(f){
         if(!vscode.workspace.isTrusted||stopping)return;
