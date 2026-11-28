@@ -29,10 +29,13 @@ apt-get -q -o Dir::Etc::sourcelist=/tmp/nexus-pylsp.list -o Dir::Etc::sourcepart
 apt-get -q -y --no-install-recommends -o Dir::Etc::sourcelist=/tmp/nexus-pylsp.list -o Dir::Etc::sourceparts=- install python3-pylsp=1.10.0-1 python3-pyflakes
 test "$(dpkg-query -W -f="\${Version}" python3-pylsp)" = 1.10.0-1
 /usr/bin/python3 -c "import pylsp, pyflakes; from importlib.metadata import version; assert version(\"python-lsp-server\") == \"1.10.0\""
+/usr/bin/python3 /tmp/nexus-pylsp-native-probe.py
+rm -f /tmp/nexus-pylsp-native-probe.py
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 rm -f /tmp/nexus-pylsp.list
 ')
+docker cp "$(dirname "$0")/ci-pylsp-native-probe.py" "$cid:/tmp/nexus-pylsp-native-probe.py"
 docker start -a "$cid"
 test "$(docker inspect --format '{{.State.ExitCode}}' "$cid")" = 0
 docker export "$cid" | gzip -n > "$out/pylsp-rootfs.tar.gz"

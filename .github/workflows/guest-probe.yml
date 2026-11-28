@@ -30,6 +30,7 @@ on:
       - 'scripts/test-device-acceptance.py'
       - 'scripts/build-glibc-rootfs.sh'
       - 'scripts/prepare-ci-pylsp-rootfs.sh'
+      - 'scripts/ci-pylsp-native-probe.py'
       - 'scripts/verify-glibc-evidence.py'
       - 'scripts/verify-acp-transport.py'
       - 'Sources/NexusCore/**'
@@ -649,6 +650,7 @@ jobs:
           Vendor/litter-ish/build/host-fakefsify/tools/fakefsify "$RUNNER_TEMP/nexus-pylsp-stage/pylsp-rootfs.tar.gz" "$RUNNER_TEMP/nexus-real-pylsp-fs"
           export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-real-pylsp-fs/data"
           export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-real-pylsp.json"
+          export NEXUS_PYLSP_TRACE=1
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_pylsp_snapshot -- --ignored --nocapture --test-threads=1
           python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","diagnosticVerified","transportClosed","shutdownClean"]) and r["fixtureOnly"] is False and r["physicalDeviceVerified"] is False and r["packageVersion"] == "1.10.0-1"' "$NEXUS_LOCAL_EVIDENCE"
       - uses: actions/upload-artifact@v4

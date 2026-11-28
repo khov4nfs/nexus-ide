@@ -785,11 +785,11 @@ mod tests {
         let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
         let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
-        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into())]);
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into()),("PYTHONFAULTHANDLER".into(),"1".into())]);
         {let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=8;}
         let version=rt.block_on(process_probe::verify_pylsp_for_ci(&guest,&env));
         let r=if version.is_ok(){
-            let input=parse_lsp(&json!({"argv":["/usr/bin/pylsp"],"language":"python","extension":"py","text":"x = missing_nexus_symbol"}).to_string()).unwrap();
+            let input=parse_lsp(&json!({"argv":["/usr/bin/python3","-u","-m","pylsp","-v"],"language":"python","extension":"py","text":"x = missing_nexus_symbol"}).to_string()).unwrap();
             rt.block_on(process_probe::lsp_diagnostics(&guest,&env,&input,false))
         }else{json!({"ok":false,"error":"Prepared pinned server verification failed"})};
         let clean=rt.block_on(guest.shutdown()).is_ok();

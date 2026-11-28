@@ -1263,6 +1263,11 @@ async fn lsp_next(session:&IshSession,capture:&mut Capture,deadline:Instant)->Re
         if crate::local_jobs::stop_requested()||Instant::now()>=deadline{return Err("LSP cancelled or timed out".into());}
         if let Some(f)=lsp_frame(&mut capture.stdout)?{return Ok(f);}
         if capture.exited||capture.closed||!capture.pty.is_empty(){return Err("LSP process stopped".into());}
+        // Only CI's fixed synthetic document may produce server trace output.
+        #[cfg(test)]
+        if std::env::var_os("NEXUS_PYLSP_TRACE").is_some()&&!capture.stderr.is_empty(){
+            eprintln!("pylsp stderr: {}",String::from_utf8_lossy(&capture.stderr));
+        }
         capture.stderr.clear();
         capture.poll(session,deadline).await?;
     }
@@ -1446,14 +1451,25 @@ pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,Strin
     opts.pipe_stdin=true;
     let Ok(session)=guest.spawn(opts)else{return json!({"ok":false,"error":"LSP spawn failed"});};
     let mut capture=Capture::default();
-    let deadline=Instant::now()+Duration::from_secs(45);
+    // Keep the production deadline bounded; allow extra cold-start time only
+    // for the real-server integration test running under the interpreter.
+    #[cfg(test)]
+    let seconds=if std::env::var_os("NEXUS_PYLSP_TRACE").is_some(){120}else{45};
+    #[cfg(not(test))]
+    let seconds=45;
+    let deadline=Instant::now()+Duration::from_secs(seconds);
+    let mut stage="initialize";
     let result:Result<Value,String>=async{
-        lsp_send(&session,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"workspaceFolders":null,"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"versionSupport":true},"completion":{"completionItem":{"snippetSupport":false}}}},"clientInfo":{"name":"nexus-ios","version":"0.7.0"}}}),deadline).await?;
+        lsp_send(&session,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":"file:///tmp","workspaceFolders":null,"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"versionSupport":true},"completion":{"completionItem":{"snippetSupport":false}}}},"clientInfo":{"name":"nexus-ios","version":"0.8.0"}}}),deadline).await?;
         let init=lsp_reply(&session,&mut capture,1,deadline).await?;
         let caps=init["capabilities"].as_object().ok_or("Missing LSP capabilities")?;
         if caps.get("positionEncoding").is_some_and(|v|v!="utf-16"){return Err("Unsupported LSP position encoding".into());}
+        stage="initialized";
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"initialized","params":{}}),deadline).await?;
+        stage="didOpen";
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":request.uri,"languageId":request.language,"version":1,"text":request.text}}}),deadline).await?;
+        stage="document response";
+        let deadline=Instant::now()+Duration::from_secs(seconds);
         let (projected,shutdown_id)=if let Some((line,character))=request.completion{
             if !caps.get("completionProvider").is_some_and(Value::is_object){return Err("Server does not advertise completion".into());}
             lsp_send(&session,json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":request.uri},"position":{"line":line,"character":character},"context":{"triggerKind":1}}}),deadline).await?;
@@ -1468,9 +1484,12 @@ pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,Strin
         }
         (json!({"diagnostics":found.ok_or("No push diagnostics received")?}),2)
         };
+        stage="didClose and shutdown";
+        let deadline=Instant::now()+Duration::from_secs(30);
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":request.uri}}}),deadline).await?;
         lsp_send(&session,json!({"jsonrpc":"2.0","id":shutdown_id,"method":"shutdown"}),deadline).await?;
         if !lsp_reply(&session,&mut capture,shutdown_id,deadline).await?.is_null(){return Err("Invalid LSP shutdown response".into());}
+        stage="exit";
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"exit"}),deadline).await?;
         drain(&session,&mut capture,deadline).await?;
         if !capture.exited||capture.code!=Some(0)||capture.signal.unwrap_or(0)!=0||!capture.closed{return Err("LSP shutdown failed".into());}
@@ -1480,9 +1499,9 @@ pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,Strin
         Ok(mut d)=>{d["ok"]=json!(true);d["snapshotOnly"]=json!(true);d["transportClosed"]=json!(true);d},
         Err(error)=>{
             #[cfg(test)]
-            eprintln!("CI LSP failure: {}",error);
+            eprintln!("CI LSP failure at {stage}: {error}; pending stderr: {}",String::from_utf8_lossy(&capture.stderr));
             #[cfg(not(test))]
-            let _=error;
+            let _=(error,stage);
             let _=session.terminate().await;
             let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;
             json!({"ok":false,"error":"LSP request rejected, unsupported, cancelled or timed out","transportClosed":closed})
