@@ -1440,6 +1440,42 @@ printf '%s\n' NEXUS_PYLSP_1_10_0
     Ok("1.10.0-1".into())
 }
 
+// CI-only regression for glibc pthread_create/clone3 and real timer dispatch.
+// Validate actual cross-thread execution, join, and repeated creation in guest.
+#[cfg(test)]
+pub(crate) async fn verify_python_threads_for_ci(guest:&IshInstance,env:&HashMap<String,String>)->bool{
+    let script=r#"
+set -eu
+/usr/bin/python3 -u -c '
+import threading
+import queue
+for i in range(3):
+    messages = queue.Queue()
+    t = threading.Thread(target=lambda: messages.put(("thread", threading.get_ident())))
+    t.start()
+    t.join(5)
+    assert not t.is_alive(), "thread join timed out"
+    kind, ident = messages.get_nowait()
+    assert kind == "thread" and ident != threading.get_ident()
+    timer = threading.Timer(0.05, lambda: messages.put(("timer", threading.get_ident())))
+    timer.start()
+    timer.join(5)
+    assert not timer.is_alive(), "timer join timed out"
+    kind, ident = messages.get_nowait()
+    assert kind == "timer" and ident != threading.get_ident()
+print("NEXUS_PYTHON_THREADS_OK")
+'
+"#;
+    let mut opts=shell(script,env);opts.pipe_stdin=false;
+    let Ok(session)=guest.spawn(opts)else{return false;};
+    let mut capture=Capture::default();
+    let result=drain(&session,&mut capture,Instant::now()+Duration::from_secs(40)).await;
+    if result.is_err(){let _=session.terminate().await;let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;}
+    let ok=result.is_ok()&&capture.closed&&capture.code==Some(0)&&capture.signal.unwrap_or(0)==0&&capture.stdout==b"NEXUS_PYTHON_THREADS_OK\n";
+    if !ok{eprintln!("CI Python thread regression: {:?}",capture.evidence());}
+    ok
+}
+
 pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,String>,request:&crate::local_jobs::LspInput,fixture:bool)->Value{
     let mut opts=SpawnOpts::cmd(request.argv.iter().map(String::as_str));
     #[cfg(test)]

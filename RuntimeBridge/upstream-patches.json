@@ -114,6 +114,16 @@
         "        while (tty->bufsize < min) {\n            err = _EIO;\n            if (pty_is_half_closed_master(tty))\n                goto error;",
         "        while (tty->bufsize < min) {\n            err = _EIO;\n            if (tty->hung_up || pty_is_half_closed_master(tty)) {\n                // The master is noncanonical; preserve even a short tail.\n                if (tty->driver == &pty_master && tty->bufsize > 0)\n                    break;\n                goto error;\n            }"
       ]
+    ],
+    "kernel/fork.c": [
+      [
+        "#define CLONE_SIGHAND_ 0x00000800\n",
+        "#define CLONE_SIGHAND_ 0x00000800\n#define CLONE_PIDFD_ 0x00001000\n"
+      ],
+      [
+        "    if (args.pidfd != 0 || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0)\n        return _EINVAL;",
+        "    // pidfd is an output pointer only when CLONE_PIDFD is requested.\n    // glibc 2.39 pthread_create supplies &pd->tid in this field even\n    // without CLONE_PIDFD. Ignore that unused field, as Linux does.\n    // Do not implement pidfds, set_tid or cgroup placement here.\n    if ((args.flags & CLONE_PIDFD_) || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0)\n        return _EINVAL;"
+      ]
     ]
   }
 }

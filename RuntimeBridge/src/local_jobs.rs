@@ -788,15 +788,16 @@ mod tests {
         let env=HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into()),("PYTHONFAULTHANDLER".into(),"1".into())]);
         {let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=8;}
         let version=rt.block_on(process_probe::verify_pylsp_for_ci(&guest,&env));
-        let r=if version.is_ok(){
+        let threads=version.is_ok()&&rt.block_on(process_probe::verify_python_threads_for_ci(&guest,&env));
+        let r=if threads{
             let input=parse_lsp(&json!({"argv":["/usr/bin/python3","-u","-m","pylsp","-v"],"language":"python","extension":"py","text":"x = missing_nexus_symbol"}).to_string()).unwrap();
             rt.block_on(process_probe::lsp_diagnostics(&guest,&env,&input,false))
-        }else{json!({"ok":false,"error":"Prepared pinned server verification failed"})};
+        }else{json!({"ok":false,"error":"Prepared server or Python thread regression failed"})};
         let clean=rt.block_on(guest.shutdown()).is_ok();
         STATE.lock().unwrap().running=false;
         let diagnosed=r["diagnostics"].as_array().is_some_and(|a|a.iter().any(|d|d["message"].as_str().is_some_and(|m|m.contains("missing_nexus_symbol"))&&d["range"]["start"]["line"]==0&&d["range"]["start"]["character"]==4));
-        let ok=version.as_deref()==Ok("1.10.0-1")&&r["ok"]==true&&r["transportClosed"]==true&&diagnosed&&clean;
-        let report=json!({"ok":ok,"fixtureOnly":false,"scope":"macOS-hosted Ubuntu guest","package":"python3-pylsp","packageVersion":version.ok(),"diagnosticVerified":diagnosed,"transportClosed":r["transportClosed"],"shutdownClean":clean,"physicalDeviceVerified":false});
+        let ok=version.as_deref()==Ok("1.10.0-1")&&threads&&r["ok"]==true&&r["transportClosed"]==true&&diagnosed&&clean;
+        let report=json!({"ok":ok,"fixtureOnly":false,"scope":"macOS-hosted Ubuntu guest","package":"python3-pylsp","packageVersion":version.ok(),"pythonThreadsVerified":threads,"diagnosticVerified":diagnosed,"transportClosed":r["transportClosed"],"shutdownClean":clean,"physicalDeviceVerified":false});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         assert!(ok,"real pylsp snapshot gate: {report}; {}",r["error"]);
     }

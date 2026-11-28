@@ -18,7 +18,7 @@ def gates(variant):
         rows[name] = ("synthetic ACP peer", {"ok": True, "fixtureOnly": True})
     for name in ("local-pty", "local-mcp", "local-call"):
         rows[name] = ("macOS guest local job", {"ok": True, "shutdownClean": True})
-    rows["real-pylsp"] = ("macOS-hosted Ubuntu guest, real pinned Python LSP Server", {"ok": True, "fixtureOnly": False, "package": "python3-pylsp", "packageVersion": "1.10.0-1", "diagnosticVerified": True, "transportClosed": True, "shutdownClean": True, "physicalDeviceVerified": False})
+    rows["real-pylsp"] = ("macOS-hosted Ubuntu guest, real pinned Python LSP Server", {"ok": True, "fixtureOnly": False, "package": "python3-pylsp", "packageVersion": "1.10.0-1", "pythonThreadsVerified": True, "diagnosticVerified": True, "transportClosed": True, "shutdownClean": True, "physicalDeviceVerified": False})
     rows["container-capabilities"] = ("macOS guest prerequisite diagnostic only", {"ok": True, "shutdownClean": True, "diagnosticOnly": True, "dockerEngineVerified": False, "composeVerified": False, "fullSystemVMVerified": False})
     rows["slot-evidence"] = ("Ubuntu ELF fixture, not AGY", {"ok": True, "shutdownClean": True, "digestVerified": True})
     for name in ("google", "google-edit", "snapshot", "mcp-session", "terminal", "codex-probe"):

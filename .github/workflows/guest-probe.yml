@@ -652,7 +652,7 @@ jobs:
           export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-real-pylsp.json"
           export NEXUS_PYLSP_TRACE=1
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_pylsp_snapshot -- --ignored --nocapture --test-threads=1
-          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","diagnosticVerified","transportClosed","shutdownClean"]) and r["fixtureOnly"] is False and r["physicalDeviceVerified"] is False and r["packageVersion"] == "1.10.0-1"' "$NEXUS_LOCAL_EVIDENCE"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","pythonThreadsVerified","diagnosticVerified","transportClosed","shutdownClean"]) and r["fixtureOnly"] is False and r["physicalDeviceVerified"] is False and r["packageVersion"] == "1.10.0-1"' "$NEXUS_LOCAL_EVIDENCE"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
