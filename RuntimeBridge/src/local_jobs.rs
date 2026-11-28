@@ -973,6 +973,59 @@ mod tests {
         assert!(ok,"real pylsp refresh gate: {report}; {}",r["error"]);
     }
     #[test]
+    #[ignore = "requires prepared real pylsp ARM64 Ubuntu fakefs"]
+    fn real_pylsp_multi_document(){
+        use std::time::{Duration,Instant};
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into()),("PYTHONFAULTHANDLER".into(),"1".into())]);
+        let version=rt.block_on(process_probe::verify_pylsp_for_ci(&guest,&env));
+        let first=multi_lsp_document("src/a.py","x = missing_nexus_a").unwrap();
+        let input=parse_lsp(&json!({"argv":["/usr/bin/python3","-u","-m","pylsp"],"language":"python","extension":"py","text":first.text}).to_string()).unwrap();
+        *LIVE_LSP.lock().unwrap()=Some(LiveLsp{multi:true,language:Some("python".into()),..Default::default()});
+        {let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=12;}
+        let driver=std::thread::spawn(||{
+            let until=Instant::now()+Duration::from_secs(420);
+            let cases=[("src/a.py","missing_nexus_a"),("src/b.py","missing_nexus_b"),("src/a.py","refreshed_nexus_a")];
+            let mut seen=0usize;
+            while Instant::now()<until{
+                let p=lsp_status();
+                if p["waiting"]==true&&p["version"].as_u64()==Some((seen+1) as u64){
+                    let (key,needle)=cases[seen];
+                    let correct=p["document"]==key&&p["multiDocument"]==true&&p["diagnostics"].as_array().is_some_and(|a|a.iter().any(|d|
+                        d["message"].as_str().is_some_and(|m|m.contains(needle))&&d["range"]["start"]["line"]==0&&d["range"]["start"]["character"]==4));
+                    if !correct{let _=enqueue(Control::Stop);return false;}
+                    if seen==0{
+                        if lsp_document_control(0,&json!({"document":"src/b.py","text":"stale"}).to_string())["ok"]!=false||
+                           lsp_document_control(1,&json!({"document":"src/b.go","text":"package x"}).to_string())["ok"]!=false{
+                            let _=enqueue(Control::Stop);return false;
+                        }
+                    }
+                    seen+=1;
+                    if seen==cases.len(){return lsp_control(seen as u32,None)["ok"]==true;}
+                    let (next,symbol)=cases[seen];
+                    if lsp_document_control(seen as u32,&json!({"document":next,"text":format!("x = {symbol}")}).to_string())["ok"]!=true{
+                        let _=enqueue(Control::Stop);return false;
+                    }
+                }
+                if !STATE.lock().unwrap().running{return false;}
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _=enqueue(Control::Stop);false
+        });
+        let r=if version.as_deref()==Ok("1.10.0-1"){rt.block_on(process_probe::live_multi_lsp(&guest,&env,&input,&first))}else{json!({"ok":false})};
+        STATE.lock().unwrap().running=false;
+        let correlated=driver.join().unwrap();
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        *LIVE_LSP.lock().unwrap()=None;
+        let ok=version.as_deref()==Ok("1.10.0-1")&&correlated&&r["ok"]==true&&r["versions"]==3&&r["documents"]==2&&r["multiDocument"]==true&&r["snapshotUriRefresh"]==true&&r["transportClosed"]==true&&clean;
+        let report=json!({"ok":ok,"fixtureOnly":false,"scope":"macOS-hosted Ubuntu guest, native multi-document mailbox","package":"python3-pylsp","packageVersion":version.ok(),"documentCorrelationVerified":correlated,"multiDocument":r["multiDocument"],"documents":r["documents"],"versions":r["versions"],"snapshotUriRefresh":r["snapshotUriRefresh"],"transportClosed":r["transportClosed"],"shutdownClean":clean,"physicalDeviceVerified":false});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(ok,"native multi-document pylsp gate: {report}");
+    }
+    #[test]
     #[ignore = "requires separate Ubuntu fakefs"]
     fn real_lsp_diagnostic_fixture(){
         let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
