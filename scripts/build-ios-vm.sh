@@ -43,19 +43,24 @@ function("download_all", """    mkdir -p "$BUILD_DIR"
     download $GETTEXT_SRC
     download $GLIB_SRC
     download $PIXMAN_SRC
+    download $SLIRP_SRC
     clone $LIBUCONTEXT_REPO $LIBUCONTEXT_COMMIT""")
 function("build_qemu_dependencies", """    build $FFI_SRC
     build $ICONV_SRC
     gl_cv_onwards_func_strchrnul=future build $GETTEXT_SRC --disable-java
     meson_build $GLIB_SRC -Dtests=false -Ddtrace=disabled
     build $PIXMAN_SRC
+    meson_darwin_build $SLIRP_SRC
     meson_build $LIBUCONTEXT_REPO -Ddefault_library=static -Dfreestanding=true""")
 replace('    QEMU_PLATFORM_BUILD_FLAGS="--enable-shared-lib --disable-cocoa --disable-sdl --disable-coreaudio --disable-slirp-smbd --enable-ucontext --with-coroutine=libucontext $HVF_FLAGS $TCI_BUILD_FLAGS"',
-        '    QEMU_PLATFORM_BUILD_FLAGS="--without-default-features --enable-tcg --enable-tcg-interpreter --target-list=aarch64-softmmu --enable-fdt=internal --enable-shared-lib --disable-hvf --disable-hvf-private --disable-kvm --disable-plugins --disable-docs --disable-cocoa --disable-sdl --enable-ucontext --with-coroutine=libucontext"')
+        '    QEMU_PLATFORM_BUILD_FLAGS="--without-default-features --enable-tcg --enable-tcg-interpreter --target-list=aarch64-softmmu --enable-fdt=internal --enable-slirp --enable-shared-lib --disable-hvf --disable-hvf-private --disable-kvm --disable-plugins --disable-docs --disable-cocoa --disable-sdl --enable-ucontext --with-coroutine=libucontext"')
 replace('\ncopy_private_headers\nbuild_pkg_config\n', '\nbuild_pkg_config\n')
 replace('\nbuild_spice_client\nbuild_vulkan_drivers\nbuild_d3d_drivers\nfixup_all\nremove_shared_gst_plugins # another hack...\n','\nfixup_all\n')
 # Override only the platform SDK floor; do not use private headers/entitlements.
 replace('IOS_SDKMINVER="15.0"', 'IOS_SDKMINVER="17.0"')
+# Pinned archive URLs from upstream use HTTP for two GNU tarballs; enforce TLS.
+sources = root / "Vendor/nexus-utm/patches/sources"
+sources.write_text(sources.read_text().replace("http://ftp.gnu.org/", "https://ftp.gnu.org/"))
 p.write_text(s)
 q = root / "Vendor/nexus-qemu/system/vl.c"
 source = q.read_text()
