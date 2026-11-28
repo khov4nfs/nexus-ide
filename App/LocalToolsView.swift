@@ -90,6 +90,35 @@ struct LocalToolsView: View {
     @State private var confirmFollowup = false
     @State private var keepCLIGuest = false
     @State private var confirmResetCLI = false
+    private var launchDisabled: Bool {
+        if model.guestClaimed || importingVSIX || importingCLI { return true }
+        switch mode {
+        case 13: return false
+        case 11: return batchLoading || batchSnapshots.isEmpty
+        case 10: return adapterPrompt.isEmpty || !AGYImportFormat.validDigest(adapterDigest)
+        case 9: return transferLoading || transferSnapshot == nil
+        case 8, 12: return lspLoading || lspSnapshot == nil || lspArgv.isEmpty
+        case 6: return cliImport == nil
+        case 3: return !stagedWorkbench
+        default: return command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)
+        }
+    }
+    private var launchMessage: String {
+        switch frozenMode {
+        case 13: return "Run fixed offline container prerequisite checks in a disposable guest? This does not run Docker or boot a VM."
+        case 12: return "Start this reviewed language server and send the first saved version?\n" + frozenInput + "\nRefresh only after explicit editor review."
+        case 11: return "Transfer these exact reviewed project files?\n" + frozenInput + "\nExport creates only; partial export possible. Import requires individual review."
+        case 10: return "Start this reviewed ACP adapter and send the first model message?\n" + frozenInput + "\nModel requests may incur charges; saved guest can retain credentials and history. No native grants."
+        case 9: return "Transfer this exact reviewed file to/from the saved Linux guest?\n" + frozenInput + "\nImport requires separate native review; no automatic overwrite."
+        case 8: return "Send this reviewed snapshot to the specified local LSP server?\n" + frozenInput + "\nNo native write grant. Server may use network or retain data."
+        case 6: return "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.")
+        case 4: return "Execute one reviewed MCP call (may have side effects):\n" + frozenInput
+        case 3: return "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "")
+        default:
+            if frozenHooks { return "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") }
+            return "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment.")
+        }
+    }
     private var stagedWorkbench: Bool {
         guard let root = Bundle.main.url(forResource: "ubuntu-fs", withExtension: nil) else { return false }
         return (try? String(contentsOf: root.appendingPathComponent("workbench.sha256"), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) == "36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc"
@@ -317,7 +346,7 @@ struct LocalToolsView: View {
                             frozenInput = String(decoding: wire,as: UTF8.self)
                         } else { frozenInput = command }
                         confirm = true
-                    }.disabled(model.guestClaimed || importingVSIX || importingCLI || (mode == 13 ? false : mode == 11 ? batchLoading || batchSnapshots.isEmpty : mode == 10 ? adapterPrompt.isEmpty || !AGYImportFormat.validDigest(adapterDigest) : mode == 9 ? transferLoading || transferSnapshot == nil : (mode == 8 || mode == 12) ? lspLoading || lspSnapshot == nil || lspArgv.isEmpty : mode == 6 ? cliImport == nil : mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
+                    }.disabled(launchDisabled)
                     Text("No provider key or native workspace injected. Commands and extensions may use the network and are not sandboxed. Restart app for another boot.").font(.caption)
                 }
                 if running && frozenMode != 2 && frozenMode != 4 {
@@ -450,7 +479,7 @@ struct LocalToolsView: View {
                 Button("Start") { start() }
                 Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false; frozenVSIX = nil; frozenCLI = nil }
             } message: {
-                Text(frozenMode == 13 ? "Run fixed offline container prerequisite checks in a disposable guest? This does not run Docker or boot a VM." : frozenMode == 12 ? "Start this reviewed language server and send the first saved version?\n" + frozenInput + "\nRefresh only after explicit editor review." : frozenMode == 11 ? "Transfer these exact reviewed project files?\n" + frozenInput + "\nExport creates only; partial export possible. Import requires individual review." : frozenMode == 10 ? "Start this reviewed ACP adapter and send the first model message?\n" + frozenInput + "\nModel requests may incur charges; saved guest can retain credentials and history. No native grants." : frozenMode == 9 ? "Transfer this exact reviewed file to/from the saved Linux guest?\n" + frozenInput + "\nImport requires separate native review; no automatic overwrite." : frozenMode == 8 ? "Send this reviewed snapshot to the specified local LSP server?\n" + frozenInput + "\nNo native write grant. Server may use network or retain data." : frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(launchMessage)
             }
             .sheet(isPresented: $transferReview) {
                 NavigationStack {

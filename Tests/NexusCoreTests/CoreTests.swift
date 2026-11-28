@@ -110,3 +110,30 @@ extension CoreTests {
         } catch { XCTAssertEqual(error as? WorkspaceError, .conflict) }
     }
 }
+
+extension CoreTests {
+    func testMultiFileSnapshotsAndIndependentConflicts() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let w = try Workspace(root: root)
+        try await w.write("src/a.txt", text: "Tiếng Việt")
+        try await w.write("docs/a.txt", text: "original")
+        let snapshots = try await w.snapshots(["src/a.txt", "docs/a.txt"])
+        XCTAssertEqual(snapshots.map(\.path), ["src/a.txt", "docs/a.txt"])
+        try await w.write("docs/a.txt", text: "new native edit")
+        try await w.apply(snapshots[0], replacement: "reviewed Linux edit")
+        do { try await w.apply(snapshots[1], replacement: "stale Linux edit"); XCTFail("stale batch file accepted") }
+        catch { XCTAssertEqual(error as? WorkspaceError, .conflict) }
+        let a = try await w.read("src/a.txt"), b = try await w.read("docs/a.txt")
+        XCTAssertEqual(a, "reviewed Linux edit")
+        XCTAssertEqual(b, "new native edit")
+        do { _ = try await w.snapshots(["src/a.txt","src/a.txt"]); XCTFail("duplicate path accepted") }
+        catch { XCTAssertEqual(error as? WorkspaceError, .invalidPath) }
+        try await w.write("large.txt", text: String(repeating: "x", count: 8193))
+        do { _ = try await w.snapshots(["large.txt"]); XCTFail("oversized file accepted") }
+        catch { XCTAssertEqual(error as? WorkspaceError, .tooLarge) }
+        for i in 0..<5 { try await w.write("part-\(i).txt", text: String(repeating: "x", count: 8192)) }
+        do { _ = try await w.snapshots((0..<5).map { "part-\($0).txt" }); XCTFail("oversized aggregate accepted") }
+        catch { XCTAssertEqual(error as? WorkspaceError, .tooLarge) }
+    }
+}
