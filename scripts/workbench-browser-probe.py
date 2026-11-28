@@ -54,7 +54,12 @@ def main():
     root = Path(os.environ["NEXUS_WORKBENCH_ROOTFS"]) / "root" / "nexus-workbench"
     url = "http://127.0.0.1:18765/?" + urlencode({"tkn": token, "folder": "/root/nexus-workbench"})
     signal.signal(signal.SIGALRM, timeout)
-    signal.alarm(420)
+    real = os.environ.get("NEXUS_WORKBENCH_REAL_LSP") == "1"
+    filename = "nexus-real-lsp.py" if real else "nexus-editor-fixture.txt"
+    initial = "missing_nexus_symbol\nclass NexusCompletion:\n    nexus_value = 42\nitem = NexusCompletion()\nitem" if real else "NEXUS_BROWSER_EDITOR_SAVED"
+    label = "nexus_value" if real else "NEXUS_LSP_COMPLETION"
+    final = initial + ("." if real else "\n") + label
+    signal.alarm(660 if real else 420)
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
@@ -112,35 +117,47 @@ def main():
             else:
                 raise TimeoutError("Installed fixture command unavailable")
             print("Workbench browser: await fixture editor", file=sys.stderr, flush=True)
-            page.get_by_text("nexus-editor-fixture.txt", exact=True).first.wait_for(state="visible")
+            page.get_by_text(filename, exact=True).first.wait_for(state="visible")
             editor = page.locator(".editor-instance .monaco-editor .view-lines").first
             editor.wait_for(state="visible")
             print("Workbench browser: edit and save", file=sys.stderr, flush=True)
             editor.click()
             page.keyboard.press("Meta+A")
-            page.keyboard.insert_text("NEXUS_BROWSER_EDITOR_SAVED")
+            page.keyboard.insert_text(initial)
             save_from_palette(page)
-            wait_for_guest_save(page, root, {
+            expected = {
                 "nexus-extension-activated.marker": b"activated",
                 "nexus-editor-saved.marker": b"saved",
-                "nexus-editor-fixture.txt": b"NEXUS_BROWSER_EDITOR_SAVED",
-            }, "initial editor save")
+                filename: initial.encode(),
+            }
+            if real:
+                expected["nexus-real-diagnostics.marker"] = b"pylsp-1.10.0"
+            wait_for_guest_save(page, root, expected, "initial editor save", seconds=150 if real else 45)
+            if real:
+                page.locator(".monaco-editor .squiggly-error").first.wait_for(state="visible", timeout=30000)
+                print("Workbench browser: real diagnostic rendered", file=sys.stderr, flush=True)
             editor.click()
             page.keyboard.press("Meta+End")
             page.keyboard.press("End")
-            page.keyboard.press("Enter")
+            if real:
+                page.keyboard.insert_text(".")
+            else:
+                page.keyboard.press("Enter")
             page.keyboard.press("Control+Space")
-            suggestion = page.locator(".suggest-widget").get_by_text("NEXUS_LSP_COMPLETION", exact=True).first
+            suggestion = page.locator(".suggest-widget").get_by_text(label, exact=True).first
             print("Workbench browser: await LSP completion", file=sys.stderr, flush=True)
-            suggestion.wait_for(state="visible")
+            suggestion.wait_for(state="visible", timeout=150000 if real else 60000)
             page.keyboard.press("Enter")
             save_from_palette(page)
-            wait_for_guest_save(page, root, {
+            expected = {
                 "nexus-editor-saved.marker": b"saved",
                 "nexus-lsp-transport.marker": b"completed",
                 "nexus-lsp-saved.marker": b"saved",
-                "nexus-editor-fixture.txt": b"NEXUS_BROWSER_EDITOR_SAVED\nNEXUS_LSP_COMPLETION",
-            }, "LSP completion save")
+                filename: final.encode(),
+            }
+            if real:
+                expected["nexus-real-completion.marker"] = b"pylsp-1.10.0"
+            wait_for_guest_save(page, root, expected, "LSP completion save", seconds=90 if real else 45)
             print("Workbench browser: completion accepted and persisted", file=sys.stderr, flush=True)
             context.close()
             browser.close()
