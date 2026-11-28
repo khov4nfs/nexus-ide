@@ -94,7 +94,7 @@ struct State {
 static STATE: Mutex<State> = Mutex::new(State {
     running:false, ready:false, mode:0, output:String::new(), raw:Vec::new(), total:0, controls:VecDeque::new(), stop:false, agent:None,
 });
-const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --no-opt --no-sparkplug --no-maglev --no-lazy --liftoff-only --single-threaded --v8-pool-size=1 /opt/nexus/workbench/out/server-main.js --telemetry-level off --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
+const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --no-opt --no-sparkplug --no-maglev --no-lazy --liftoff-only --single-threaded --v8-pool-size=1 /opt/nexus/workbench/out/server-main.js --telemetry-level off --force-disable-user-env --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
 fn fail(message: &str) -> Value { json!({"ok":false,"error":message}) }
 fn valid_command(s: &str) -> bool { !s.trim().is_empty() && s.len() <= 2048 && !s.contains('\0') }
 fn parse_call(input:&str)->Option<Value> {
@@ -427,6 +427,11 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
             // execArgv (extension host). This does not disable Node async I/O
             // or guest Wasm, and never requests host executable memory.
             // Retain the upstream heap cap for Node descendants as well.
+            // Workbench receives an explicit guest environment. Skip the
+            // upstream interactive login-shell environment probe (which
+            // spawns another detached Node/shell before the extension host).
+            // The actual extension host and editor gates remain mandatory.
+            env.insert("SHELL".into(),"/bin/sh".into());
             env.insert("ISH_NODE_NO_ARG_INJECTION".into(),"1".into());
             env.insert("NODE_OPTIONS".into(),"--max-old-space-size=512".into());
             env.insert("UV_USE_IO_URING".into(),"0".into());
