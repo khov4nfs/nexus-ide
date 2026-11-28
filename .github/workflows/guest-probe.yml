@@ -54,6 +54,8 @@ on:
       - 'scripts/build-test-vsix.py'
       - 'scripts/build-real-workbench-vsix.py'
       - 'scripts/workbench-real-lsp-extension.js'
+      - 'scripts/workbench-lsp-session.js'
+      - 'scripts/test-workbench-lsp-session.js'
       - 'scripts/workbench-browser-probe.py'
       - 'scripts/test-agy-import.py'
       - 'scripts/stage-ubuntu-device.sh'
@@ -116,7 +118,7 @@ jobs:
       matrix:
         variant: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu","workbench"]') || fromJSON(format('["{0}"]', inputs.variant || 'ubuntu')) }}
     runs-on: ${{ inputs.full_vm && 'macos-26' || 'macos-15' }}
-    timeout-minutes: ${{ inputs.full_vm && 240 || 100 }}
+    timeout-minutes: ${{ inputs.full_vm && 250 || 130 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -817,9 +819,9 @@ jobs:
           touch "$RUNNER_TEMP/nexus-workbench-start"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
           python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["nodeRuntimeVerified"] is True and r["extensionDigestVerified"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is True and r["lspFixtureOnly"] is True' "$NEXUS_WORKBENCH_EVIDENCE"
-      - name: Verify real Workbench Python LSP diagnostics and completion through Chromium
+      - name: Verify persistent real Workbench Python C and C++ LSP through Chromium
         if: matrix.variant == 'workbench'
-        timeout-minutes: 22
+        timeout-minutes: 32
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
           export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
@@ -833,11 +835,13 @@ jobs:
           export NEXUS_WORKBENCH_BROWSER_PYTHON="$RUNNER_TEMP/nexus-browser/bin/python"
           export NEXUS_WORKBENCH_BROWSER_SCRIPT="$GITHUB_WORKSPACE/scripts/workbench-browser-probe.py"
           node --check scripts/workbench-real-lsp-extension.js
+          node --check scripts/workbench-lsp-session.js
+          node --test scripts/test-workbench-lsp-session.js
           python3 scripts/build-real-workbench-vsix.py "$RUNNER_TEMP/nexus-real-pylsp.vsix"
           export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-real-pylsp.vsix" | awk '{print $1}')"
           cat "$RUNNER_TEMP/nexus-real-pylsp.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
-          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","shutdownClean","extensionActivationVerified","editorVerified","lspVerified","realDiagnosticsVerified","realCompletionVerified"]) and r["lspFixtureOnly"] is False and r["realServerVersion"]=="1.10.0"' "$NEXUS_WORKBENCH_EVIDENCE"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","shutdownClean","extensionActivationVerified","editorVerified","lspVerified","realDiagnosticsVerified","realCompletionVerified"]) and r["lspFixtureOnly"] is False and r["realServerVersion"]=="1.10.0" and r["persistentMultiLanguageVerified"] is True and r["clangdVersion"]=="18.1.3"' "$NEXUS_WORKBENCH_EVIDENCE"
       - name: Collect bounded native crash stack (CI-only)
         if: failure() && matrix.variant == 'workbench' && steps.workbench_gate.outcome == 'failure'
         timeout-minutes: 2
