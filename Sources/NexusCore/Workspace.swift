@@ -71,6 +71,13 @@ public actor Workspace {
         WorkspaceSnapshot(path: path, text: try read(path), root: root)
     }
 
+    public func snapshots(_ paths: [String]) throws -> [WorkspaceSnapshot] {
+        guard (1...8).contains(paths.count), Set(paths).count == paths.count else { throw WorkspaceError.invalidPath }
+        let result = try paths.map { try snapshot($0) }
+        guard result.allSatisfy({ $0.text.utf8.count <= 8192 && !$0.text.utf8.contains(0) }), result.reduce(0, { $0 + $1.text.utf8.count }) <= 32768 else { throw WorkspaceError.tooLarge }
+        return result
+    }
+
     /// Compare exact UTF-8 bytes and write within one actor turn.
     /// This protects cooperative native edits, not concurrent external writers.
     public func apply(_ snapshot: WorkspaceSnapshot, replacement: String) throws {

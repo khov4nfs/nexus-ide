@@ -124,6 +124,22 @@ struct GuestEditPreview: Identifiable {
         return snap
     }
 
+    func batchSnapshots(_ paths: [String]) async throws -> [WorkspaceSnapshot] {
+        guard let workspace, !reviewBusy else { throw WorkspaceError.conflict }
+        reviewBusy = true; defer { reviewBusy = false }
+        let snaps = try await workspace.snapshots(paths)
+        if let selected = snaps.first(where: { $0.path == path }), Data(selected.text.utf8) != Data(source.utf8) { throw WorkspaceError.conflict }
+        return snaps
+    }
+
+    func applyReviewedBatchFile(_ snapshot: WorkspaceSnapshot, replacement: String) async throws {
+        guard let workspace, !reviewBusy, replacement.utf8.count <= 8192, !replacement.utf8.contains(0), path != snapshot.path || Data(source.utf8) == Data(snapshot.text.utf8) else { throw WorkspaceError.conflict }
+        reviewBusy = true; defer { reviewBusy = false }
+        try await workspace.apply(snapshot, replacement: replacement)
+        if path == snapshot.path, Data(source.utf8) == Data(snapshot.text.utf8) { source = replacement }
+        status = "Applied reviewed batch file"
+    }
+
     func applyReviewedTransfer(_ snapshot: WorkspaceSnapshot, replacement: String) async throws {
         guard let workspace, !reviewBusy, path == snapshot.path, replacement.utf8.count <= 8192,
               !replacement.utf8.contains(0), Data(source.utf8) == Data(snapshot.text.utf8) else { throw WorkspaceError.conflict }

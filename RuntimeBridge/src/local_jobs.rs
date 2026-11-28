@@ -139,6 +139,37 @@ fn parse_adapter(input:&str)->Option<AdapterInput>{
     Some(AdapterInput{argv,digest:digest.into(),prompt:prompt.into(),resume})
 }
 pub(crate) struct TransferInput {pub name:String,pub text:Option<String>}
+struct BatchInput {push:bool,files:Vec<TransferInput>}
+fn transfer_component(s:&str)->bool{!s.is_empty()&&s.len()<=128&&!s.starts_with('.')&&s.bytes().all(|b|b.is_ascii_alphanumeric()||b"._-".contains(&b))}
+fn parse_batch(input:&str)->Option<BatchInput>{
+    if input.len()>262144{return None;}
+    let v:Value=serde_json::from_str(input).ok()?;
+    if v.as_object()?.len()!=3{return None;}
+    let push=match v["action"].as_str()?{"push"=>true,"pull"=>false,_=>return None};
+    let id=v["batch"].as_str()?;if !transfer_component(id)||id.len()>64{return None;}
+    let list=v["files"].as_array()?;if !(1..=8).contains(&list.len()){return None;}
+    let mut files=Vec::<TransferInput>::new();let mut total=0;
+    for f in list{
+        let name=f["path"].as_str()?;
+        if name.len()>256||name.split('/').count()>8||!name.split('/').all(transfer_component){return None;}
+        let name=format!("batches/{id}/{name}");
+        if files.iter().any(|x|x.name==name||x.name.starts_with(&format!("{name}/"))||name.starts_with(&format!("{}/",x.name))){return None;}
+        let text=if push{if f.as_object()?.len()!=2{return None;}let t=f["text"].as_str()?;if t.len()>8192||t.contains('\0'){return None;}total+=t.len();if total>32768{return None;}Some(t.to_owned())}else{if f.as_object()?.len()!=1{return None;}None};
+        files.push(TransferInput{name,text});
+    }
+    Some(BatchInput{push,files})
+}
+async fn run_batch(guest:&IshInstance,env:&HashMap<String,String>,batch:&BatchInput)->Value{
+    let mut results=Vec::new();let mut total=0u64;
+    for f in &batch.files{
+        let r=process_probe::workspace_transfer(guest,env,f).await;
+        if r["ok"]!=true{return json!({"ok":false,"completed":results.len(),"partialExportPossible":batch.push,"error":"Batch stopped; no native imports returned"});}
+        total+=r["bytes"].as_u64().unwrap_or(32769);
+        if total>32768{return json!({"ok":false,"completed":results.len(),"partialExportPossible":batch.push,"error":"Batch byte limit"});}
+        results.push(r);
+    }
+    json!({"ok":true,"action":if batch.push{"push"}else{"pull"},"files":results,"bytes":total,"completed":results.len()})
+}
 fn parse_transfer(input:&str)->Option<TransferInput>{
     if input.len()>65536{return None;}
     let v:Value=serde_json::from_str(input).ok()?;
@@ -241,7 +272,8 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let lsp=if mode==8 {match parse_lsp(input){Some(v)=>Some(v),None=>return fail("Invalid LSP snapshot request")}}else{None};
     let transfer=if mode==9 {match parse_transfer(input){Some(v)=>Some(v),None=>return fail("Invalid workspace transfer")}}else{None};
     let adapter=if mode==10 {match parse_adapter(input){Some(v)=>Some(v),None=>return fail("Invalid reviewed ACP adapter request")}}else{None};
-    if !matches!(mode,1..=6|8|9|10) ||
+    let batch=if mode==11 {match parse_batch(input){Some(v)=>Some(v),None=>return fail("Invalid batch transfer")}}else{None};
+    if !matches!(mode,1..=6|8|9|10|11) ||
         (matches!(mode,1|2) && !valid_command(input)) { return fail("Invalid local job"); }
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
@@ -269,6 +301,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let libc = rt.block_on(process_probe::glibc_compat(&guest,&env));
     let mut result = if libc["passed"] != true { fail("Ubuntu compatibility failed") }
         else if let Some(request)=adapter.as_ref(){rt.block_on(crate::persistent_acp::local_adapter_session(&guest,&env,request,false))}
+        else if let Some(request)=batch.as_ref(){rt.block_on(run_batch(&guest,&env,request))}
         else if let Some(request)=transfer.as_ref(){rt.block_on(process_probe::workspace_transfer(&guest,&env,request))}
         else if let Some(request)=lsp.as_ref(){rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}
         else if let Some(plan)=hooks.as_ref() {
@@ -336,6 +369,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let shutdown = rt.block_on(guest.shutdown()).is_ok();
     result["shutdownClean"] = json!(shutdown);
     result["ok"] = json!(result["ok"] == true && shutdown);
+    if mode==11 && result["ok"]!=true {result.as_object_mut().unwrap().remove("files");}
     if mode==9 && result["ok"]!=true {result.as_object_mut().unwrap().remove("text");}
     if mode==8 && result["ok"]!=true {let o=result.as_object_mut().unwrap();o.remove("diagnostics");o.remove("completions");}
     result
@@ -552,6 +586,36 @@ mod tests {
         let ok=if matches!(phase.as_str(),"success"|"resume"){driven&&r["ok"]==true&&r["turnsCompleted"]==2&&r["permissionDenials"]==1&&p["agentHandle"]=="adapter-fixture"&&p["agentTurns"][1]["response"]=="Second adapter reply"&&r["sessionLoaded"]==json!(phase=="resume")}else{r["ok"]==false&&p["agentTurns"].as_array().is_some_and(|a|a.is_empty())};
         std::fs::write(report,serde_json::to_vec_pretty(&json!({"ok":ok&&clean,"fixtureOnly":true,"phase":phase,"shutdownClean":clean})).unwrap()).unwrap();
         assert!(ok&&clean,"ACP adapter fixture failed: {r}");
+    }
+    #[test]
+    fn batch_input_bounds(){
+        let valid=json!({"action":"push","batch":"demo","files":[{"path":"src/a.txt","text":"hello"},{"path":"src/b.txt","text":""}]});
+        assert!(parse_batch(&valid.to_string()).is_some());
+        for path in ["../bad","src/.secret","src//bad","/root","src/a.txt/child","src/a.txt"]{
+            let mut v=valid.clone();v["files"][1]["path"]=json!(path);assert!(parse_batch(&v.to_string()).is_none());
+        }
+    }
+    #[test]
+    #[ignore = "requires independent Ubuntu guest boots"]
+    fn real_workspace_batch(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_BATCH_PHASE").expect("phase");
+        let req=match phase.as_str(){
+            "push"=>json!({"action":"push","batch":"fixture","files":[{"path":"src/a.txt","text":"Nexus Việt\n"},{"path":"docs/a.txt","text":"second"}]}),
+            "duplicate"=>json!({"action":"push","batch":"fixture","files":[{"path":"src/a.txt","text":"no"}]}),
+            "pull"=>json!({"action":"pull","batch":"fixture","files":[{"path":"src/a.txt"},{"path":"docs/a.txt"}]}),
+            "missing"=>json!({"action":"pull","batch":"fixture","files":[{"path":"src/a.txt"},{"path":"missing"}]}),
+            _=>panic!("unknown phase"),
+        };
+        let r=run(Path::new(&path),11,&req.to_string());
+        let ok=match phase.as_str(){
+            "push"=>r["ok"]==true&&r["completed"]==2,
+            "pull"=>r["ok"]==true&&r["files"][0]["text"]=="Nexus Việt\n"&&r["files"][1]["text"]=="second",
+            _=>r["ok"]==false&&r.get("files").is_none(),
+        }&&r["shutdownClean"]==true;
+        std::fs::write(evidence,serde_json::to_vec_pretty(&json!({"ok":ok,"phase":phase,"fixtureOnly":true,"shutdownClean":r["shutdownClean"]})).unwrap()).unwrap();
+        assert!(ok,"batch failed: {}",r["error"]);
     }
     #[test]
     fn transfer_input_bounds(){

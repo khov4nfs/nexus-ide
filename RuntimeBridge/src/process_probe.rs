@@ -1168,7 +1168,16 @@ test ! -L /root
 test ! -L "$dir"
 mkdir -p "$dir"
 test -d "$dir"
-target="$dir/$1"
+rel=$1
+while [ "$rel" != "${rel#*/}" ]; do
+    part=${rel%%/*}
+    rel=${rel#*/}
+    dir="$dir/$part"
+    test ! -L "$dir"
+    if [ "$2" = push ]; then mkdir -p "$dir"; fi
+    test -d "$dir"
+done
+target="$dir/$rel"
 test ! -L "$target"
 if [ "$2" = push ]; then
     test ! -e "$target"
@@ -1178,7 +1187,7 @@ if [ "$2" = push ]; then
     IFS= read -r wire
     printf '%s' "$wire" | /usr/bin/base64 -d > "$tmp"
     test "$(wc -c < "$tmp")" -le 8192
-    ln "$tmp" "$target"
+    ln -T "$tmp" "$target"
 else
     test -f "$target"
     test "$(wc -c < "$target")" -le 8192

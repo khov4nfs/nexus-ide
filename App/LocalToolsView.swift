@@ -52,6 +52,13 @@ struct LocalToolsView: View {
     @State private var adapterDigest = ""
     @State private var adapterPrompt = ""
     @State private var adapterResume = ""
+    @State private var batchID = "project"
+    @State private var batchAction = "push"
+    @State private var batchPaths = ""
+    @State private var batchSnapshots: [WorkspaceSnapshot] = []
+    @State private var batchReplacements: [String: String] = [:]
+    @State private var batchLoading = false
+    @State private var batchReviewFile = false
     @State private var transferName = ""
     @State private var transferAction = "push"
     @State private var transferSnapshot: WorkspaceSnapshot?
@@ -100,8 +107,21 @@ struct LocalToolsView: View {
                         Text("Native LSP").tag(UInt8(8))
                         Text("Native/Linux file transfer").tag(UInt8(9))
                         Text("Local ACP adapter (Claude etc.)").tag(UInt8(10))
+                        Text("Multi-file project transfer").tag(UInt8(11))
                     }.disabled(model.guestClaimed)
-                    if mode == 10 {
+                    if mode == 11 {
+                        Picker("Direction", selection: $batchAction) { Text("Export project files").tag("push"); Text("Import replacements").tag("pull") }.disabled(model.guestClaimed || batchLoading)
+                        TextField("Batch folder name", text: $batchID).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed || batchLoading)
+                        TextField("Native relative paths, one per line", text: $batchPaths, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed || batchLoading)
+                            .onChange(of: batchPaths) { _, _ in batchSnapshots = [] }
+                        Button("Load saved snapshots") {
+                            batchLoading = true
+                            let paths = batchPaths.split(separator: "\n").map(String.init)
+                            Task { defer { batchLoading = false }; do { batchSnapshots = try await model.batchSnapshots(paths); report = "Loaded \(batchSnapshots.count) saved files" } catch { batchSnapshots = []; report = "Invalid, oversized or unsaved files" } }
+                        }.disabled(model.guestClaimed || batchLoading)
+                        ForEach(batchSnapshots, id: \.path) { snap in Text(snap.path + " · " + String(snap.text.utf8.count) + " bytes").font(.caption) }
+                        Text("Up to 8 UTF-8 files, 8 KiB each, 32 KiB total. Paths preserved in /root/nexus-transfer/batches/<batch>. Export creates only and may partially succeed. Import reviews each existing native file independently. No automatic sync or deletes.").font(.caption)
+                    } else if mode == 10 {
                         TextField("Reviewed absolute adapter argv (JSON)", text: $adapterArgv, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
                         TextField("Adapter executable SHA-256", text: $adapterDigest).autocorrectionDisabled().textInputAutocapitalization(.never).disabled(model.guestClaimed)
                         TextField("First message", text: $adapterPrompt, axis: .vertical).disabled(model.guestClaimed)
@@ -224,12 +244,18 @@ struct LocalToolsView: View {
                         Button("Reset saved Linux environment", role: .destructive) { resetWorkbench = false; confirmReset = true }.disabled(model.guestClaimed)
                     }
                     Button("Review and start local job") {
-                        frozenKeep = mode == 9 || mode == 10 ? true : mode == 6 ? keepCLIGuest : mode == 3 ? keepWorkbench : keepGuest
+                        frozenKeep = mode == 9 || mode == 10 || mode == 11 ? true : mode == 6 ? keepCLIGuest : mode == 3 ? keepWorkbench : keepGuest
                         frozenMode = mode
                         frozenVSIX = mode == 3 ? selectedVSIX : nil
                         frozenCLI = mode == 6 ? cliImport : nil
                         frozenHooks = mode == 1 && enableHooks
-                        if mode == 10 {
+                        if mode == 11 {
+                            let component: (String) -> Bool = { s in !s.isEmpty && s.utf8.count <= 128 && !s.hasPrefix(".") && s.utf8.allSatisfy { (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45,46,95].contains($0) } }
+                            guard component(batchID), batchID.utf8.count <= 64, !batchSnapshots.isEmpty, batchSnapshots.allSatisfy({ $0.path.utf8.count <= 256 && $0.path.components(separatedBy: "/").count <= 8 && $0.path.components(separatedBy: "/").allSatisfy(component) }) else { report = "Invalid batch name or path"; return }
+                            let rows = batchSnapshots.map { snap in batchAction == "push" ? ["path":snap.path,"text":snap.text] : ["path":snap.path] }
+                            guard let wire = try? JSONSerialization.data(withJSONObject: ["action":batchAction,"batch":batchID,"files":rows], options: [.sortedKeys]), wire.count <= 262144 else { report = "Invalid batch"; return }
+                            frozenInput = String(decoding: wire, as: UTF8.self)
+                        } else if mode == 10 {
                             guard let argv = try? ACPTerminalApproval.parse(Data(adapterArgv.utf8)), AGYImportFormat.validDigest(adapterDigest), !adapterPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, adapterPrompt.utf8.count <= 2048, !adapterPrompt.utf8.contains(0), adapterResume.utf8.count <= 128, adapterResume.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45,95].contains($0) }) else { report = "Invalid reviewed adapter request"; return }
                             var request: [String: Any] = ["argv":argv.arguments,"sha256":adapterDigest,"prompt":adapterPrompt]
                             if !adapterResume.isEmpty { request["resume"] = adapterResume }
@@ -284,7 +310,7 @@ struct LocalToolsView: View {
                             frozenInput = String(decoding: wire,as: UTF8.self)
                         } else { frozenInput = command }
                         confirm = true
-                    }.disabled(model.guestClaimed || importingVSIX || importingCLI || (mode == 10 ? adapterPrompt.isEmpty || !AGYImportFormat.validDigest(adapterDigest) : mode == 9 ? transferLoading || transferSnapshot == nil : mode == 8 ? lspLoading || lspSnapshot == nil || lspArgv.isEmpty : mode == 6 ? cliImport == nil : mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
+                    }.disabled(model.guestClaimed || importingVSIX || importingCLI || (mode == 11 ? batchLoading || batchSnapshots.isEmpty : mode == 10 ? adapterPrompt.isEmpty || !AGYImportFormat.validDigest(adapterDigest) : mode == 9 ? transferLoading || transferSnapshot == nil : mode == 8 ? lspLoading || lspSnapshot == nil || lspArgv.isEmpty : mode == 6 ? cliImport == nil : mode == 3 ? !stagedWorkbench : command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || command.utf8.count > 2048 || command.utf8.contains(0)))
                     Text("No provider key or native workspace injected. Commands and extensions may use the network and are not sandboxed. Restart app for another boot.").font(.caption)
                 }
                 if running && frozenMode != 2 && frozenMode != 4 {
@@ -341,6 +367,16 @@ struct LocalToolsView: View {
                             } label: { VStack(alignment: .leading) { Text(verbatim: lspItems[i].label); Text(verbatim: lspItems[i].text).font(.caption) } }
                             .disabled(running || model.reviewBusy)
                         }
+                    }
+                }
+                if !batchReplacements.isEmpty {
+                    Section("Review imported project files") {
+                        ForEach(batchSnapshots, id: \.path) { snap in
+                            if let replacement = batchReplacements[snap.path] {
+                                Button(snap.path) { transferSnapshot = snap; transferReplacement = replacement; batchReviewFile = true; reviewTitle = "Review project file"; transferReview = true }.disabled(model.reviewBusy)
+                            }
+                        }
+                        Button("Discard remaining imports", role: .destructive) { batchReplacements = [:] }.disabled(model.reviewBusy)
                     }
                 }
                 Section("Status") {
@@ -404,7 +440,7 @@ struct LocalToolsView: View {
                 Button("Start") { start() }
                 Button("Cancel", role: .cancel) { frozenInput = ""; frozenHooks = false; frozenVSIX = nil; frozenCLI = nil }
             } message: {
-                Text(frozenMode == 10 ? "Start this reviewed ACP adapter and send the first model message?\n" + frozenInput + "\nModel requests may incur charges; saved guest can retain credentials and history. No native grants." : frozenMode == 9 ? "Transfer this exact reviewed file to/from the saved Linux guest?\n" + frozenInput + "\nImport requires separate native review; no automatic overwrite." : frozenMode == 8 ? "Send this reviewed snapshot to the specified local LSP server?\n" + frozenInput + "\nNo native write grant. Server may use network or retain data." : frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
+                Text(frozenMode == 11 ? "Transfer these exact reviewed project files?\n" + frozenInput + "\nExport creates only; partial export possible. Import requires individual review." : frozenMode == 10 ? "Start this reviewed ACP adapter and send the first model message?\n" + frozenInput + "\nModel requests may incur charges; saved guest can retain credentials and history. No native grants." : frozenMode == 9 ? "Transfer this exact reviewed file to/from the saved Linux guest?\n" + frozenInput + "\nImport requires separate native review; no automatic overwrite." : frozenMode == 8 ? "Send this reviewed snapshot to the specified local LSP server?\n" + frozenInput + "\nNo native write grant. Server may use network or retain data." : frozenMode == 6 ? "Start this reviewed original CLI in Ubuntu?\n" + frozenInput + "\nNo provider key is supplied by Nexus. Use the CLI own sign-in. A text turn sends your prompt to the provider and may incur charges. Commands may access guest files and network; no security sandbox." + (frozenKeep ? "\nRetain this guest, including CLI-owned credentials, after clean shutdown." : "\nUse disposable guest.") : frozenHooks ? "Run this exact lifecycle plan locally? Before hook must succeed. After hook runs only after a successful main command; no hook after cancellation.\n" + frozenInput + "\nCommands can modify guest files or use its network. No security sandbox." + (frozenKeep ? "\nUse saved Linux environment." : "\nUse disposable Linux environment.") : frozenMode == 4 ? "Execute one reviewed MCP call (may have side effects):\n" + frozenInput : frozenMode == 3 ? "Launch reviewed OpenVSCode on loopback with a random token. No native workspace mount. No guarantee of compatibility." + (frozenKeep ? "\nUse saved workbench files, settings and extensions." : "\nUse disposable workbench.") + (frozenVSIX.map { "\nInstall this reviewed VSIX before startup: " + $0.digest } ?? "") : "Run this reviewed command locally:\n" + frozenInput + "\nNo provider key is injected. It may use the network, modify guest files or consume resources. No automatic execution." + (frozenKeep ? "\nUse saved Linux environment. Changes persist after clean shutdown." : "\nUse disposable Linux environment."))
             }
             .sheet(isPresented: $transferReview) {
                 NavigationStack {
@@ -421,13 +457,13 @@ struct LocalToolsView: View {
                         }.padding().frame(maxWidth: .infinity, alignment: .leading)
                     }.navigationTitle(reviewTitle)
                     .toolbar {
-                        ToolbarItem(placement: .cancellationAction) { Button("Discard") { transferReplacement = nil; transferReview = false }.disabled(model.reviewBusy) }
+                        ToolbarItem(placement: .cancellationAction) { Button("Discard") { if batchReviewFile, let snap = transferSnapshot { batchReplacements.removeValue(forKey: snap.path) }; batchReviewFile = false; transferReplacement = nil; transferReview = false }.disabled(model.reviewBusy) }
                         ToolbarItem(placement: .confirmationAction) {
                             Button("Apply") {
                                 guard let snap = transferSnapshot, let replacement = transferReplacement else { return }
                                 Task {
-                                    do { try await model.applyReviewedTransfer(snap, replacement: replacement); report = "Reviewed transfer applied"; transferReplacement = nil; transferReview = false }
-                                    catch { report = "Import conflict: native file or editor changed"; transferReplacement = nil; transferReview = false }
+                                    do { if batchReviewFile { try await model.applyReviewedBatchFile(snap, replacement: replacement); batchReplacements.removeValue(forKey: snap.path) } else { try await model.applyReviewedTransfer(snap, replacement: replacement) }; batchReviewFile = false; report = "Reviewed transfer applied"; transferReplacement = nil; transferReview = false }
+                                    catch { if batchReviewFile { batchReplacements.removeValue(forKey: snap.path) }; batchReviewFile = false; report = "Import conflict: native file or editor changed"; transferReplacement = nil; transferReview = false }
                                 }
                             }.disabled(model.reviewBusy)
                         }
@@ -491,6 +527,11 @@ struct LocalToolsView: View {
             report = await Task.detached(priority: .userInitiated) {
                 LocalRunner.run(mode: selectedMode, input: input, persistent: persistent, vsix: vsix, cli: cli)
             }.value
+            if selectedMode == 11, let obj = try? JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any], obj["ok"] as? Bool == true, obj["shutdownClean"] as? Bool == true, obj["action"] as? String == "pull", let rows = obj["files"] as? [[String: Any]], rows.count == batchSnapshots.count {
+                var result: [String: String] = [:]
+                for (snap, row) in zip(batchSnapshots, rows) { if row["name"] as? String == "batches/" + batchID + "/" + snap.path, let text = row["text"] as? String, text.utf8.count <= 8192, !text.utf8.contains(0) { result[snap.path] = text } }
+                if result.count == batchSnapshots.count { batchReplacements = result; report = "Project files ready for individual review" } else { report = "Batch response mismatch; no imports staged" }
+            }
             if selectedMode == 9, let obj = try? JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any], obj["ok"] as? Bool == true, obj["shutdownClean"] as? Bool == true, obj["action"] as? String == "pull", let text = obj["text"] as? String, text.utf8.count <= 8192, !text.utf8.contains(0) {
                 transferReplacement = text; reviewTitle = "Review Linux import"; transferReview = true; report = "Linux file retrieved; native review required"
             }
