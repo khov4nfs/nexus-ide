@@ -53,6 +53,8 @@ char *nexus_local_run(const char *rootfs_data_path, uint8_t mode, const char *in
 char *nexus_local_progress(void);
 char *nexus_live_lsp_status(void);
 char *nexus_live_lsp_change(uint32_t version,const char *text);
+// Reviewed logical document key and saved text, no native filesystem path grant.
+char *nexus_live_lsp_document(uint32_t version,const char *input);
 char *nexus_live_lsp_finish(uint32_t version);
 char *nexus_local_input(const char *input);
 // Bounded raw bytes, monotonic absolute cursor, explicit gap on truncation.
