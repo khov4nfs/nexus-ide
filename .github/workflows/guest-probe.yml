@@ -741,6 +741,7 @@ jobs:
           "$RUNNER_TEMP/nexus-browser/bin/python" -m playwright install chromium
       - name: Boot reviewed real OpenVSCode and verify browser editor and extension activation
         if: matrix.variant == 'workbench'
+        timeout-minutes: 14
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
           export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
