@@ -299,6 +299,27 @@ async fn run_agent_session(guest:&IshInstance,env:&HashMap<String,String>,kind:&
     r["ok"]=json!(r["ok"]==true&&after.unwrap_or(true)&&verified_after&&!stop_requested());
     r
 }
+// Diagnostic only. Never start a daemon, run an image, mount anything, or
+// connect to a Docker socket. A positive primitive is not Engine support.
+fn container_capabilities(guest:&IshInstance,env:&HashMap<String,String>)->Value{
+    let tests=[
+        ("namespaceEntries","test -e /proc/self/ns/user && test -e /proc/self/ns/mnt && test -e /proc/self/ns/pid && test -e /proc/self/ns/net"),
+        ("userNamespace","command -v unshare >/dev/null && unshare --user --map-root-user /usr/bin/true"),
+        ("mountNamespace","command -v unshare >/dev/null && unshare --mount /usr/bin/true"),
+        ("cgroupV2Visible","test -r /sys/fs/cgroup/cgroup.controllers"),
+        ("overlayListed","grep -qw overlay /proc/filesystems"),
+        ("dockerCLIInstalled","command -v docker >/dev/null"),
+        ("daemonSocketVisible","test -S /var/run/docker.sock"),
+    ];
+    let mut rows=serde_json::Map::new();
+    for (name,script) in tests{
+        if stop_requested(){return fail("Capability probe cancelled");}
+        let argv=vec!["/bin/sh".into(),"-c".into(),script.into()];
+        let (status,_)=guest.run_oneshot(&argv,Path::new("/"),env,Some(5000));
+        rows.insert(name.into(),json!(status==0));
+    }
+    json!({"ok":true,"diagnosticOnly":true,"backend":"embedded-user-mode","capabilities":rows,"dockerEngineVerified":false,"composeVerified":false,"fullSystemVMVerified":false})
+}
 fn run(path: &Path, mode: u8, input: &str) -> Value {
     let call=if mode==4 {match parse_call(input) {Some(v)=>Some(v),None=>return fail("Invalid MCP call")}} else {None};
     let hooks=if mode==5 {match parse_hooks(input) {Some(v)=>Some(v),None=>return fail("Invalid hook plan")}} else {None};
@@ -308,7 +329,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let transfer=if mode==9 {match parse_transfer(input){Some(v)=>Some(v),None=>return fail("Invalid workspace transfer")}}else{None};
     let adapter=if mode==10 {match parse_adapter(input){Some(v)=>Some(v),None=>return fail("Invalid reviewed ACP adapter request")}}else{None};
     let batch=if mode==11 {match parse_batch(input){Some(v)=>Some(v),None=>return fail("Invalid batch transfer")}}else{None};
-    if !matches!(mode,1..=6|8|9|10|11|12) ||
+    if !matches!(mode,1..=6|8|9|10|11|12|13) || (mode==13&&input!="probe") ||
         (matches!(mode,1|2) && !valid_command(input)) { return fail("Invalid local job"); }
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
@@ -336,6 +357,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         ("TERM".into(),if matches!(mode,1|5|6) {"xterm-256color".into()} else {"dumb".into()}),("NODE_OPTIONS".into(),"--jitless".into())]);
     let libc = rt.block_on(process_probe::glibc_compat(&guest,&env));
     let mut result = if libc["passed"] != true { fail("Ubuntu compatibility failed") }
+        else if mode==13 {container_capabilities(&guest,&env)}
         else if let Some(request)=adapter.as_ref(){rt.block_on(crate::persistent_acp::local_adapter_session(&guest,&env,request,false))}
         else if let Some(request)=batch.as_ref(){rt.block_on(run_batch(&guest,&env,request))}
         else if let Some(request)=transfer.as_ref(){rt.block_on(process_probe::workspace_transfer(&guest,&env,request))}
@@ -630,6 +652,21 @@ mod tests {
         let ok=if matches!(phase.as_str(),"success"|"resume"){driven&&r["ok"]==true&&r["turnsCompleted"]==2&&r["permissionDenials"]==1&&p["agentHandle"]=="adapter-fixture"&&p["agentTurns"][1]["response"]=="Second adapter reply"&&r["sessionLoaded"]==json!(phase=="resume")}else{r["ok"]==false&&p["agentTurns"].as_array().is_some_and(|a|a.is_empty())};
         std::fs::write(report,serde_json::to_vec_pretty(&json!({"ok":ok&&clean,"fixtureOnly":true,"phase":phase,"shutdownClean":clean})).unwrap()).unwrap();
         assert!(ok&&clean,"ACP adapter fixture failed: {r}");
+    }
+    #[test]
+    #[ignore = "requires Ubuntu fakefs; reports only observed primitives"]
+    fn real_container_capabilities(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let r=run(Path::new(&path),13,"probe");
+        assert_eq!(r["ok"],true);
+        assert_eq!(r["shutdownClean"],true);
+        assert_eq!(r["diagnosticOnly"],true);
+        assert_eq!(r["dockerEngineVerified"],false);
+        assert_eq!(r["composeVerified"],false);
+        assert_eq!(r["fullSystemVMVerified"],false);
+        assert_eq!(r["capabilities"].as_object().unwrap().len(),7);
+        std::fs::write(evidence,serde_json::to_vec_pretty(&r).unwrap()).unwrap();
     }
     #[test]
     fn batch_input_bounds(){

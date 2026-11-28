@@ -494,6 +494,21 @@ jobs:
           name: local-adapter-fixture-evidence
           path: ${{ runner.temp }}/nexus-adapter-*.json
           if-no-files-found: error
+      - name: Observe container prerequisites without enabling Docker
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-container-capabilities-fs"
+          export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-container-capabilities-fs/data"
+          export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-container-capabilities.json"
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_container_capabilities -- --ignored --nocapture --test-threads=1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: container-prerequisite-diagnostic
+          path: ${{ runner.temp }}/nexus-container-capabilities.json
+          if-no-files-found: error
       - name: Verify nested multi-file transfer across independent boots
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"

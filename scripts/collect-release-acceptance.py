@@ -18,6 +18,7 @@ def gates(variant):
         rows[name] = ("synthetic ACP peer", {"ok": True, "fixtureOnly": True})
     for name in ("local-pty", "local-mcp", "local-call"):
         rows[name] = ("macOS guest local job", {"ok": True, "shutdownClean": True})
+    rows["container-capabilities"] = ("macOS guest prerequisite diagnostic only", {"ok": True, "shutdownClean": True, "diagnosticOnly": True, "dockerEngineVerified": False, "composeVerified": False, "fullSystemVMVerified": False})
     rows["slot-evidence"] = ("Ubuntu ELF fixture, not AGY", {"ok": True, "shutdownClean": True, "digestVerified": True})
     for name in ("google", "google-edit", "snapshot", "mcp-session", "terminal", "codex-probe"):
         rows[name] = ("synthetic protocol peer", {"ok": True, "fixtureOnly": True, "shutdownClean": True})
@@ -94,6 +95,7 @@ def collect(evidence, package, commit, variant):
         "ciAcceptancePassed": True, "checks": reports,
         "physicalDeviceVerified": False, "realProviderAuthVerified": False,
         "realProviderInferenceVerified": False, "productionReady": False,
+        "containerBackend": "embedded-user-mode", "dockerEngineVerified": False, "composeVerified": False, "fullSystemVMVerified": False,
         "remaining": ["signed physical iPhone acceptance", "real imported provider binaries and auth/inference",
                       "workbench editor/extension activation and LSP", "license and source obligations",
                       "full-system VM/Docker not implemented"],

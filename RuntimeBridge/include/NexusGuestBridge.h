@@ -46,7 +46,7 @@ char *nexus_acp_chat_terminal(const char *text,const char *choice);
 char *nexus_acp_prompt_progress(void);
 char *nexus_acp_cancel_prompt(void);
 char *nexus_acp_close(void);
-// Separate local boot: 1 PTY, 2 MCP discovery, 3 workbench, 4 MCP call, 5 PTY with reviewed lifecycle hooks, 6 reviewed original CLI, 8 LSP diagnostics, 9 workspace transfer, 10 reviewed local ACP adapter, 11 bounded multi-file transfer, 12 live versioned LSP.
+// Separate local boot: 1 PTY, 2 MCP discovery, 3 workbench, 4 MCP call, 5 PTY with reviewed lifecycle hooks, 6 reviewed original CLI, 8 LSP diagnostics, 9 workspace transfer, 10 reviewed local ACP adapter, 11 bounded multi-file transfer, 12 live versioned LSP, 13 container prerequisite diagnostic.
 #include <stdint.h>
 char *nexus_local_run(const char *rootfs_data_path, uint8_t mode, const char *input);
 char *nexus_local_progress(void);
