@@ -57,6 +57,9 @@ on:
       - 'scripts/workbench-lsp-session.js'
       - 'scripts/test-workbench-lsp-session.js'
       - 'scripts/workbench-lsp-edits.js'
+      - 'scripts/lsp-typescript/**'
+      - 'scripts/prepare-typescript-lsp-bundle.py'
+      - 'scripts/test-real-typescript-lsp.js'
       - 'scripts/test-workbench-lsp-edits.js'
       - 'scripts/workbench-browser-probe.py'
       - 'scripts/test-agy-import.py'
@@ -791,7 +794,8 @@ jobs:
           done
           pylsp="$RUNNER_TEMP/nexus-pylsp-stage/pylsp-rootfs.tar.gz"
           (cd "$RUNNER_TEMP/nexus-pylsp-stage" && shasum -a 256 -c SHA256SUMS)
-          python3 scripts/prepare-workbench-rootfs.py --archive "$asset" --source-license "$RUNNER_TEMP/LICENSE.txt" --source-notices "$RUNNER_TEMP/ThirdPartyNotices.txt" --pylsp-rootfs "$pylsp" --pylsp-rootfs-sha256 "$(shasum -a 256 "$pylsp" | awk '{print $1}')" --confirm-local-use
+          python3 scripts/prepare-typescript-lsp-bundle.py "$RUNNER_TEMP/typescript-lsp.tar.gz"
+          python3 scripts/prepare-workbench-rootfs.py --lsp-bundle "$RUNNER_TEMP/typescript-lsp.tar.gz" --lsp-bundle-sha256 "$(shasum -a 256 "$RUNNER_TEMP/typescript-lsp.tar.gz" | awk '{print $1}')" --archive "$asset" --source-license "$RUNNER_TEMP/LICENSE.txt" --source-notices "$RUNNER_TEMP/ThirdPartyNotices.txt" --pylsp-rootfs "$pylsp" --pylsp-rootfs-sha256 "$(shasum -a 256 "$pylsp" | awk '{print $1}')" --confirm-local-use
           mv RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/plain-ubuntu-staged"
           bash scripts/stage-ubuntu-device.sh --workbench
       - name: Prepare pinned CI-only Chromium browser harness
@@ -823,7 +827,7 @@ jobs:
           python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["nodeRuntimeVerified"] is True and r["extensionDigestVerified"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is True and r["lspFixtureOnly"] is True' "$NEXUS_WORKBENCH_EVIDENCE"
       - name: Verify persistent real Workbench Python C and C++ LSP through Chromium
         if: matrix.variant == 'workbench'
-        timeout-minutes: 40
+        timeout-minutes: 48
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
           export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
@@ -844,7 +848,7 @@ jobs:
           export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-real-pylsp.vsix" | awk '{print $1}')"
           cat "$RUNNER_TEMP/nexus-real-pylsp.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
-          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","shutdownClean","extensionActivationVerified","editorVerified","lspVerified","realDiagnosticsVerified","realCompletionVerified"]) and r["lspFixtureOnly"] is False and r["realServerVersion"]=="1.10.0" and r["persistentMultiLanguageVerified"] is True and r["crossFileDefinitionReferencesRenameVerified"] is True and r["clangdVersion"]=="18.1.3"' "$NEXUS_WORKBENCH_EVIDENCE"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","shutdownClean","extensionActivationVerified","editorVerified","lspVerified","realDiagnosticsVerified","realCompletionVerified"]) and r["lspFixtureOnly"] is False and r["realServerVersion"]=="1.10.0" and r["persistentMultiLanguageVerified"] is True and r["crossFileDefinitionReferencesRenameVerified"] is True and r["typescriptJavaScriptRealVerified"] is True and r["clangdVersion"]=="18.1.3"' "$NEXUS_WORKBENCH_EVIDENCE"
       - name: Collect bounded native crash stack (CI-only)
         if: failure() && matrix.variant == 'workbench' && steps.workbench_gate.outcome == 'failure'
         timeout-minutes: 2
