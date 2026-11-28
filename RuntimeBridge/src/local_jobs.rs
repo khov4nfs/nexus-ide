@@ -1097,12 +1097,18 @@ mod tests {
                             entry.path().join("package.json").is_file()
                     }))
         });
+        let real_lsp=std::env::var("NEXUS_WORKBENCH_REAL_LSP").as_deref()==Ok("1");
         let root=guest_path.join("root/nexus-workbench");
         let activated=browser_ok&&std::fs::read(root.join("nexus-extension-activated.marker")).ok().as_deref()==Some(b"activated");
         let editor_verified=activated&&std::fs::read(root.join("nexus-editor-saved.marker")).ok().as_deref()==Some(b"saved");
-        let lsp_verified=editor_verified&&std::fs::read(root.join("nexus-lsp-transport.marker")).ok().as_deref()==Some(b"completed")&&std::fs::read(root.join("nexus-lsp-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join("nexus-editor-fixture.txt")).ok().as_deref()==Some(b"NEXUS_BROWSER_EDITOR_SAVED\nNEXUS_LSP_COMPLETION");
+        let real_diagnostics=real_lsp&&editor_verified&&std::fs::read(root.join("nexus-real-diagnostics.marker")).ok().as_deref()==Some(b"pylsp-1.10.0");
+        let (file,expected):(&str,&[u8])=if real_lsp{
+            ("nexus-real-lsp.py",b"missing_nexus_symbol\nclass NexusCompletion:\n    nexus_value = 42\nitem = NexusCompletion()\nitem.nexus_value")
+        }else{("nexus-editor-fixture.txt",b"NEXUS_BROWSER_EDITOR_SAVED\nNEXUS_LSP_COMPLETION")};
+        let real_completion=real_lsp&&std::fs::read(root.join("nexus-real-completion.marker")).ok().as_deref()==Some(b"pylsp-1.10.0");
+        let lsp_verified=editor_verified&&std::fs::read(root.join("nexus-lsp-transport.marker")).ok().as_deref()==Some(b"completed")&&std::fs::read(root.join("nexus-lsp-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join(file)).ok().as_deref()==Some(expected)&&(!real_lsp||(real_diagnostics&&real_completion));
         let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified&&lsp_verified)),
-            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"nodeRuntimeVerified":closed["nodeRuntimeVerified"],"extensionDigestVerified":closed["extensionDigestVerified"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":lsp_verified,"lspFixtureOnly":true});
+            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"nodeRuntimeVerified":closed["nodeRuntimeVerified"],"extensionDigestVerified":closed["extensionDigestVerified"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":lsp_verified,"lspFixtureOnly":!real_lsp,"realDiagnosticsVerified":real_diagnostics,"realCompletionVerified":real_completion,"realServerVersion":if real_diagnostics&&real_completion{Some("1.10.0")}else{None}});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         println!("{report}");
         assert_eq!(report["ok"],true);
