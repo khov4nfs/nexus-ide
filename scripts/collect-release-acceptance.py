@@ -33,6 +33,7 @@ def gates(variant):
         "lsp": ("success", "invalidUri", "invalidRange", "completion", "completionInvalid"),
         "transfer": ("push", "duplicate", "pull"),
         "batch": ("push", "duplicate", "pull", "missing"),
+        "live-lsp": ("success", "future"),
     }
     for group, phases in groups.items():
         for phase in phases:

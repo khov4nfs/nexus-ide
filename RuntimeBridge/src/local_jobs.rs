@@ -53,6 +53,40 @@ fn agent_send(ticket:u32,text:Option<String>)->Value{
     a.waiting=false;
     json!({"ok":true})
 }
+#[derive(Default)]
+struct LiveLsp {version:u32,waiting:bool,pending:Option<String>,finish:bool,diagnostics:Vec<Value>}
+static LIVE_LSP:Mutex<Option<LiveLsp>>=Mutex::new(None);
+pub(crate) enum LspNext {Change(String),Finish,Stop}
+pub(crate) fn lsp_publish(version:u32,diagnostics:Vec<Value>)->bool{
+    if stop_requested(){return false;}
+    let Ok(mut slot)=LIVE_LSP.lock()else{return false;};
+    let Some(s)=slot.as_mut()else{return false;};
+    s.version=version;s.diagnostics=diagnostics;s.waiting=version<10;true
+}
+pub(crate) async fn lsp_wait()->LspNext{
+    let until=std::time::Instant::now()+std::time::Duration::from_secs(180);
+    loop{
+        if stop_requested(){return LspNext::Stop;}
+        {
+            let Ok(mut slot)=LIVE_LSP.lock()else{return LspNext::Stop;};
+            let Some(s)=slot.as_mut()else{return LspNext::Stop;};
+            if let Some(text)=s.pending.take(){s.waiting=false;return LspNext::Change(text);}
+            if s.finish||s.version>=10||std::time::Instant::now()>=until{s.waiting=false;return LspNext::Finish;}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+fn lsp_control(version:u32,text:Option<String>)->Value{
+    if stop_requested(){return fail("LSP stopped");}
+    let Ok(mut slot)=LIVE_LSP.lock()else{return fail("LSP unavailable");};
+    let Some(s)=slot.as_mut()else{return fail("No live LSP");};
+    if s.version!=version||!s.waiting||s.finish||s.pending.is_some(){return fail("Stale or busy LSP version");}
+    if let Some(text)=text{if text.len()>8192||text.contains('\0'){return fail("Invalid snapshot");}s.pending=Some(text);s.diagnostics.clear();}else{s.finish=true;}
+    s.waiting=false;json!({"ok":true})
+}
+fn lsp_status()->Value{
+    LIVE_LSP.lock().ok().and_then(|slot|slot.as_ref().map(|s|json!({"active":true,"version":s.version,"waiting":s.waiting,"diagnostics":s.diagnostics}))).unwrap_or_else(||json!({"active":false}))
+}
 struct State {
     running: bool, ready: bool, mode: u8, output: String, raw: Vec<u8>, total: u64,
     controls: VecDeque<Control>, stop: bool, agent:Option<AgentMailbox>,
@@ -242,6 +276,7 @@ fn enqueue(control: Control) -> Value {
 struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
+        if let Ok(mut slot)=LIVE_LSP.lock(){*slot=None;}
         if let Ok(mut s) = STATE.lock() { s.running = false; s.ready = false; s.controls.clear(); if let Some(a)=s.agent.as_mut(){a.waiting=false;a.pending=None;} }
     }
 }
@@ -269,11 +304,11 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let hooks=if mode==5 {match parse_hooks(input) {Some(v)=>Some(v),None=>return fail("Invalid hook plan")}} else {None};
     let workbench=if mode==3 {match parse_workbench(input) {Some(v)=>Some(v),None=>return fail("Invalid workbench launch")}} else {None};
     let cli=if mode==6 {match parse_cli(input) {Some(v)=>Some(v),None=>return fail("Invalid CLI launch")}} else {None};
-    let lsp=if mode==8 {match parse_lsp(input){Some(v)=>Some(v),None=>return fail("Invalid LSP snapshot request")}}else{None};
+    let lsp=if matches!(mode,8|12) {match parse_lsp(input){Some(v) if mode==8||v.completion.is_none()=>Some(v),_=>return fail("Invalid LSP snapshot request")}}else{None};
     let transfer=if mode==9 {match parse_transfer(input){Some(v)=>Some(v),None=>return fail("Invalid workspace transfer")}}else{None};
     let adapter=if mode==10 {match parse_adapter(input){Some(v)=>Some(v),None=>return fail("Invalid reviewed ACP adapter request")}}else{None};
     let batch=if mode==11 {match parse_batch(input){Some(v)=>Some(v),None=>return fail("Invalid batch transfer")}}else{None};
-    if !matches!(mode,1..=6|8|9|10|11) ||
+    if !matches!(mode,1..=6|8|9|10|11|12) ||
         (matches!(mode,1|2) && !valid_command(input)) { return fail("Invalid local job"); }
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
@@ -289,6 +324,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     *s = State { running:true,ready:false,mode:if native{7}else if matches!(mode,5|6) {1}else{mode},output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false,agent:if native{Some(AgentMailbox::default())}else{None} };
     drop(s);
     let _guard = Guard;
+    if mode==12{if let Ok(mut slot)=LIVE_LSP.lock(){*slot=Some(LiveLsp::default());}else{return fail("LSP mailbox unavailable");}}
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt, Err(_) => return fail("Runtime creation failed; restart app"),
     };
@@ -303,7 +339,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         else if let Some(request)=adapter.as_ref(){rt.block_on(crate::persistent_acp::local_adapter_session(&guest,&env,request,false))}
         else if let Some(request)=batch.as_ref(){rt.block_on(run_batch(&guest,&env,request))}
         else if let Some(request)=transfer.as_ref(){rt.block_on(process_probe::workspace_transfer(&guest,&env,request))}
-        else if let Some(request)=lsp.as_ref(){rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}
+        else if let Some(request)=lsp.as_ref(){if mode==12{rt.block_on(process_probe::live_lsp(&guest,&env,request,false))}else{rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}}
         else if let Some(plan)=hooks.as_ref() {
             let before=plan["before"].as_str();
             let after=plan["after"].as_str();
@@ -389,6 +425,14 @@ pub unsafe extern "C" fn nexus_local_run(path:*const c_char,mode:u8,input:*const
 }
 #[no_mangle]
 pub extern "C" fn nexus_local_progress() -> *mut c_char { ffi(progress) }
+#[no_mangle]
+pub extern "C" fn nexus_live_lsp_status()->*mut c_char{ffi(lsp_status)}
+/// # Safety
+/// text must be a NUL-terminated UTF-8 string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_live_lsp_change(version:u32,text:*const c_char)->*mut c_char{ffi(||match arg(text){Some(t)=>lsp_control(version,Some(t)),None=>fail("Missing snapshot")})}
+#[no_mangle]
+pub extern "C" fn nexus_live_lsp_finish(version:u32)->*mut c_char{ffi(||lsp_control(version,None))}
 /// # Safety
 /// Pointer must be valid NUL-terminated UTF-8 for the duration of the call.
 #[no_mangle]
@@ -646,6 +690,44 @@ mod tests {
         }&&r["shutdownClean"]==true;
         std::fs::write(evidence,serde_json::to_vec_pretty(&json!({"ok":ok,"phase":phase,"shutdownClean":r["shutdownClean"],"fixtureOnly":true})).unwrap()).unwrap();
         assert!(ok,"transfer failed: {}",r["error"]);
+    }
+    #[test]
+    #[ignore = "requires independent Ubuntu boot"]
+    fn real_live_lsp_fixture(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_LIVE_LSP_PHASE").expect("phase");
+        let input=parse_lsp(&json!({"argv":["/usr/bin/server"],"language":"python","extension":"py","text":"x = 1\n"}).to_string()).unwrap();
+        *LIVE_LSP.lock().unwrap()=Some(LiveLsp::default());
+        {let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=12;}
+        let driver=std::thread::spawn(||{
+            let until=std::time::Instant::now()+std::time::Duration::from_secs(30);
+            let mut sent=false;
+            while std::time::Instant::now()<until{
+                let p=lsp_status();
+                if p["waiting"]==true&&p["version"]==1&&!sent{
+                    assert_eq!(lsp_control(0,Some("stale".into()))["ok"],false);
+                    assert_eq!(lsp_control(1,Some("x = 2\n".into()))["ok"],true);
+                    assert_eq!(lsp_control(1,Some("duplicate".into()))["ok"],false);sent=true;
+                }else if p["waiting"]==true&&p["version"]==2{
+                    return p["diagnostics"][0]["message"]=="version two"&&lsp_control(2,None)["ok"]==true;
+                }
+                if !STATE.lock().unwrap().running{return false;}
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let _=enqueue(Control::Stop);false
+        });
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin".into()),("HOME".into(),"/root".into()),("NEXUS_LIVE_LSP_PHASE".into(),phase.clone())]);
+        let r=rt.block_on(process_probe::live_lsp(&guest,&env,&input,true));
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        STATE.lock().unwrap().running=false;
+        let driven=driver.join().unwrap();
+        *LIVE_LSP.lock().unwrap()=None;
+        let ok=clean&&if phase=="success"{driven&&r["ok"]==true&&r["versions"]==2}else{r["ok"]==false&&!driven};
+        std::fs::write(evidence,serde_json::to_vec_pretty(&json!({"ok":ok,"phase":phase,"fixtureOnly":true,"shutdownClean":clean})).unwrap()).unwrap();
+        assert!(ok,"live LSP fixture failed: {r}");
     }
     #[test]
     fn lsp_input_bounds(){
