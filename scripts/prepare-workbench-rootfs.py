@@ -6,6 +6,7 @@ not an independent signature. Do not distribute proprietary AGY.
 """
 import argparse
 import copy
+import hashlib
 import io
 import importlib.util
 from pathlib import Path, PurePosixPath
@@ -23,6 +24,9 @@ VERSION = "1.109.5"
 PREFIX = f"openvscode-server-v{VERSION}-linux-arm64"
 SHA = "36d9c14036489b63de84ebace837fcacf7e60e669a0dc715802c5443684ea4dc"
 ASSET = f"https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v{VERSION}/{PREFIX}.tar.gz"
+SOURCE_COMMIT = "4ffe2270acdf711bbefecc3e8c79f4b3631640e5"
+SOURCE_DOCUMENTS = {"LICENSE.txt": (1088, "0ac28ee234d232ac0691f39cebf95bf6b2a763a5"),
+                    "ThirdPartyNotices.txt": (157153, "896b59001d6166773fa6771e20287fbbd1e947cf")}
 DEST = "opt/nexus/workbench"
 VSIX_SLOT = "opt/nexus/extension.vsix"
 VSIX_MARKER = b"NEXUS_VSIX_IMPORT_SLOT_V1\n"
@@ -33,7 +37,17 @@ def add_dir(dst, name):
     info.mode = 0o755
     dst.addfile(info)
 
-def overlay(original, package, output):
+def verify_source_document(path, name):
+    size, blob = SOURCE_DOCUMENTS[name]
+    if not path.is_file() or path.is_symlink() or path.stat().st_size != size:
+        raise ValueError("Expected pinned upstream source document: " + name)
+    data = path.read_bytes()
+    actual = hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
+    if len(data) != size or actual != blob:
+        raise ValueError("Upstream source Git blob mismatch: " + name)
+    return data
+
+def overlay(original, package, output, source_documents=None):
     with tarfile.open(original, "r:gz") as src, tarfile.open(package, "r:gz") as pkg, tarfile.open(output, "x:gz") as dst:
         dirs = set()
         for member in src:
@@ -89,13 +103,28 @@ def overlay(original, package, output):
                 name = parent.as_posix()
                 if name != "." and (name not in members or not members[name].isdir()):
                     raise ValueError("Missing or non-directory ancestor")
-        for required in ("bin/openvscode-server", "node", "LICENSE"):
-            # The release may name its license LICENSE.txt instead.
-            if required == "LICENSE":
-                if not any(name in members and members[name].isfile() for name in ("LICENSE", "LICENSE.txt")):
-                    raise ValueError("Missing release license")
-            elif required not in members or not members[required].isfile() or not members[required].mode & 0o111:
+        for required in ("bin/openvscode-server", "node"):
+            if required not in members or not members[required].isfile() or not members[required].mode & 0o111:
                 raise ValueError("Missing executable: " + required)
+        has_license = any(name in members and members[name].isfile() and members[name].size > 0
+                          for name in ("LICENSE", "LICENSE.txt"))
+        if not has_license and source_documents is None:
+            raise ValueError("Missing release license; supply verified upstream --source-license and --source-notices")
+        if source_documents is not None:
+            if set(source_documents) != set(SOURCE_DOCUMENTS):
+                raise ValueError("Incomplete upstream source documents")
+            # Preserve archive files unchanged. Add exact source notices under
+            # reserved names, and canonical LICENSE.txt only if absent.
+            additions = {"NEXUS-UPSTREAM-" + name: data for name, data in source_documents.items()}
+            if not has_license:
+                additions["LICENSE.txt"] = source_documents["LICENSE.txt"]
+            for relative, data in additions.items():
+                if relative in members or any(name.startswith(relative + "/") for name in members):
+                    raise ValueError("Upstream source document destination collision")
+                info = tarfile.TarInfo("./" + DEST + "/" + relative)
+                info.mode = 0o644
+                info.size = len(data)
+                dst.addfile(info, io.BytesIO(data))
         for relative, member in members.items():
             info = copy.copy(member)
             info.name = "./" + DEST + "/" + relative
@@ -113,9 +142,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--confirm-local-use", action="store_true", required=True)
+    parser.add_argument("--source-license", type=Path)
+    parser.add_argument("--source-notices", type=Path)
     parser.add_argument("--agy-binary", type=Path)
     parser.add_argument("--agy-sha256")
     args = parser.parse_args()
+    if bool(args.source_license) != bool(args.source_notices):
+        parser.error("Provide both pinned upstream source documents or neither")
+    source_documents = ({"LICENSE.txt": verify_source_document(args.source_license, "LICENSE.txt"),
+                         "ThirdPartyNotices.txt": verify_source_document(args.source_notices, "ThirdPartyNotices.txt")}
+                        if args.source_license else None)
     if bool(args.agy_binary) != bool(args.agy_sha256):
         parser.error("Provide both optional AGY arguments or neither")
     if not args.archive.is_file() or args.archive.is_symlink() or args.archive.stat().st_size != 74488835:
@@ -149,7 +185,7 @@ def main():
             original = stage / "with-slot.tar.gz"
             agy.overlay_import_slot(agy.UBUNTU, original)
         archive = stage / "rootfs.tar.gz"
-        overlay(original, package, archive)
+        overlay(original, package, archive, source_documents)
         fs = stage / "fs"
         subprocess.run([str(converter), str(archive), str(fs)], check=True)
         subprocess.run(["sqlite3", str(fs / "meta.db"), "PRAGMA wal_checkpoint(TRUNCATE);"], check=True)
@@ -165,7 +201,13 @@ def main():
             if agy.digest(fs / "data/opt/nexus/agy") != args.agy_sha256:
                 raise SystemExit("AGY digest mismatch after conversion")
             (fs / "agy.sha256").write_text(args.agy_sha256 + "\n")
-        (fs / "provenance.txt").write_text(f"ubuntu_sha256={agy.UBUNTU_SHA}\nworkbench_source={ASSET}\nworkbench_sha256={SHA}\n" + (f"agy_sha256={args.agy_sha256}\n" if args.agy_binary else ""))
+        source_provenance = ""
+        if source_documents is not None:
+            for name, data in source_documents.items():
+                if (fs / "data" / DEST / ("NEXUS-UPSTREAM-" + name)).read_bytes() != data:
+                    raise ValueError("Source document conversion mismatch")
+            source_provenance = f"workbench_source_commit={SOURCE_COMMIT}\n" + "".join(f"workbench_source_{name}_sha256={hashlib.sha256(data).hexdigest()}\n" for name, data in source_documents.items())
+        (fs / "provenance.txt").write_text(f"ubuntu_sha256={agy.UBUNTU_SHA}\nworkbench_source={ASSET}\nworkbench_sha256={SHA}\n" + source_provenance + (f"agy_sha256={args.agy_sha256}\n" if args.agy_binary else ""))
         if target.exists() or target.is_symlink():
             raise SystemExit("Target appeared during import")
         fs.rename(target)

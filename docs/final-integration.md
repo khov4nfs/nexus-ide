@@ -67,3 +67,5 @@ Upstream references:
 - https://agentclientprotocol.com/protocol/v1/file-system
 - https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle
 - https://github.com/utmapp/UTM
+
+For the pinned OpenVSCode v1.109.5 archive, if the release lacks a root license, obtain both `LICENSE.txt` and `ThirdPartyNotices.txt` from https://github.com/gitpod-io/openvscode-server/tree/4ffe2270acdf711bbefecc3e8c79f4b3631640e5 and pass `--source-license /path/to/LICENSE.txt --source-notices /path/to/ThirdPartyNotices.txt` to the importer. It checks the exact source Git blob hashes and preserves the notices. This does not replace distribution license review.

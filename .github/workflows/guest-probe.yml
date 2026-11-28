@@ -726,7 +726,11 @@ jobs:
         run: |
           asset="$RUNNER_TEMP/openvscode-server-v1.109.5-linux-arm64.tar.gz"
           curl --proto '=https' --tlsv1.2 --fail --location --retry 2 https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v1.109.5/openvscode-server-v1.109.5-linux-arm64.tar.gz -o "$asset"
-          python3 scripts/prepare-workbench-rootfs.py --archive "$asset" --confirm-local-use
+          source=https://raw.githubusercontent.com/gitpod-io/openvscode-server/4ffe2270acdf711bbefecc3e8c79f4b3631640e5
+          for name in LICENSE.txt ThirdPartyNotices.txt; do
+            curl --proto '=https' --tlsv1.2 --fail --location --retry 2 "$source/$name" -o "$RUNNER_TEMP/$name"
+          done
+          python3 scripts/prepare-workbench-rootfs.py --archive "$asset" --source-license "$RUNNER_TEMP/LICENSE.txt" --source-notices "$RUNNER_TEMP/ThirdPartyNotices.txt" --confirm-local-use
           mv RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/plain-ubuntu-staged"
           bash scripts/stage-ubuntu-device.sh --workbench
       - name: Prepare pinned CI-only Chromium browser harness

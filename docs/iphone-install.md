@@ -60,3 +60,5 @@ The integrated 0.8.0 candidate now includes device-record-template.json with eve
 Pull requests now run both integrated variants, with separate CI artifact names ending in -ubuntu or -workbench. The owner-triggered main workflow remains single variant and requires explicit license review for IPA distribution. Actual pylsp snapshot gate is CI-only; install reviewed language servers yourself in the local-tools guest for device testing. No pylsp package is added to the IPA.
 
 The real pylsp CI gate uses a separately prepared ARM64 test rootfs, not shipped runtime assets. Docker on the Linux CI preparation runner is not part of the app and does not demonstrate Docker on iPhone.
+
+For the pinned OpenVSCode v1.109.5 archive, if the release lacks a root license, obtain both `LICENSE.txt` and `ThirdPartyNotices.txt` from https://github.com/gitpod-io/openvscode-server/tree/4ffe2270acdf711bbefecc3e8c79f4b3631640e5 and pass `--source-license /path/to/LICENSE.txt --source-notices /path/to/ThirdPartyNotices.txt` to the importer. It checks the exact source Git blob hashes and preserves the notices. This does not replace distribution license review.
