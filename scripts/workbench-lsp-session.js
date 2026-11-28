@@ -41,7 +41,7 @@ function boundedSnapshot(doc,root){
 class Session{
     constructor(key,{root=ROOT,timeout=120000,spawnProcess=spawn,approval=null,projectIndex=false}={}){
         if(!Object.hasOwn(PROFILES,key))throw Error('unknown server');
-        this.profile=reviewedProfile(key,approval);if(key==='clangd'&&projectIndex)this.profile={...this.profile,args:this.profile.args.map(x=>x==='--background-index=false'?'--background-index=true':x)};this.key=key;this.root=root;this.timeout=timeout;this.spawnProcess=spawnProcess;
+        this.approval=approval;this.profile=reviewedProfile(key,approval);if(key==='clangd'&&projectIndex)this.profile={...this.profile,args:this.profile.args.map(x=>x==='--background-index=false'?'--background-index=true':x)};this.key=key;this.root=root;this.timeout=timeout;this.spawnProcess=spawnProcess;
         this.nonce=randomBytes(8).toString('hex');this.sequence=0;this.id=0;
         this.pending=new Map();this.docs=new Map();this.wireDocs=new Map();
         this.buffer=Buffer.alloc(0);this.failure=null;this.child=null;this.starting=null;
@@ -154,9 +154,9 @@ class Session{
         if(this.failure)throw this.failure;
         if(this.starting)return this.starting;
         this.starting=(async()=>{
-            const p=this.profile;
+            const p=this.profile.optional?reviewedProfile(this.key,this.approval):this.profile;
             this.child=this.spawnProcess(p.command,p.args,{cwd:this.root,stdio:['pipe','pipe','ignore'],
-                env:{PATH:'/opt/nexus/lsp/bin:/usr/bin:/bin',HOME:'/root',LANG:'C.UTF-8',PYTHONFAULTHANDLER:'1',GOPROXY:'off',GOSUMDB:'off',GOTOOLCHAIN:'local',CARGO_NET_OFFLINE:'true',ISH_NODE_NO_ARG_INJECTION:'1'}});
+                env:{PATH:p.optional?'/opt/nexus/lsp/bin:/usr/bin:/bin':'/usr/bin:/bin',HOME:'/root',LANG:'C.UTF-8',PYTHONFAULTHANDLER:'1',GOPROXY:'off',GOSUMDB:'off',GOTOOLCHAIN:'local',CARGO_NET_OFFLINE:'true',ISH_NODE_NO_ARG_INJECTION:'1'}});
             this.stats.launches++;
             this.exited=new Promise(resolve=>this.child.once('close',(code,signal)=>{this.stats.processExited=true;resolve({code,signal});}));
             this.child.on('error',e=>this.fail(e));
