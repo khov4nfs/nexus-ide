@@ -250,6 +250,9 @@ struct IDEView: View {
 #if NEXUS_UBUNTU_LAB && os(iOS) && !targetEnvironment(simulator)
             UbuntuLabView(model: model).tabItem { Label("Agent", systemImage: "cpu") }
             LocalToolsView(model: model).tabItem { Label("Local tools", systemImage: "terminal.fill") }
+#if NEXUS_FULL_VM
+            FullVMView(model: model).tabItem { Label("Full VM", systemImage: "server.rack") }
+#endif
 #else
             NavigationStack {
                 List {
