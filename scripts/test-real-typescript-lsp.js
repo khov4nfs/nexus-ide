@@ -6,10 +6,11 @@ const os=require('node:os');
 const path=require('node:path');
 const {createHash}=require('node:crypto');
 const {pathToFileURL}=require('node:url');
-const {Session}=require('./workbench-lsp-session');
-const {plan}=require('./workbench-lsp-edits');
-async function main(){
-    const toolRoot=fs.realpathSync(process.argv[2]);
+const packaged=fs.existsSync(path.join(__dirname,'lsp-session.js'));
+const {Session}=require(packaged?'./lsp-session':'./workbench-lsp-session');
+const {plan}=require(packaged?'./lsp-edits':'./workbench-lsp-edits');
+async function run(inputRoot){
+    const toolRoot=fs.realpathSync(inputRoot);
     const entry=path.join(toolRoot,'typescript/node_modules/typescript-language-server/lib/cli.mjs');
     const sha256=createHash('sha256').update(fs.readFileSync(entry)).digest('hex');
     const root=fs.mkdtempSync(path.join(os.tmpdir(),'nexus-real-ts-'));
@@ -43,7 +44,8 @@ async function main(){
         const report=await s.stop();
         assert.equal(report.launches,1);assert.equal(report.initializes,1);assert.equal(report.changes,2);
         assert.equal(report.shutdownClean,true);assert.equal(report.opens,report.closes);
-        console.log(JSON.stringify({ok:true,scope:'host real pinned TypeScript LSP, not iPhone',server:'4.3.4',typescript:'5.7.3',entrySHA256:sha256,stats:report}));
+        return {ok:true,scope:'real pinned TypeScript LSP, not physical-device certification',server:'4.3.4',typescript:'5.7.3',entrySHA256:sha256,stats:report};
     }finally{await s.stop();fs.rmSync(root,{recursive:true,force:true});}
 }
-main().catch(e=>{console.error(e.stack);process.exitCode=1;});
+module.exports={run};
+if(require.main===module)run(process.argv[2]).then(report=>console.log(JSON.stringify(report))).catch(e=>{console.error(e.stack);process.exitCode=1;});
