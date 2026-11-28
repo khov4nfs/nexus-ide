@@ -20,7 +20,10 @@ Do not start device testing until PR regression gates pass, the final source rev
        item
 
 3. Save using the real File: Save command. Wait for the actual pylsp diagnostic for missing_nexus_symbol. Verify it is visible in Monaco/Problems. Append a dot to item, invoke completion, choose nexus_value and save. Verify final line item.nexus_value. Shut down cleanly and relaunch saved guest to verify file bytes.
-4. Separately create a normal Python file under /root/nexus-workbench; save a deliberate undefined identifier and request attribute completion on a different class. Confirm the real server works outside the acceptance fixture. The reviewed extension supports bounded guest Python files, diagnostics on save and plain identifier completion; it is not a general multi-language or persistent LSP client.
+4. Separately create a normal Python file under /root/nexus-workbench; save a deliberate undefined identifier and request attribute completion on a different class. Confirm the real server works outside the acceptance fixture. The reviewed extension now supports bounded Python, C and C++ files, debounced live/on-save diagnostics, plain identifier completion, and persistent per-server sessions during a Workbench boot.
+
+5. In the same Workbench boot, invoke Nexus: Open C++ CI Fixture and enter the C++ source from scripts/workbench-browser-probe.py (exercise_c_family). Save, check the missing_nexus_cpp diagnostic, append a dot to item, accept nexus_value and save. Repeat with Nexus: Open C CI Fixture and missing_nexus_c / nexus_c_value. Keep both documents open. Also verify live diagnostics change after a normal file edit.
+6. Invoke Nexus: Stop Language Servers. Review nexus-persistent-lsp.json in the guest. Require one launch and initialize for Python and clangd respectively, Python snapshot refresh, at least two clangd changes, peakDocuments at least two, matching opens/closes, clean shutdown and process exit. Restart Language Servers only after clean/confirmed process exit. Verify new normal-document operations and saved file contents after app relaunch. Record both server versions and redacted observations for workbench_persistent_python_c_cpp_sessions. Process memory is not expected to survive app termination.
 
 ## 3. Full VM device runs
 
