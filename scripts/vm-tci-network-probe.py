@@ -1,6 +1,7 @@
 """Run the actual host TCI guest and verify a forwarded container HTTP request."""
 import json
 import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -57,6 +58,17 @@ with serial.open("wb") as log:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+        # Preserve acceptance markers even if lengthy daemon logs push them
+        # outside the serial tail. Bounded output; raw evidence stays in artifact.
+        markers = []
         with serial.open("rb") as reader:
+            for line in reader:
+                line = line.strip()
+                if len(line) <= 200 and re.fullmatch(rb"NEXUS_VM_[A-Z0-9_]+(?::[A-Za-z0-9_./:+@-]+)?", line):
+                    if len(markers) < 128:
+                        markers.append(line.decode("ascii"))
             reader.seek(max(0, serial.stat().st_size - 16384))
+            print("Guest acceptance markers (first 128):")
+            print("\n".join(markers))
+            print("Guest serial tail:")
             print(reader.read().decode(errors="replace"))
