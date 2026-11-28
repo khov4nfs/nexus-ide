@@ -14,6 +14,10 @@ git clone --no-checkout https://github.com/utmapp/qemu.git Vendor/nexus-qemu
 git -C Vendor/nexus-qemu checkout --detach "$qemu_pin"
 test "$(git -C Vendor/nexus-qemu rev-parse HEAD)" = "$qemu_pin"
 git -C Vendor/nexus-qemu submodule update --init --recursive
+# Apply the exact patch used by the pinned UTM dependency build.
+patch_file="$root/Vendor/nexus-utm/patches/qemu-10.0.12-utm.patch"
+git -C Vendor/nexus-qemu apply --check "$patch_file"
+git -C Vendor/nexus-qemu apply "$patch_file"
 # Use only the reviewed iOS cross-build infrastructure, not UTM UI or
 # private hypervisor support. Every substitution requires exact context.
 python3 - "$root" <<'PY'
@@ -47,7 +51,7 @@ function("build_qemu_dependencies", """    build $FFI_SRC
     build $PIXMAN_SRC
     meson_build $LIBUCONTEXT_REPO -Ddefault_library=static -Dfreestanding=true""")
 replace('    QEMU_PLATFORM_BUILD_FLAGS="--enable-shared-lib --disable-cocoa --disable-sdl --disable-coreaudio --disable-slirp-smbd --enable-ucontext --with-coroutine=libucontext $HVF_FLAGS $TCI_BUILD_FLAGS"',
-        '    QEMU_PLATFORM_BUILD_FLAGS="--without-default-features --enable-tcg --enable-tcg-interpreter --target-list=aarch64-softmmu --enable-shared-lib --disable-hvf --disable-hvf-private --disable-kvm --disable-plugins --disable-docs --disable-cocoa --disable-sdl --enable-ucontext --with-coroutine=libucontext"')
+        '    QEMU_PLATFORM_BUILD_FLAGS="--without-default-features --enable-tcg --enable-tcg-interpreter --target-list=aarch64-softmmu --enable-fdt=internal --enable-shared-lib --disable-hvf --disable-hvf-private --disable-kvm --disable-plugins --disable-docs --disable-cocoa --disable-sdl --enable-ucontext --with-coroutine=libucontext"')
 replace('\ncopy_private_headers\nbuild_pkg_config\n', '\nbuild_pkg_config\n')
 replace('\nbuild_spice_client\nbuild_vulkan_drivers\nbuild_d3d_drivers\nfixup_all\nremove_shared_gst_plugins # another hack...\n','\nfixup_all\n')
 # Override only the platform SDK floor; do not use private headers/entitlements.
