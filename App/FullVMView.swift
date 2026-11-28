@@ -191,7 +191,7 @@ private enum VMEngine {
         return ["qemu-system-aarch64", "-L", firmware.path,
                 "-machine", "virt,gic-version=3", "-cpu", "cortex-a57",
                 "-accel", "tcg,thread=single", "-smp", "1", "-m", String(ram),
-                "-nodefaults", "-display", "none", "-nic", "none", "-no-reboot",
+                "-nodefaults", "-no-user-config", "-display", "none", "-nic", "none", "-no-reboot",
                 "-kernel", VMStore.file(root, .kernel).path, "-initrd", VMStore.file(root, .initrd).path,
                 "-append", "root=/dev/vda rw rootwait console=ttyAMA0",
                 "-blockdev", try encode(file), "-blockdev", try encode(raw),
@@ -215,6 +215,7 @@ private enum VMEngine {
     private var monitorBuffer = Data()
     private var serialTail = Data()
     private var timer: Timer?
+    private var observers: [NSObjectProtocol] = []
     private var guestShutdown = false
     private var forced = false
     private var greeting = false
@@ -280,8 +281,16 @@ private enum VMEngine {
                 active = true; busy = false; ready = false
                 deadline = Date().addingTimeInterval(1800)
                 status = "Booting local interpreter VM. Keep this app foreground."
-                timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                let pollTimer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
                     Task { @MainActor in self?.poll() }
+                }
+                timer = pollTimer
+                RunLoop.main.add(pollTimer, forMode: .common)
+                // Stop requests must work even when another app tab is selected.
+                for notification in [UIApplication.willResignActiveNotification, UIApplication.didReceiveMemoryWarningNotification] {
+                    observers.append(NotificationCenter.default.addObserver(forName: notification, object: nil, queue: .main) { [weak self] _ in
+                        Task { @MainActor in self?.foregroundLost() }
+                    })
                 }
                 // Ownership of the guest-side descriptors transfers to QEMU.
                 // Do not close them again from Swift.
@@ -353,6 +362,8 @@ private enum VMEngine {
             }
             if obj["error"] != nil { status = "QMP rejected a control request." }
         }
+        let thermal = ProcessInfo.processInfo.thermalState
+        if thermal == .serious || thermal == .critical { powerdown() }
         if let deadline, Date() >= deadline, !powerRequested { powerdown() }
     }
     func send(_ text: String) -> Bool {
@@ -377,6 +388,8 @@ private enum VMEngine {
     private func ended(_ code: Int32, root: URL) {
         poll()
         timer?.invalidate(); timer = nil
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        observers.removeAll()
         Darwin.close(serial); Darwin.close(monitor)
         serial = -1; monitor = -1; active = false; monitorReady = false
         if code == 0, guestShutdown, !forced {
@@ -391,7 +404,7 @@ private enum VMEngine {
     }
 }
 
-struct FullVMView: View {
+@MainActor struct FullVMView: View {
     @ObservedObject var model: IDEModel
     @StateObject private var vm = FullVMModel()
     @Environment(\.scenePhase) private var scenePhase
@@ -450,7 +463,7 @@ struct FullVMView: View {
                         .disabled(!vm.monitorReady)
                 }
                 Section("Container scope") {
-                    Text("A compatible guest image must contain its own Docker Engine and Compose. No daemon or image is bundled. Use the serial console to test the guest. Host CI evidence is not iPhone evidence.")
+                    Text("A compatible guest image must contain its own Docker Engine and Compose. No daemon or image is bundled. Use the serial console to test the guest and run sync; poweroff for clean shutdown if ACPI powerdown is unsupported. Host CI evidence is not iPhone evidence.")
                         .font(.caption)
                 }
             }.navigationTitle("Full VM")
