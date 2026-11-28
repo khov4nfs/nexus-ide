@@ -853,6 +853,74 @@ mod tests {
         assert!(ok,"real pylsp snapshot gate: {report}; {}",r["error"]);
     }
     #[test]
+    #[ignore = "requires prepared real pylsp ARM64 Ubuntu fakefs"]
+    fn real_pylsp_completion(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into()),("PYTHONFAULTHANDLER".into(),"1".into())]);
+        {let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=8;}
+        let version=rt.block_on(process_probe::verify_pylsp_for_ci(&guest,&env));
+        let r=if version.as_deref()==Ok("1.10.0-1"){
+            let input=parse_lsp(&json!({"argv":["/usr/bin/python3","-u","-m","pylsp","-v"],"language":"python","extension":"py","text":"class NexusCompletion:\n    nexus_value = 42\nitem = NexusCompletion()\nitem.","completion":{"line":3,"character":5}}).to_string()).unwrap();
+            rt.block_on(process_probe::lsp_diagnostics(&guest,&env,&input,false))
+        }else{json!({"ok":false,"error":"Prepared server version failed"})};
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        STATE.lock().unwrap().running=false;
+        let completion=r["completions"].as_array().is_some_and(|a|a.iter().any(|c|c["label"]=="nexus_value"&&c["text"]=="nexus_value"&&c["range"]==json!({"start":{"line":3,"character":5},"end":{"line":3,"character":5}})));
+        let ok=version.as_deref()==Ok("1.10.0-1")&&r["ok"]==true&&r["transportClosed"]==true&&completion&&clean;
+        let report=json!({"ok":ok,"fixtureOnly":false,"scope":"macOS-hosted Ubuntu guest","package":"python3-pylsp","packageVersion":version.ok(),"completionVerified":completion,"transportClosed":r["transportClosed"],"shutdownClean":clean,"physicalDeviceVerified":false});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(ok,"real pylsp completion gate: {report}; {}",r["error"]);
+    }
+    #[test]
+    #[ignore = "requires prepared real pylsp ARM64 Ubuntu fakefs"]
+    fn real_pylsp_live_refresh(){
+        use std::time::{Duration,Instant};
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into()),("PYTHONFAULTHANDLER".into(),"1".into())]);
+        let version=rt.block_on(process_probe::verify_pylsp_for_ci(&guest,&env));
+        let input=parse_lsp(&json!({"argv":["/usr/bin/python3","-u","-m","pylsp","-v"],"language":"python","extension":"py","text":"x = missing_nexus_symbol"}).to_string()).unwrap();
+        *LIVE_LSP.lock().unwrap()=Some(LiveLsp::default());
+        {let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=12;}
+        let driver=std::thread::spawn(||{
+            fn has(p:&Value,needle:&str)->bool{
+                p["diagnostics"].as_array().is_some_and(|a|a.iter().any(|d|d["message"].as_str().is_some_and(|m|m.contains(needle))&&d["range"]["start"]["line"]==0&&d["range"]["start"]["character"]==4))
+            }
+            let until=Instant::now()+Duration::from_secs(270);
+            let mut first=false;
+            while Instant::now()<until{
+                let p=lsp_status();
+                if p["waiting"]==true&&p["version"]==1&&!first{
+                    if !has(&p,"missing_nexus_symbol"){let _=enqueue(Control::Stop);return (false,false);}
+                    assert_eq!(lsp_control(0,Some("stale".into()))["ok"],false);
+                    first=lsp_control(1,Some("x = second_nexus_symbol".into()))["ok"]==true;
+                    if !first{let _=enqueue(Control::Stop);return (false,false);}
+                }else if p["waiting"]==true&&p["version"]==2{
+                    let second=has(&p,"second_nexus_symbol")&&!has(&p,"missing_nexus_symbol");
+                    let finished=lsp_control(2,None)["ok"]==true;
+                    return (first,second&&finished);
+                }
+                if !STATE.lock().unwrap().running{return (first,false);}
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _=enqueue(Control::Stop);(first,false)
+        });
+        let r=if version.as_deref()==Ok("1.10.0-1"){rt.block_on(process_probe::live_lsp(&guest,&env,&input,false))}else{json!({"ok":false})};
+        STATE.lock().unwrap().running=false;
+        let (first,second)=driver.join().unwrap();
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        *LIVE_LSP.lock().unwrap()=None;
+        let ok=version.as_deref()==Ok("1.10.0-1")&&first&&second&&r["ok"]==true&&r["versions"]==2&&r["snapshotUriRefresh"]==true&&r["transportClosed"]==true&&clean;
+        let report=json!({"ok":ok,"fixtureOnly":false,"scope":"macOS-hosted Ubuntu guest","package":"python3-pylsp","packageVersion":version.ok(),"initialDiagnosticVerified":first,"refreshedDiagnosticVerified":second,"snapshotUriRefresh":r["snapshotUriRefresh"],"versions":r["versions"],"transportClosed":r["transportClosed"],"shutdownClean":clean,"physicalDeviceVerified":false});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(ok,"real pylsp refresh gate: {report}; {}",r["error"]);
+    }
+    #[test]
     #[ignore = "requires separate Ubuntu fakefs"]
     fn real_lsp_diagnostic_fixture(){
         let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
