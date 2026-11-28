@@ -1348,8 +1348,32 @@ fn lsp_completions(value:&Value,request:&crate::local_jobs::LspInput)->Result<Ve
     }
     Ok(result)
 }
-// A single reviewed document and full-sync server. Versionless diagnostics are
-// not safe to associate with subsequent editor contents; fail closed.
+// For full-sync servers keep strict version correlation. Incremental servers
+// (e.g. pylsp 1.10.0) can omit diagnostic versions: never attribute an
+// unversioned notification to a changed document at the same URI. Instead
+// close and open a distinct virtual URI per reviewed snapshot, in one server
+// process. No edits are sent to native files or written by this transport.
+fn live_snapshot_uri(uri:&str,version:u32)->String{
+    let (stem,ext)=uri.rsplit_once('.').expect("validated virtual document extension");
+    format!("{stem}-v{version}.{ext}")
+}
+fn live_diagnostic_projection(params:&Value,uri:&str,text:&str,version:u32,distinct_uri:bool,retired:&[String])->Result<Option<Vec<Value>>,String>{
+    if distinct_uri&&retired.iter().any(|old|params["uri"].as_str()==Some(old.as_str())){return Ok(None);}
+    if !distinct_uri&&params["uri"]==uri&&params["version"].as_u64().is_some_and(|v|v<version as u64){return Ok(None);}
+    lsp_project_version(params,uri,text,if distinct_uri{1}else{version},!distinct_uri).map(Some)
+}
+#[test]
+fn live_snapshot_diagnostic_correlation(){
+    let first=live_snapshot_uri("file:///tmp/nexus-lsp.py",1);
+    let second=live_snapshot_uri("file:///tmp/nexus-lsp.py",2);
+    let retired=vec![first.clone()];
+    assert_ne!(first,second);
+    assert!(live_diagnostic_projection(&json!({"uri":first,"diagnostics":[]}),&second,"x",2,true,&retired).unwrap().is_none());
+    assert_eq!(live_diagnostic_projection(&json!({"uri":second,"diagnostics":[]}),&second,"x",2,true,&retired).unwrap(),Some(vec![]));
+    assert!(live_diagnostic_projection(&json!({"uri":second,"version":2,"diagnostics":[]}),&second,"x",2,true,&retired).is_err());
+    assert!(live_diagnostic_projection(&json!({"uri":"file:///tmp/unrelated.py","diagnostics":[]}),&second,"x",2,true,&retired).is_err());
+    assert!(live_diagnostic_projection(&json!({"uri":second,"diagnostics":[]}),&second,"x",2,false,&[]).is_err());
+}
 pub(crate) async fn live_lsp(guest:&IshInstance,env:&HashMap<String,String>,request:&crate::local_jobs::LspInput,fixture:bool)->Value{
     use crate::local_jobs::{lsp_publish,lsp_wait,LspNext};
     let mut opts=SpawnOpts::cmd(request.argv.iter().map(String::as_str));
@@ -1362,55 +1386,75 @@ pub(crate) async fn live_lsp(guest:&IshInstance,env:&HashMap<String,String>,requ
     opts.pipe_stdin=true;
     let Ok(session)=guest.spawn(opts)else{return json!({"ok":false,"error":"LSP spawn failed"});};
     let mut capture=Capture::default();
-    let result:Result<u32,String>=async{
-        let deadline=Instant::now()+Duration::from_secs(45);
-        lsp_send(&session,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"workspaceFolders":null,"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"versionSupport":true},"synchronization":{"dynamicRegistration":false}}}}}),deadline).await?;
+    #[cfg(test)]
+    let seconds=if std::env::var_os("NEXUS_PYLSP_TRACE").is_some(){120}else{45};
+    #[cfg(not(test))]
+    let seconds=45;
+    let result:Result<(u32,bool),String>=async{
+        let deadline=Instant::now()+Duration::from_secs(seconds);
+        lsp_send(&session,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":"file:///tmp","workspaceFolders":null,"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"versionSupport":true},"synchronization":{"dynamicRegistration":false}}}}}),deadline).await?;
         let init=lsp_reply(&session,&mut capture,1,deadline).await?;
         let caps=init["capabilities"].as_object().ok_or("Missing LSP capabilities")?;
         let sync=&init["capabilities"]["textDocumentSync"];
-        if caps.get("positionEncoding").is_some_and(|v|v!="utf-16")||!(sync.as_u64()==Some(1)||(sync["change"].as_u64()==Some(1)&&sync["openClose"]==true)){return Err("Full synchronization unsupported".into());}
+        let sync_kind=sync.as_u64().or_else(||if sync["openClose"]==true{sync["change"].as_u64()}else{None});
+        if caps.get("positionEncoding").is_some_and(|v|v!="utf-16")||!matches!(sync_kind,Some(1|2)){return Err("Document synchronization unsupported".into());}
+        let distinct_uri=sync_kind==Some(2);
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"initialized","params":{}}),deadline).await?;
         let mut text=request.text.clone();
         let mut version=1u32;
-        lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":request.uri,"languageId":request.language,"version":version,"text":text}}}),deadline).await?;
+        let mut retired=Vec::new();
+        let mut uri=if distinct_uri{live_snapshot_uri(&request.uri,version)}else{request.uri.clone()};
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":request.language,"version":1,"text":text}}}),deadline).await?;
         loop{
-            let deadline=Instant::now()+Duration::from_secs(45);
+            let deadline=Instant::now()+Duration::from_secs(seconds);
             let mut found=None;
             for _ in 0..128{
                 let frame=lsp_next(&session,&mut capture,deadline).await?;
                 if frame.get("id").is_some(){return Err("Unexpected reply".into());}
                 if frame["method"]=="textDocument/publishDiagnostics"{
                     let p=&frame["params"];
-                    if p["uri"]==request.uri&&p["version"].as_u64().is_some_and(|v|v<version as u64){continue;}
-                    found=Some(lsp_project_version(p,&request.uri,&text,version,true)?);break;
+                    if let Some(rows)=live_diagnostic_projection(p,&uri,&text,version,distinct_uri,&retired)?{
+                        found=Some(rows);break;
+                    }
                 }
             }
             if !lsp_publish(version,found.ok_or("No correlated diagnostics")?){return Err("LSP stopped".into());}
             match lsp_wait().await{
                 LspNext::Change(next)=>{
                     version+=1;text=next;
-                    lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":request.uri,"version":version},"contentChanges":[{"text":text}]}}),Instant::now()+Duration::from_secs(45)).await?;
+                    let deadline=Instant::now()+Duration::from_secs(seconds);
+                    if distinct_uri{
+                        lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":uri}}}),deadline).await?;
+                        retired.push(uri);
+                        uri=live_snapshot_uri(&request.uri,version);
+                        lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":request.language,"version":1,"text":text}}}),deadline).await?;
+                    }else{
+                        lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":version},"contentChanges":[{"text":text}]}}),deadline).await?;
+                    }
                 }
                 LspNext::Finish=>break,
                 LspNext::Stop=>return Err("LSP stopped".into()),
             }
         }
         let deadline=Instant::now()+Duration::from_secs(30);
-        lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":request.uri}}}),deadline).await?;
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":uri}}}),deadline).await?;
         lsp_send(&session,json!({"jsonrpc":"2.0","id":2,"method":"shutdown"}),deadline).await?;
         if !lsp_reply(&session,&mut capture,2,deadline).await?.is_null(){return Err("Invalid shutdown".into());}
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"exit"}),deadline).await?;
         drain(&session,&mut capture,deadline).await?;
         if !capture.closed||capture.code!=Some(0)||capture.signal.unwrap_or(0)!=0{return Err("LSP shutdown failed".into());}
-        Ok(version)
+        Ok((version,distinct_uri))
     }.await;
     match result{
-        Ok(n)=>json!({"ok":true,"versions":n,"transportClosed":true}),
+        Ok((n,distinct_uri))=>json!({"ok":true,"versions":n,"transportClosed":true,"snapshotUriRefresh":distinct_uri}),
         Err(error)=>{
             // Keep the production report generic; the fixture needs to prove
             // the exact rejection rather than pass on any unrelated failure.
             #[cfg(test)]
-            let fixture_error=if fixture{Some(error.as_str())}else{None};
+            let fixture_error=if fixture{Some(error.as_str())}else{
+                if std::env::var_os("NEXUS_PYLSP_TRACE").is_some(){eprintln!("CI live pylsp failure: {error}");}
+                None
+            };
             #[cfg(not(test))]
             let fixture_error:Option<&str>=None;
             let _=session.terminate().await;
