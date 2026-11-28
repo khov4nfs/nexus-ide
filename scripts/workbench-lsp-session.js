@@ -212,7 +212,10 @@ class Session{
                 const outcome=await Promise.race([this.exited,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('exit timeout')),10000);})]);
                 if(outcome.code!==0||outcome.signal!==null)throw Error('unclean exit');
                 this.stats.shutdownClean=true;
-            }catch(e){this.fail(e);}
+            }catch(e){
+                this.fail(e);clearTimeout(timer);
+                await Promise.race([this.exited,new Promise(resolve=>{timer=setTimeout(resolve,2000);})]);
+            }
             finally{clearTimeout(timer);}
             return {...this.stats};
         })();
