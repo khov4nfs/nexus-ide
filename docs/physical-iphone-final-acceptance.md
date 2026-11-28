@@ -50,3 +50,7 @@ On a trusted machine (Python 3.11+):
 The verifier rejects altered IPA/VSIX identity, incomplete checks, mismatched evidence hashes or missing manual acknowledgement. It returns operatorReviewComplete only when every required check has evidence. It never claims independent physical-device verification or productionReady. Send redacted failures to the developer; do not upload secrets, actual workspace files, raw serial logs or device identifiers.
 
 No final workflow was dispatched and no real iPhone run has been performed by this implementation.
+
+## Extended project LSP device checks
+
+Follow [reviewed-project-lsp.md](reviewed-project-lsp.md). In one native live LSP session, review and send saved A, B, and edited A; confirm independent diagnostic content, stale-generation rejection, no cross-file semantic claim and clean shutdown. For Workbench, run the real synthetic cross-file acceptance command and inspect both saved files; also run Review Symbol Rename and Review Refactoring on a separate trusted test project, review all files and verify no edits are applied when cancelled or stale. Test optional reviewed toolchains separately when actually staged; record exact versions and do not mark unavailable server/refactor capabilities as passed. No device evidence has been collected by this change.
