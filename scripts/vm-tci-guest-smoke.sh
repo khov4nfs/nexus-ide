@@ -30,6 +30,7 @@ mountpoint -q /sys || mount -t sysfs sysfs /sys
 mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
 mkdir -p /run /dev/pts /dev/shm /sys/fs/cgroup /tmp
 mountpoint -q /run || mount -t tmpfs tmpfs /run
+mountpoint -q /tmp || mount -t tmpfs -o mode=1777,size=64m tmpfs /tmp
 mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts
 mountpoint -q /dev/shm || mount -t tmpfs tmpfs /dev/shm
 mountpoint -q /sys/fs/cgroup || mount -t cgroup2 cgroup2 /sys/fs/cgroup
@@ -39,6 +40,13 @@ test -r /proc/self/ns/mnt
 test -r /proc/self/ns/pid
 test -r /proc/self/ns/net
 test "$(cat /proc/1/comm)" != ""
+mkdir -p /var/lib/nexus-vm-acceptance
+counter=/var/lib/nexus-vm-acceptance/boot-count
+previous=0
+if [ -e "$counter" ]; then previous=$(cat "$counter"); fi
+case "$previous" in ""|*[!0-9]*) exit 1;; esac
+test "$previous" -lt 9999
+echo "NEXUS_VM_PERSIST_PREVIOUS:$previous"
 echo "NEXUS_VM_KERNEL:$(uname -r)"
 echo "NEXUS_VM_CGROUP2_OK"
 dpkg-query -W docker.io docker-compose-v2 busybox-static
@@ -185,5 +193,9 @@ fi
 kill -TERM "$daemon"
 wait "$daemon"
 daemon=
+next=$((previous+1))
+printf "%s\n" "$next" >"$counter.new"
+mv "$counter.new" "$counter"
 sync
+echo "NEXUS_VM_PERSIST_SAVED:$next"
 echo NEXUS_VM_CLEAN_SHUTDOWN
