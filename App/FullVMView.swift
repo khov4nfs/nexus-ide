@@ -230,6 +230,16 @@ private enum VMEngine {
     @Published var busy = false
     @Published var monitorReady = false
     @Published var assets: Set<VMAsset> = []
+    @Published private(set) var acceptanceEvidence = ""
+    private var evidenceMode: VMNetwork?
+    private var evidenceRAM = 0
+    private var evidenceAssets: [String:String] = [:]
+    private var markerBuffer = Data()
+    private var markers: [String] = []
+    private var httpVerified = false
+    private var qmpVerified = false
+    private var cleanObserved = false
+    private var exitCode: Int32?
     private var root: URL?
     private var serial: Int32 = -1
     private var monitor: Int32 = -1
@@ -299,6 +309,12 @@ private enum VMEngine {
                 let args = try VMEngine.args(root: root, firmware: firmware, ram: ram, network: network, smoke: smoke, serial: s.1, monitor: m.1)
                 try Data("dirty\n".utf8).write(to: VMStore.dirty(root), options: .atomic)
                 serial = s.0; monitor = m.0
+                if smoke {
+                    evidenceMode = network; evidenceRAM = ram
+                    for kind in VMAsset.allCases {
+                        if let hash = try? String(contentsOf: VMStore.proof(root, kind), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), VMStore.validDigest(hash) { evidenceAssets[kind.rawValue] = hash }
+                    }
+                }
                 active = true; busy = false; ready = false
                 deadline = Date().addingTimeInterval(1800)
                 status = "Booting local interpreter VM. Keep this app foreground."
@@ -354,7 +370,9 @@ private enum VMEngine {
     }
     private func poll() {
         guard active else { return }
-        serialTail.append(readSocket(serial))
+        let incoming = readSocket(serial)
+        serialTail.append(incoming)
+        captureMarkers(incoming)
         if serialTail.count > 65536 { serialTail = Data(serialTail.suffix(65536)) }
         console = String(decoding: serialTail, as: UTF8.self)
         monitorBuffer.append(readSocket(monitor))
@@ -373,7 +391,7 @@ private enum VMEngine {
                 _ = qmp("qmp_capabilities", id: "capabilities")
             }
             if obj["id"] as? String == "capabilities", obj["return"] != nil {
-                monitorReady = true
+                monitorReady = true; qmpVerified = true
                 status = "QMP connected. Verify Linux boot in the serial console."
                 if powerRequested { _ = qmp("system_powerdown", id: "powerdown") }
             }
@@ -403,7 +421,9 @@ private enum VMEngine {
                 let (data, response) = try await session.data(from: url)
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200,
                       data == Data("NEXUS_VM_HTTP_42\n".utf8) else { status = "Unexpected forwarded HTTP response."; return }
+                httpVerified = true
                 if active { status = "Actual local container HTTP response verified; wait for guest shutdown." }
+                else { publishEvidence() }
             } catch { if active { status = "Local HTTP probe failed."; } }
         }
     }
@@ -420,6 +440,38 @@ private enum VMEngine {
         status = "Forced stop requested. The disk will require reset."
         _ = qmp("quit", id: "quit")
     }
+    private func captureMarkers(_ data: Data) {
+        guard evidenceMode != nil else { return }
+        markerBuffer.append(data)
+        if markerBuffer.count > 131072 { markerBuffer.removeAll(); return }
+        let exact: Set<String> = ["NEXUS_VM_CGROUP2_OK","NEXUS_VM_NET_CONFIG_OK","NEXUS_VM_DOCKER_DAEMON_OK","NEXUS_VM_DOCKER_RUN_OK","NEXUS_VM_COMPOSE_OK","NEXUS_VM_COMPOSE_NETWORK_OK","NEXUS_VM_FORWARD_READY","NEXUS_VM_FORWARD_OK","NEXUS_VM_INTERNET_TLS_OK","NEXUS_VM_REGISTRY_PULL_OK","NEXUS_VM_CLEAN_SHUTDOWN"]
+        while let end = markerBuffer.firstIndex(of: 10) {
+            let line = String(decoding: markerBuffer[..<end], as: UTF8.self).trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+            markerBuffer.removeSubrange(...end)
+            guard markers.count < 64, line.utf8.count <= 180 else { continue }
+            let pattern = #"^NEXUS_VM_(KERNEL:[A-Za-z0-9._+-]+|PERSIST_(PREVIOUS|SAVED):[0-9]{1,4}|REGISTRY_DIGEST:(docker\.io/library/)?busybox@sha256:[0-9a-f]{64}|FAIL:[0-9]{1,3})$"#
+            if exact.contains(line) || line.range(of: pattern, options: .regularExpression) != nil { markers.append(line) }
+        }
+    }
+    private func publishEvidence() {
+        guard let mode = evidenceMode, let exitCode else { return }
+        let info = Bundle.main.infoDictionary ?? [:]
+        let data: [String: Any] = [
+            "scope": "Observed local VM smoke run; requires operator review against exact IPA. Guest markers are not independent proof.",
+            "appVersion": info["CFBundleShortVersionString"] as? String ?? "",
+            "appBuild": info["CFBundleVersion"] as? String ?? "",
+            "iOSVersion": UIDevice.current.systemVersion,
+            "networkMode": mode.rawValue, "memoryMiB": evidenceRAM,
+            "importedAssetSHA256": evidenceAssets, "observedSerialMarkers": markers,
+            "qmpConnected": qmpVerified, "nativeHTTPResponseObserved": httpVerified,
+            "exitCode": exitCode, "guestShutdownEvent": guestShutdown,
+            "cleanDiskObserved": cleanObserved, "forcedOrTransportFailure": forced,
+            "productionReady": false, "operatorReviewRequired": true
+        ]
+        if let bytes = try? JSONSerialization.data(withJSONObject: data, options: [.prettyPrinted,.sortedKeys]) {
+            acceptanceEvidence = String(decoding: bytes, as: UTF8.self)
+        }
+    }
     func foregroundLost() { if active { powerdown() } }
     private func ended(_ code: Int32, root: URL) {
         poll()
@@ -431,12 +483,15 @@ private enum VMEngine {
         if code == 0, guestShutdown, !forced {
             do {
                 try FileManager.default.removeItem(at: VMStore.dirty(root))
+                cleanObserved = true
                 status = "Guest shutdown and QEMU cleanup observed. Reopen app to boot saved disk."
             } catch { status = "Shutdown returned but dirty marker could not be cleared." }
         } else {
             status = "VM stopped without proven guest shutdown. Disk remains dirty."
         }
         ready = false
+        exitCode = code
+        publishEvidence()
     }
 }
 
@@ -513,6 +568,12 @@ private enum VMEngine {
                     Button("Request guest shutdown") { vm.powerdown() }.disabled(!vm.active)
                     Button("Force stop (dirty disk)", role: .destructive) { confirmForce = true }
                         .disabled(!vm.monitorReady)
+                }
+                if !vm.acceptanceEvidence.isEmpty {
+                    Section("Device acceptance evidence") {
+                        Text("Review and save this bounded report before relaunch. It excludes raw serial output, credentials and device identifiers. It is not a production approval.").font(.caption)
+                        ShareLink(item: vm.acceptanceEvidence) { Label("Share observed VM evidence", systemImage: "square.and.arrow.up") }
+                    }
                 }
                 Section("Container scope") {
                     Text("A compatible guest image must contain its own Docker Engine and Compose. No daemon or image is bundled. Use the serial console to test the guest and run sync; poweroff for clean shutdown if ACPI powerdown is unsupported. Host CI evidence is not iPhone evidence.")
