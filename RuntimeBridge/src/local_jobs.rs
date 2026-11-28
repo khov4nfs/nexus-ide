@@ -94,7 +94,7 @@ struct State {
 static STATE: Mutex<State> = Mutex::new(State {
     running:false, ready:false, mode:0, output:String::new(), raw:Vec::new(), total:0, controls:VecDeque::new(), stop:false, agent:None,
 });
-const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
+const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --jitless /opt/nexus/workbench/out/server-main.js --telemetry-level off --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
 fn fail(message: &str) -> Value { json!({"ok":false,"error":message}) }
 fn valid_command(s: &str) -> bool { !s.trim().is_empty() && s.len() <= 2048 && !s.contains('\0') }
 fn parse_call(input:&str)->Option<Value> {
@@ -132,7 +132,7 @@ fn parse_workbench(input:&str)->Option<(String,Option<String>)> {
     if !valid_token(&token) || !process_probe::agy_digest_ok(&digest) {return None;}
     Some((token,Some(digest)))
 }
-const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
+const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --jitless /opt/nexus/workbench/out/server-main.js --telemetry-level off --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
 fn parse_cli(input:&str)->Option<(String,String,String,Option<String>,Option<NativeSession>)> {
     if input.len()>16384 {return None;}
     let v:Value=serde_json::from_str(input).ok()?;
@@ -411,14 +411,26 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
             r
         }
         else if let Some((token,vsix))=workbench.as_ref() {
-            let installed=vsix.as_deref().map(|digest| {
-                let verified=rt.block_on(process_probe::guest_file_digest(&guest,&env,"/opt/nexus/extension.vsix",digest))["passed"]==true;
-                verified && !stop_requested() && rt.block_on(process_probe::local_hook_with_timeout(&guest,&env,INSTALL_VSIX,120))
+            // Node and libuv stay in interpreted, ordinary syscall mode.
+            // libuv documents UV_USE_IO_URING=0 for disabling the optional fast path.
+            env.insert("UV_USE_IO_URING".into(),"0".into());
+            let runtime=rt.block_on(process_probe::local_hook_with_timeout(&guest,&env,
+                "test -r /opt/nexus/workbench/out/server-main.js && exec /opt/nexus/workbench/node --jitless -e 'const fs=require(\"fs\"); fs.stat(\"/tmp\",(e,s)=>{if(e||!s.isDirectory())process.exitCode=1;else console.log(\"NEXUS_NODE_ASYNC_OK\")})'",60));
+            let digest_verified=vsix.as_deref().map(|digest|
+                rt.block_on(process_probe::guest_file_digest(&guest,&env,"/opt/nexus/extension.vsix",digest))["passed"]==true);
+            #[cfg(test)]
+            if std::env::var_os("NEXUS_WORKBENCH_CI_TRACE").is_some(){
+                eprintln!("CI Workbench preflight: node={runtime}, vsix digest={digest_verified:?}");
+            }
+            let installed=vsix.as_deref().map(|_| {
+                runtime && digest_verified==Some(true) && !stop_requested() && rt.block_on(process_probe::local_hook_with_timeout(&guest,&env,INSTALL_VSIX,120))
             });
-            let mut r=if installed.unwrap_or(true) && !stop_requested() {
+            let mut r=if runtime && installed.unwrap_or(true) && !stop_requested() {
                 env.insert("NEXUS_WORKBENCH_TOKEN".into(),token.clone());
                 rt.block_on(process_probe::local_process(&guest,&env,WORKBENCH,true))
-            } else {fail("Reviewed VSIX verification or installation failed, or launch cancelled")};
+            } else {fail(if !runtime{"Workbench Node async preflight failed"}else if digest_verified==Some(false){"Reviewed VSIX digest mismatch"}else{"Reviewed VSIX installation failed, or launch cancelled"})};
+            r["nodeRuntimeVerified"]=json!(runtime);
+            r["extensionDigestVerified"]=json!(digest_verified);
             r["extensionInstalled"]=json!(installed);
             r
         } else {
@@ -947,11 +959,13 @@ mod tests {
             std::process::Command::new(std::env::var_os("NEXUS_WORKBENCH_BROWSER_PYTHON").unwrap())
                 .arg(std::env::var_os("NEXUS_WORKBENCH_BROWSER_SCRIPT").expect("browser script"))
                 .env("NEXUS_WORKBENCH_TEST_TOKEN",&token)
-                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit())
                 .status().is_ok_and(|s|s.success())
         }else{false};
         let stop=enqueue(Control::Stop);
         let closed=worker.join().expect("workbench owner");
+        // CI-only fixed synthetic input; returned status contains no server URL or token.
+        eprintln!("CI Workbench final process status: {closed}");
         let extension_verified=vsix.as_ref().map(|_| {
             closed["extensionInstalled"]==true &&
                 std::fs::read_dir(guest_path.join("root/nexus-vscode-extensions")).ok().is_some_and(|dirs|
@@ -966,7 +980,7 @@ mod tests {
         let editor_verified=activated&&std::fs::read(root.join("nexus-editor-saved.marker")).ok().as_deref()==Some(b"saved");
         let lsp_verified=editor_verified&&std::fs::read(root.join("nexus-lsp-transport.marker")).ok().as_deref()==Some(b"completed")&&std::fs::read(root.join("nexus-lsp-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join("nexus-editor-fixture.txt")).ok().as_deref()==Some(b"NEXUS_BROWSER_EDITOR_SAVED\nNEXUS_LSP_COMPLETION");
         let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified&&lsp_verified)),
-            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":lsp_verified,"lspFixtureOnly":true});
+            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"nodeRuntimeVerified":closed["nodeRuntimeVerified"],"extensionDigestVerified":closed["extensionDigestVerified"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":lsp_verified,"lspFixtureOnly":true});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         println!("{report}");
         assert_eq!(report["ok"],true);

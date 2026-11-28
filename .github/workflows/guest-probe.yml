@@ -749,20 +749,21 @@ jobs:
           cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-workbench-fs"
           export NEXUS_WORKBENCH_ROOTFS="$RUNNER_TEMP/nexus-workbench-fs/data"
           export NEXUS_WORKBENCH_EVIDENCE="$RUNNER_TEMP/nexus-workbench.json"
+          export NEXUS_WORKBENCH_CI_TRACE=1
           export NEXUS_WORKBENCH_BROWSER_PYTHON="$RUNNER_TEMP/nexus-browser/bin/python"
           export NEXUS_WORKBENCH_BROWSER_SCRIPT="$GITHUB_WORKSPACE/scripts/workbench-browser-probe.py"
           python3 scripts/build-test-vsix.py "$RUNNER_TEMP/nexus-fixture.vsix"
           export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-fixture.vsix" | awk '{print $1}')"
           cat "$RUNNER_TEMP/nexus-fixture.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
-          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is True and r["lspFixtureOnly"] is True' "$NEXUS_WORKBENCH_EVIDENCE"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["nodeRuntimeVerified"] is True and r["extensionDigestVerified"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is True and r["lspFixtureOnly"] is True' "$NEXUS_WORKBENCH_EVIDENCE"
       - name: Upload workbench loopback evidence
-        if: matrix.variant == 'workbench'
+        if: always() && matrix.variant == 'workbench'
         uses: actions/upload-artifact@v4
         with:
           name: workbench-loopback-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-workbench.json
-          if-no-files-found: error
+          if-no-files-found: warn
       - name: Build and verify integrated Release IPA
         env:
           VARIANT: ${{ matrix.variant }}

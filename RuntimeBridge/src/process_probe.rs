@@ -918,7 +918,13 @@ async fn run_hook(guest:&IshInstance,env:&HashMap<String,String>,command:&str,se
         let _=session.terminate().await;
         let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
     }
-    result.is_ok() && capture.closed && capture.exited && capture.code==Some(0) && capture.signal.unwrap_or(0)==0 && !cancel()
+    let ok=result.is_ok() && capture.closed && capture.exited && capture.code==Some(0) && capture.signal.unwrap_or(0)==0 && !cancel();
+    #[cfg(test)]
+    if std::env::var_os("NEXUS_WORKBENCH_CI_TRACE").is_some(){
+        // Only this synthetic CI workflow enables tracing. No user data.
+        eprintln!("CI Workbench hook ok={ok}: {:?}; transport={:?}",capture.evidence(),result.err());
+    }
+    ok
 }
 
 // Codex app-server JSONL intentionally does not use ACP's JSON-RPC version
@@ -1613,6 +1619,13 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
         let _ = drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
     }
     if !workbench { publish_output(&capture.pty,false,capture.truncated_pty,capture.pty_total); }
+    #[cfg(test)]
+    if workbench && std::env::var_os("NEXUS_WORKBENCH_CI_TRACE").is_some(){
+        // The test token is synthetic; redact it anyway before logging.
+        let output=capture.evidence().to_string();
+        let output=env.get("NEXUS_WORKBENCH_TOKEN").filter(|s|!s.is_empty()).map_or_else(||output.clone(),|s|output.replace(s,"[redacted]"));
+        eprintln!("CI Workbench server lifecycle: {output}");
+    }
     json!({"ok":result.is_ok() && capture.closed && capture.exited,
         "stopped":stopped,"exitCode":capture.code,"termSignal":capture.signal,"outputTruncated":capture.truncated_pty,
         "closed":capture.closed,"error":if result.is_err() { Some("Local process deadline, output limit or transport failure") } else { None }})
