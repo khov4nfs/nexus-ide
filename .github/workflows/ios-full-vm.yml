@@ -75,5 +75,7 @@ jobs:
           path: |
             ${{ runner.temp }}/nexus-ios-vm-build.json
             RuntimeAssets/full-vm/provenance.json
+            RuntimeAssets/full-vm/source-inventory.json
+            RuntimeAssets/full-vm/DependencyNotices/
           if-no-files-found: warn
           retention-days: 7
