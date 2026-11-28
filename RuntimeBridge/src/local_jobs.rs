@@ -94,7 +94,7 @@ struct State {
 static STATE: Mutex<State> = Mutex::new(State {
     running:false, ready:false, mode:0, output:String::new(), raw:Vec::new(), total:0, controls:VecDeque::new(), stop:false, agent:None,
 });
-const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --no-opt --no-sparkplug --liftoff-only /opt/nexus/workbench/out/server-main.js --telemetry-level off --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
+const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --no-opt --no-sparkplug --no-maglev --no-lazy --liftoff-only /opt/nexus/workbench/out/server-main.js --telemetry-level off --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
 fn fail(message: &str) -> Value { json!({"ok":false,"error":message}) }
 fn valid_command(s: &str) -> bool { !s.trim().is_empty() && s.len() <= 2048 && !s.contains('\0') }
 fn parse_call(input:&str)->Option<Value> {
@@ -132,7 +132,7 @@ fn parse_workbench(input:&str)->Option<(String,Option<String>)> {
     if !valid_token(&token) || !process_probe::agy_digest_ok(&digest) {return None;}
     Some((token,Some(digest)))
 }
-const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --no-opt --no-sparkplug --liftoff-only /opt/nexus/workbench/out/server-main.js --telemetry-level off --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
+const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --no-opt --no-sparkplug --no-maglev --no-lazy --liftoff-only /opt/nexus/workbench/out/server-main.js --telemetry-level off --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
 fn parse_cli(input:&str)->Option<(String,String,String,Option<String>,Option<NativeSession>)> {
     if input.len()>16384 {return None;}
     let v:Value=serde_json::from_str(input).ok()?;
@@ -418,12 +418,18 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
             // for MessageChannel. Keep JS optimization disabled for the main
             // entrypoints and permit guest Wasm Liftoff. These V8 flags cannot
             // be passed via NODE_OPTIONS; child guest processes have no host JIT.
-            env.remove("NODE_OPTIONS");
+            // The pinned litter-ish kernel/exec.c also injects --jitless
+            // into every guest node exec, independently of NODE_OPTIONS.
+            // Use its explicit per-environment compatibility opt-out only
+            // in this reviewed Workbench lane; leave other guest lanes alone.
+            // Retain the upstream heap cap for Node descendants as well.
+            env.insert("ISH_NODE_NO_ARG_INJECTION".into(),"1".into());
+            env.insert("NODE_OPTIONS".into(),"--max-old-space-size=512".into());
             env.insert("UV_USE_IO_URING".into(),"0".into());
             let runtime=rt.block_on(process_probe::local_hook_with_timeout(&guest,&env,r#"
 set -eu
 test -r /opt/nexus/workbench/out/server-main.js
-exec /opt/nexus/workbench/node --no-opt --no-sparkplug --liftoff-only -e '
+exec /opt/nexus/workbench/node --no-opt --no-sparkplug --no-maglev --no-lazy --liftoff-only -e '
 const fs = require("node:fs");
 const { port1, port2 } = new MessageChannel();
 const wasm = Uint8Array.from([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,2,1,0,7,7,1,3,114,117,110,0,0,10,6,1,4,0,65,42,11]);
