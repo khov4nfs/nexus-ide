@@ -444,7 +444,7 @@ private enum VMEngine {
         guard evidenceMode != nil else { return }
         markerBuffer.append(data)
         if markerBuffer.count > 131072 { markerBuffer.removeAll(); return }
-        let exact: Set<String> = ["NEXUS_VM_CGROUP2_OK","NEXUS_VM_NET_CONFIG_OK","NEXUS_VM_DOCKER_DAEMON_OK","NEXUS_VM_DOCKER_RUN_OK","NEXUS_VM_COMPOSE_OK","NEXUS_VM_COMPOSE_NETWORK_OK","NEXUS_VM_FORWARD_READY","NEXUS_VM_FORWARD_OK","NEXUS_VM_INTERNET_TLS_OK","NEXUS_VM_REGISTRY_PULL_OK","NEXUS_VM_CLEAN_SHUTDOWN"]
+        let exact: Set<String> = ["NEXUS_VM_CGROUP2_OK","NEXUS_VM_NET_CONFIG_OK","NEXUS_VM_RESTRICTED_EGRESS_BLOCKED","NEXUS_VM_DOCKER_DAEMON_OK","NEXUS_VM_DOCKER_RUN_OK","NEXUS_VM_COMPOSE_OK","NEXUS_VM_COMPOSE_NETWORK_OK","NEXUS_VM_FORWARD_READY","NEXUS_VM_FORWARD_OK","NEXUS_VM_INTERNET_TLS_OK","NEXUS_VM_REGISTRY_PULL_OK","NEXUS_VM_CLEAN_SHUTDOWN"]
         while let end = markerBuffer.firstIndex(of: 10) {
             let line = String(decoding: markerBuffer[..<end], as: UTF8.self).trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
             markerBuffer.removeSubrange(...end)
