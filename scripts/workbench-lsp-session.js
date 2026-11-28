@@ -37,7 +37,7 @@ class Session{
     fail(error){
         if(this.failure)return;
         this.failure=error;
-        for(const p of this.pending.values()){clearTimeout(p.timer);p.reject(error);}
+        for(const p of this.pending.values()){clearTimeout(p.timer);p.cancellation?.dispose();p.reject(error);}
         this.pending.clear();
         for(const d of this.docs.values())this.rejectWaiter(d,error);
         if(this.child&&this.child.exitCode===null&&this.child.signalCode===null)this.child.kill('SIGKILL');
@@ -68,7 +68,7 @@ class Session{
                     if(this.pending.has(id)){p.cancelled=true;try{this.notify('$/cancelRequest',{id});}catch(e){this.fail(e);}}
                 });
             }catch(e){this.fail(e);}
-        }).finally(()=>{});
+        });
     }
     receive(chunk){
         try{
@@ -153,13 +153,13 @@ class Session{
             const ext=path.extname(filename);
             if(this.profile.snapshot&&!ext)throw Error('missing extension');
             const wire=this.profile.snapshot?pathToFileURL(path.join(path.dirname(filename),'.nexus-lsp-'+this.nonce+'-'+(++this.sequence)+ext)).href:doc.uri;
-            d={uri:doc.uri,wire,wireVersion:1,version:doc.version,text:doc.text,language:doc.language,diagnostics:null,waiter:null};
+            d={uri:doc.uri,wire,wireVersion:this.profile.snapshot?1:++this.sequence,version:doc.version,text:doc.text,language:doc.language,diagnostics:null,waiter:null};
             this.docs.set(doc.uri,d);this.wireDocs.set(wire,d);
-            this.notify('textDocument/didOpen',{textDocument:{uri:wire,languageId:doc.language,version:1,text:doc.text}});
+            this.notify('textDocument/didOpen',{textDocument:{uri:wire,languageId:doc.language,version:d.wireVersion,text:doc.text}});
             this.stats.opens++;this.stats.peakDocuments=Math.max(this.stats.peakDocuments,this.docs.size);
         }else{
             this.rejectWaiter(d,Error('document changed'));
-            d.version=doc.version;d.text=doc.text;d.wireVersion++;d.diagnostics=null;
+            d.version=doc.version;d.text=doc.text;d.wireVersion=++this.sequence;d.diagnostics=null;
             // Full content change is permitted even for incremental sync.
             this.notify('textDocument/didChange',{textDocument:{uri:d.wire,version:d.wireVersion},contentChanges:[{text:doc.text}]});
             this.stats.changes++;
@@ -206,7 +206,8 @@ class Session{
                 if(this.failure)throw this.failure;
                 await this.starting;
                 for(const d of [...this.docs.values()])this.drop(d);
-                if(await this.call('shutdown',null)!==null)throw Error('shutdown response');
+                if(await Promise.race([this.call('shutdown',null),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('shutdown timeout')),10000);})])!==null)throw Error('shutdown response');
+                clearTimeout(timer);
                 this.notify('exit');this.child.stdin.end();
                 const outcome=await Promise.race([this.exited,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('exit timeout')),10000);})]);
                 if(outcome.code!==0||outcome.signal!==null)throw Error('unclean exit');
