@@ -85,3 +85,35 @@ test('outside workspace and wrong language rejected, malformed frame kills sessi
     assert.ok(s.failure);assert.equal(f.child.signalCode,'SIGKILL');
     assert.equal((await s.stop()).shutdownClean,false);
 });
+
+test('RPC rejection preserves method and code without server content',async()=>{
+    const f=fake('clangd'),s=new Session('clangd',{spawnProcess:f.spawnProcess,timeout:1000});
+    try{
+        await s.start();
+        const pending=s.call('textDocument/definition',{});
+        const msg=await until(()=>f.messages.find(x=>x.method==='textDocument/definition'));
+        f.emit({id:msg.id,error:{code:-32801,message:'private source content',data:{secret:'private path'}}});
+        await assert.rejects(pending,e=>e.rpcCode===-32801&&e.rpcMethod==='textDocument/definition'&&!e.message.includes('private'));
+        assert.equal(s.failure,null);
+    }finally{assert.equal((await s.stop()).shutdownClean,true);}
+});
+test('index probe retries cancellation but never semantic errors or missing evidence',async()=>{
+    const {indexedRequest}=require('./test-real-native-language-lsp');
+    let attempts=0;
+    const transient=Object.assign(Error('cancelled'),{rpcCode:-32801,rpcMethod:'textDocument/definition'});
+    const options={timeout:1000,maxAttempts:3,pause:1};
+    assert.equal(await indexedRequest(async()=>{
+        attempts++;
+        if(attempts===1)throw transient;
+        return attempts===2?null:'verified';
+    },r=>r==='verified',options),'verified');
+    assert.equal(attempts,3);
+    attempts=0;
+    await assert.rejects(indexedRequest(async()=>{
+        attempts++;throw Object.assign(Error('semantic rejection'),{rpcCode:-32603});
+    },undefined,options),/semantic rejection/);
+    assert.equal(attempts,1);
+    attempts=0;
+    await assert.rejects(indexedRequest(async()=>{attempts++;return null;},Boolean,options),/required evidence/);
+    assert.equal(attempts,3);
+});
