@@ -17,11 +17,11 @@ const PROFILES=Object.freeze({
 });
 const LANGUAGES=Object.freeze({python:'python',c:'clangd',cpp:'clangd',typescript:'typescript',typescriptreact:'typescript',javascript:'typescript',javascriptreact:'typescript',rust:'rust',go:'go',shellscript:'bash'});
 function profileFor(language){return Object.hasOwn(LANGUAGES,language)?LANGUAGES[language]:null;}
-function reviewedProfile(key,approval){
+function reviewedProfile(key,approval,toolRoot=TOOL_ROOT,nodeExecutable='/opt/nexus/workbench/node'){
     const p=PROFILES[key];
     if(!p.optional)return p;
     if(!approval||typeof approval.version!=='string'||!/^[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,79}$/.test(approval.version)||!(/^[a-f0-9]{64}$/).test(approval.sha256))throw Error('reviewed optional server required');
-    const entry=path.join(TOOL_ROOT,p.entry);
+    const entry=path.join(toolRoot,p.entry);
     if(fs.realpathSync(entry)!==entry)throw Error('unexpected server link');
     const st=fs.statSync(entry);
     if(!st.isFile()||st.size<1||st.size>128*1024*1024)throw Error('invalid server entry');
@@ -29,7 +29,8 @@ function reviewedProfile(key,approval){
     try{const buf=Buffer.alloc(65536);let n;while((n=fs.readSync(fd,buf,0,buf.length,null))!==0)hash.update(buf.subarray(0,n));}finally{fs.closeSync(fd);}
     if(hash.digest('hex')!==approval.sha256)throw Error('server digest mismatch');
     const flags=['--no-opt','--no-sparkplug','--no-maglev','--no-lazy','--liftoff-only','--single-threaded','--v8-pool-size=1'];
-    return {...p,command:p.node?'/opt/nexus/workbench/node':entry,args:p.node?[...flags,entry,...p.args]:p.args,reviewedVersion:approval.version};
+    const initializationOptions=key==='typescript'?{...p.initializationOptions,tsserver:{path:path.join(toolRoot,'typescript/node_modules/typescript/lib/tsserver.js')}}:p.initializationOptions;
+    return {...p,initializationOptions,command:p.node?nodeExecutable:entry,args:p.node?[...flags,entry,...p.args]:p.args,reviewedVersion:approval.version};
 }
 function boundedSnapshot(doc,root){
     if(!doc||typeof doc.uri!=='string'||typeof doc.text!=='string'||!Number.isSafeInteger(doc.version)||doc.version<1||
@@ -39,9 +40,9 @@ function boundedSnapshot(doc,root){
     return filename;
 }
 class Session{
-    constructor(key,{root=ROOT,timeout=120000,spawnProcess=spawn,approval=null,projectIndex=false}={}){
+    constructor(key,{root=ROOT,timeout=120000,spawnProcess=spawn,approval=null,projectIndex=false,toolRoot=TOOL_ROOT,nodeExecutable='/opt/nexus/workbench/node',home='/root'}={}){
         if(!Object.hasOwn(PROFILES,key))throw Error('unknown server');
-        this.approval=approval;this.profile=reviewedProfile(key,approval);if(key==='clangd'&&projectIndex)this.profile={...this.profile,args:this.profile.args.map(x=>x==='--background-index=false'?'--background-index=true':x)};this.key=key;this.root=root;this.timeout=timeout;this.spawnProcess=spawnProcess;
+        this.approval=approval;this.toolRoot=toolRoot;this.nodeExecutable=nodeExecutable;this.home=home;this.profile=reviewedProfile(key,approval,toolRoot,nodeExecutable);if(key==='clangd'&&projectIndex)this.profile={...this.profile,args:this.profile.args.map(x=>x==='--background-index=false'?'--background-index=true':x)};this.key=key;this.root=root;this.timeout=timeout;this.spawnProcess=spawnProcess;
         this.nonce=randomBytes(8).toString('hex');this.sequence=0;this.id=0;
         this.pending=new Map();this.docs=new Map();this.wireDocs=new Map();
         this.buffer=Buffer.alloc(0);this.failure=null;this.child=null;this.starting=null;
@@ -154,9 +155,9 @@ class Session{
         if(this.failure)throw this.failure;
         if(this.starting)return this.starting;
         this.starting=(async()=>{
-            const p=this.profile.optional?reviewedProfile(this.key,this.approval):this.profile;
+            const p=this.profile.optional?reviewedProfile(this.key,this.approval,this.toolRoot,this.nodeExecutable):this.profile;
             this.child=this.spawnProcess(p.command,p.args,{cwd:this.root,stdio:['pipe','pipe','ignore'],
-                env:{PATH:p.optional?'/opt/nexus/lsp/bin:/usr/bin:/bin':'/usr/bin:/bin',HOME:'/root',LANG:'C.UTF-8',PYTHONFAULTHANDLER:'1',GOPROXY:'off',GOSUMDB:'off',GOTOOLCHAIN:'local',CARGO_NET_OFFLINE:'true',ISH_NODE_NO_ARG_INJECTION:'1'}});
+                env:{PATH:p.optional?path.join(this.toolRoot,'bin')+':/usr/bin:/bin':'/usr/bin:/bin',HOME:this.home,LANG:'C.UTF-8',PYTHONFAULTHANDLER:'1',GOPROXY:'off',GOSUMDB:'off',GOTOOLCHAIN:'local',CARGO_NET_OFFLINE:'true',ISH_NODE_NO_ARG_INJECTION:'1'}});
             this.stats.launches++;
             this.exited=new Promise(resolve=>this.child.once('close',(code,signal)=>{this.stats.processExited=true;resolve({code,signal});}));
             this.child.on('error',e=>this.fail(e));
