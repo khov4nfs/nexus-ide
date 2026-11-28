@@ -375,6 +375,20 @@ exports.activate=function(context){
         }catch(_){vscode.window.showWarningMessage('Cross-file project acceptance failed');}
         finally{projectBusy=false;}
     }));
+    context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.tsFixture',async()=>{
+        if(!vscode.workspace.isTrusted||stopping||projectBusy||!projectAcceptance)return;
+        projectBusy=true;
+        try{
+            // Fixed synthetic fixtures only, using the exact pre-staged and
+            // npm-locked JS bundle. No workspace command or auto-download.
+            const entry=path.join(TOOL_ROOT,PROFILES.typescript.entry);
+            const digest=require('crypto').createHash('sha256').update(fs.readFileSync(entry)).digest('hex');
+            if(digest!=='557a242e685e6b49967597a8d33934190f391090c763a0d344b9e7211e55b5dd')throw Error('unexpected TypeScript entry');
+            const report=await require('./test-real-typescript-lsp.js').run(TOOL_ROOT);
+            marker('nexus-typescript-real.json',JSON.stringify(report));
+        }catch(_){vscode.window.showWarningMessage('Real TypeScript/JavaScript acceptance failed');}
+        finally{projectBusy=false;}
+    }));
     context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.approve',approveOptional));
     context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.rename',()=>reviewProjectEdit(vscode.window.activeTextEditor,'rename')));
     context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.refactor',()=>reviewProjectEdit(vscode.window.activeTextEditor,'refactor')));
