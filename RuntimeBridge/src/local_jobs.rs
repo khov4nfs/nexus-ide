@@ -992,7 +992,22 @@ mod tests {
                 .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit())
                 .status().is_ok_and(|s|s.success())
         }else{false};
+        eprintln!("CI Workbench: requesting stop; browser_ok={browser_ok}");
         let stop=enqueue(Control::Stop);
+        let stop_deadline=Instant::now()+Duration::from_secs(90);
+        while !worker.is_finished() && Instant::now()<stop_deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !worker.is_finished() {
+            let report=json!({"ok":false,"ready":ready,"httpStatus":status,"shutdownClean":false,
+                "browserRequested":browser_requested,"browserCompleted":browser_ok,
+                "error":"Workbench runtime did not exit within stop watchdog"});
+            std::fs::write(&evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            eprintln!("{report}");
+            // CI-only isolated test executable. Never continue with a stuck
+            // guest or claim a clean shutdown, even if editor bytes exist.
+            std::process::exit(1);
+        }
         let closed=worker.join().expect("workbench owner");
         // CI-only fixed synthetic input; returned status contains no server URL or token.
         eprintln!("CI Workbench final process status: {closed}");
@@ -1009,7 +1024,7 @@ mod tests {
         let activated=browser_ok&&std::fs::read(root.join("nexus-extension-activated.marker")).ok().as_deref()==Some(b"activated");
         let editor_verified=activated&&std::fs::read(root.join("nexus-editor-saved.marker")).ok().as_deref()==Some(b"saved");
         let lsp_verified=editor_verified&&std::fs::read(root.join("nexus-lsp-transport.marker")).ok().as_deref()==Some(b"completed")&&std::fs::read(root.join("nexus-lsp-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join("nexus-editor-fixture.txt")).ok().as_deref()==Some(b"NEXUS_BROWSER_EDITOR_SAVED\nNEXUS_LSP_COMPLETION");
-        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified&&lsp_verified)),
+        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified&&lsp_verified)),
             "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"nodeRuntimeVerified":closed["nodeRuntimeVerified"],"extensionDigestVerified":closed["extensionDigestVerified"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":lsp_verified,"lspFixtureOnly":true});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         println!("{report}");
