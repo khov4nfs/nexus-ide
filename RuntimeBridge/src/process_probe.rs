@@ -1580,16 +1580,27 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
     };
     let mut capture = Capture::default();
     capture.rolling_pty = !workbench;
-    let deadline = Instant::now() + Duration::from_secs(1800);
+    let mut deadline = Instant::now() + Duration::from_secs(1800);
     let mut stopped = false;
+    let mut force_stop_at = None;
     let result: Result<(),String> = async {
         loop {
             for control in take_control() {
                 match control {
                     Control::Stop => {
-                        if !stopped && !capture.exited {
-                            session.terminate().await.map_err(|_| "Stop failed".to_owned())?;
+                        if !stopped {
                             stopped = true;
+                            // Do not reuse the 30-minute job deadline after Stop.
+                            // Give the reviewed Workbench server a chance to
+                            // dispose its extension hosts before escalation.
+                            let now = Instant::now();
+                            deadline = now + Duration::from_secs(30);
+                            if workbench && !capture.exited {
+                                session.signal(15).await.map_err(|_| "Graceful stop failed".to_owned())?;
+                                force_stop_at = Some(now + Duration::from_secs(15));
+                            } else if !capture.closed {
+                                session.terminate().await.map_err(|_| "Stop failed".to_owned())?;
+                            }
                         }
                     }
                     Control::Input(bytes) if !workbench && !stopped && !capture.exited =>
@@ -1597,6 +1608,12 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
                     Control::Resize(cols,rows) if !workbench && !stopped && !capture.exited =>
                         session.resize(cols,rows).await.map_err(|_| "Resize failed".to_owned())?,
                     _ => {}
+                }
+            }
+            if force_stop_at.is_some_and(|at| Instant::now() >= at) {
+                force_stop_at = None;
+                if !capture.closed {
+                    session.terminate().await.map_err(|_| "Forced stop failed".to_owned())?;
                 }
             }
             capture.poll(&session, deadline).await?;
