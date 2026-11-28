@@ -1,6 +1,6 @@
 #!/bin/sh
 # Runs ONLY as PID 1 in the disposable full-system Linux VM.
-# Restricted SLIRP only on explicit nexus.net=1; no registry pulls or host Docker socket.
+# Guest-only Docker/containerd. Restricted SLIRP on nexus.net=1; registry pull only on nexus.net=2.
 set -eu
 test "$$" -eq 1
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -8,6 +8,7 @@ export HOME=/root
 export DOCKER_HOST=unix:///run/docker.sock
 unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
 daemon=
+containerd_pid=
 finish() {
     rc=$?
     trap - EXIT
@@ -15,9 +16,16 @@ finish() {
         kill -TERM "$daemon" 2>/dev/null || true
         wait "$daemon" 2>/dev/null || true
     fi
+    if [ -n "$containerd_pid" ]; then
+        kill -TERM "$containerd_pid" 2>/dev/null || true
+        wait "$containerd_pid" 2>/dev/null || true
+    fi
     if [ "$rc" -ne 0 ]; then
         echo "NEXUS_VM_FAIL:$rc"
-        tail -n 60 /run/nexus-dockerd.log 2>/dev/null || true
+        echo "Guest containerd log:"
+        tail -n 100 /run/nexus-containerd.log 2>/dev/null || true
+        echo "Guest dockerd log:"
+        tail -n 100 /run/nexus-dockerd.log 2>/dev/null || true
     fi
     sync
     busybox poweroff -f
@@ -49,7 +57,7 @@ test "$previous" -lt 9999
 echo "NEXUS_VM_PERSIST_PREVIOUS:$previous"
 echo "NEXUS_VM_KERNEL:$(uname -r)"
 echo "NEXUS_VM_CGROUP2_OK"
-dpkg-query -W docker.io docker-compose-v2 busybox-static
+dpkg-query -W docker.io docker-compose-v2 containerd busybox-static
 # Retain the vfs prerequisite. In network mode verify actual bridge NAT
 # and published ports, not a host Docker daemon or fake proxy.
 case " $(cat /proc/cmdline) " in
@@ -90,16 +98,40 @@ case " $(cat /proc/cmdline) " in
         set -- --iptables=false --ip6tables=false --bridge=none --ip-forward=false --ip-masq=false --userland-proxy=false
         ;;
 esac
-dockerd --host "$DOCKER_HOST" --data-root /var/lib/docker \
+# Under interpreter-only TCI, the default dockerd-managed containerd
+# bootstrap timeout is too short for a cold guest. Start the real guest
+# service independently and wait for a successful gRPC Version response.
+# Keep both daemons on guest-local UNIX sockets, with separate state roots.
+containerd_socket=/run/nexus-containerd.sock
+printf 'version = 3\n' >/run/nexus-containerd.toml
+containerd --config /run/nexus-containerd.toml \
+    --address "$containerd_socket" --root /var/lib/containerd --state /run/nexus-containerd \
+    >/run/nexus-containerd.log 2>&1 &
+containerd_pid=$!
+echo NEXUS_VM_CONTAINERD_START
+i=0
+until timeout 5s ctr --address "$containerd_socket" version >/run/nexus-containerd-version.txt 2>&1 &&
+    grep -q '^Server:' /run/nexus-containerd-version.txt; do
+    kill -0 "$containerd_pid"
+    i=$((i+1))
+    test "$i" -lt 60
+    sleep 1
+done
+echo NEXUS_VM_CONTAINERD_READY
+# Explicitly preserve the existing classic vfs driver contract for Docker 29.
+printf '{"features":{"containerd-snapshotter":false}}\n' >/run/nexus-dockerd.json
+dockerd --config-file /run/nexus-dockerd.json --containerd "$containerd_socket" \
+    --host "$DOCKER_HOST" --data-root /var/lib/docker \
     --exec-root /run/docker --pidfile /run/docker.pid \
     --exec-opt native.cgroupdriver=cgroupfs --storage-driver vfs \
     "$@" >/run/nexus-dockerd.log 2>&1 &
 daemon=$!
 i=0
-until docker info >/dev/null 2>&1; do
+until timeout 5s docker info >/dev/null 2>&1; do
     kill -0 "$daemon"
+    kill -0 "$containerd_pid"
     i=$((i+1))
-    test "$i" -lt 240
+    test "$i" -lt 60
     sleep 1
 done
 test "$(docker info --format '{{.Driver}}')" = vfs
@@ -199,6 +231,10 @@ fi
 kill -TERM "$daemon"
 wait "$daemon"
 daemon=
+kill -TERM "$containerd_pid"
+wait "$containerd_pid"
+containerd_pid=
+echo NEXUS_VM_CONTAINERD_STOPPED
 next=$((previous+1))
 printf "%s\n" "$next" >"$counter.new"
 mv "$counter.new" "$counter"
