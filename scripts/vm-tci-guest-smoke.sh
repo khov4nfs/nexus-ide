@@ -70,8 +70,14 @@ case " $(cat /proc/cmdline) " in
         ip link set "$iface" up
         ip addr add 10.0.2.15/24 dev "$iface"
         ip route replace default via 10.0.2.2
+        printf "nameserver 10.0.2.3\n" >/etc/resolv.conf
+        if [ "$network" -eq 1 ]; then
+            if curl --proto "=https" --silent --show-error --max-time 15 https://registry-1.docker.io/v2/ -o /dev/null; then
+                echo "Restricted mode unexpectedly reached registry" >&2; exit 1
+            fi
+            echo NEXUS_VM_RESTRICTED_EGRESS_BLOCKED
+        fi
         if [ "$network" -eq 2 ]; then
-            printf "nameserver 10.0.2.3\n" >/etc/resolv.conf
             curl --proto "=https" --tlsv1.2 --fail --silent --show-error --max-time 90 https://registry-1.docker.io/v2/ -o /tmp/registry-response -w "%{http_code}" > /tmp/registry-status || test "$(cat /tmp/registry-status)" = 401
             test "$(cat /tmp/registry-status)" = 401
             echo NEXUS_VM_INTERNET_TLS_OK
