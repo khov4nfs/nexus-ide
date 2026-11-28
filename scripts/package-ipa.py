@@ -124,6 +124,20 @@ def verify(path, variant):
             for entry in ("data/opt/nexus/workbench/node","data/opt/nexus/workbench/bin/openvscode-server","data/usr/bin/pylsp","data/usr/bin/clangd-18","data/opt/nexus-lsp-package-inventory.tsv"):
                 if guest+entry not in names:
                     raise ValueError("Missing workbench executable")
+            if not re.search(r"^reviewed_lsp_bundle_sha256=[0-9a-f]{64}$", provenance, re.M):
+                raise ValueError("Missing reviewed TypeScript bundle provenance")
+            tools = guest+"data/opt/nexus/lsp/"
+            manifest = json.loads(z.read(tools+"manifest.json"))
+            ts_entry = "557a242e685e6b49967597a8d33934190f391090c763a0d344b9e7211e55b5dd"
+            if manifest.get("servers",{}).get("typescript") != {"version":"4.3.4","entrySHA256":ts_entry}:
+                raise ValueError("TypeScript bundle manifest mismatch")
+            with z.open(tools+"typescript/node_modules/typescript-language-server/lib/cli.mjs") as stream:
+                if hashlib.file_digest(stream,"sha256").hexdigest() != ts_entry:
+                    raise ValueError("TypeScript entry mismatch")
+            for package,version in (("typescript","5.7.3"),("typescript-language-server","4.3.4")):
+                metadata = json.loads(z.read(tools+"typescript/node_modules/"+package+"/package.json"))
+                if metadata.get("version") != version:
+                    raise ValueError("TypeScript toolchain package version mismatch")
         elif guest+"workbench.sha256" in names:
             raise ValueError("Unexpected workbench in plain build")
         vm_notice = prefix+"FullVMNotices/"
