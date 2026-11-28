@@ -144,6 +144,8 @@ def main():
     parser.add_argument("--confirm-local-use", action="store_true", required=True)
     parser.add_argument("--source-license", type=Path)
     parser.add_argument("--source-notices", type=Path)
+    parser.add_argument("--pylsp-rootfs", type=Path, help="Same-run signed Ubuntu pylsp package rootfs")
+    parser.add_argument("--pylsp-rootfs-sha256")
     parser.add_argument("--agy-binary", type=Path)
     parser.add_argument("--agy-sha256")
     args = parser.parse_args()
@@ -156,6 +158,10 @@ def main():
         parser.error("Provide both optional AGY arguments or neither")
     if not args.archive.is_file() or args.archive.is_symlink() or args.archive.stat().st_size != 74488835:
         raise SystemExit("Expected pinned regular release archive")
+    if bool(args.pylsp_rootfs) != bool(args.pylsp_rootfs_sha256):
+        parser.error("Provide rootfs and reviewed SHA-256 together")
+    if args.pylsp_rootfs and (not args.pylsp_rootfs.is_file() or args.pylsp_rootfs.is_symlink() or agy.digest(args.pylsp_rootfs) != args.pylsp_rootfs_sha256):
+        raise SystemExit("Prepared Python LSP rootfs digest mismatch")
     target = agy.BUILD / "workbench-fs"
     if target.exists() or target.is_symlink():
         raise SystemExit("Refusing to overwrite workbench-fs")
@@ -173,17 +179,18 @@ def main():
         shutil.copyfile(args.archive, package)
         if agy.digest(package) != SHA:
             raise SystemExit("OpenVSCode release SHA-256 mismatch")
-        original = agy.UBUNTU
+        base = args.pylsp_rootfs or agy.UBUNTU
+        original = base
         if args.agy_binary:
             agy.validate_binary(args.agy_binary, args.agy_sha256)
             binary = stage / "agy"
             shutil.copyfile(args.agy_binary, binary)
             agy.validate_binary(binary, args.agy_sha256)
             original = stage / "with-agy.tar.gz"
-            agy.overlay_archive(agy.UBUNTU, binary, original)
+            agy.overlay_archive(base, binary, original)
         else:
             original = stage / "with-slot.tar.gz"
-            agy.overlay_import_slot(agy.UBUNTU, original)
+            agy.overlay_import_slot(base, original)
         archive = stage / "rootfs.tar.gz"
         overlay(original, package, archive, source_documents)
         fs = stage / "fs"
@@ -207,6 +214,10 @@ def main():
                 if (fs / "data" / DEST / ("NEXUS-UPSTREAM-" + name)).read_bytes() != data:
                     raise ValueError("Source document conversion mismatch")
             source_provenance = f"workbench_source_commit={SOURCE_COMMIT}\n" + "".join(f"workbench_source_{name}_sha256={hashlib.sha256(data).hexdigest()}\n" for name, data in source_documents.items())
+        if args.pylsp_rootfs:
+            if not (fs / "data/usr/bin/pylsp").is_file():
+                raise ValueError("Prepared real pylsp executable missing")
+            source_provenance += f"pylsp_rootfs_sha256={args.pylsp_rootfs_sha256}\npylsp_package_version=1.10.0-1\n"
         (fs / "provenance.txt").write_text(f"ubuntu_sha256={agy.UBUNTU_SHA}\nworkbench_source={ASSET}\nworkbench_sha256={SHA}\n" + source_provenance + (f"agy_sha256={args.agy_sha256}\n" if args.agy_binary else ""))
         if target.exists() or target.is_symlink():
             raise SystemExit("Target appeared during import")
