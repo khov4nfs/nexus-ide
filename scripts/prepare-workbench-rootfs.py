@@ -8,6 +8,8 @@ import argparse
 import copy
 import hashlib
 import io
+import json
+import re
 import importlib.util
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -138,6 +140,92 @@ def overlay(original, package, output, source_documents=None):
             else:
                 dst.addfile(info)
 
+LSP_DEST = "opt/nexus/lsp"
+LSP_ENTRIES = {
+    "typescript": "typescript/node_modules/typescript-language-server/lib/cli.mjs",
+    "rust": "bin/rust-analyzer",
+    "go": "bin/gopls",
+    "bash": "bash/node_modules/bash-language-server/out/cli.js",
+}
+
+def overlay_reviewed_lsp(original, bundle, output):
+    """Copy a reviewed, regular-file-only offline bundle without host extraction."""
+    with tarfile.open(bundle, "r:gz") as pkg:
+        members = {}
+        total = 0
+        for member in pkg:
+            p = PurePosixPath(member.name)
+            if p.is_absolute() or ".." in p.parts or not p.parts or member.name.startswith("/") or "\\" in member.name:
+                raise ValueError("Invalid LSP bundle path")
+            name = p.as_posix()
+            if name == ".":
+                if not member.isdir():
+                    raise ValueError("Invalid bundle root")
+                continue
+            if name in members or len(members) >= 100_000 or not (member.isfile() or member.isdir()):
+                raise ValueError("Duplicate, excessive or nonregular bundle entry")
+            if p.parts[0] not in ("bin", "typescript", "bash", "notices", "manifest.json"):
+                raise ValueError("Unexpected bundle destination")
+            if p.parts[0] == "manifest.json" and (name != "manifest.json" or not member.isfile() or member.size > 65536):
+                raise ValueError("Invalid manifest")
+            total += member.size if member.isfile() else 0
+            if total > 1536 * 1024 * 1024:
+                raise ValueError("Expanded bundle limit")
+            members[name] = member
+        for name in members:
+            for parent in PurePosixPath(name).parents:
+                if parent.as_posix() != "." and (parent.as_posix() not in members or not members[parent.as_posix()].isdir()):
+                    raise ValueError("Missing regular directory ancestor")
+        manifest = members.get("manifest.json")
+        if manifest is None:
+            raise ValueError("Missing reviewed bundle manifest")
+        record = json.loads(pkg.extractfile(manifest).read())
+        servers = record.get("servers") if isinstance(record, dict) else None
+        if not isinstance(servers, dict) or not servers or not set(servers) <= set(LSP_ENTRIES):
+            raise ValueError("Invalid reviewed server inventory")
+        if record.get("schemaVersion") != 1 or record.get("architecture") != "arm64":
+            raise ValueError("Invalid bundle architecture")
+        if not any(name.startswith("notices/") and item.isfile() and item.size for name, item in members.items()):
+            raise ValueError("Bundle notices required")
+        for key, details in servers.items():
+            if not isinstance(details, dict) or set(details) != {"version", "entrySHA256"} or not isinstance(details["version"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,79}", details["version"]) or not isinstance(details["entrySHA256"], str) or not re.fullmatch(r"[a-f0-9]{64}", details["entrySHA256"]):
+                raise ValueError("Invalid server version or digest")
+            member = members.get(LSP_ENTRIES[key])
+            if member is None or not member.isfile() or not 1 <= member.size <= 128 * 1024 * 1024:
+                raise ValueError("Missing server entry")
+            with pkg.extractfile(member) as stream:
+                if key in ("rust", "go"):
+                    header = stream.read(20)
+                    if header[:7] != b"\x7fELF\x02\x01\x01" or header[18:20] != b"\xb7\x00" or not member.mode & 0o111:
+                        raise ValueError("Expected executable AArch64 ELF")
+                    stream.seek(0)
+                if hashlib.file_digest(stream, "sha256").hexdigest() != details["entrySHA256"]:
+                    raise ValueError("Reviewed server entry digest mismatch")
+        with tarfile.open(original, "r:gz") as src, tarfile.open(output, "x:gz") as dst:
+            for member in src:
+                p = PurePosixPath(member.name)
+                if p.is_absolute() or ".." in p.parts or p.as_posix() == LSP_DEST or p.as_posix().startswith(LSP_DEST + "/"):
+                    raise ValueError("Unsafe or colliding base entry")
+                if member.isfile():
+                    with src.extractfile(member) as stream:
+                        dst.addfile(member, stream)
+                else:
+                    dst.addfile(member)
+            add_dir(dst, LSP_DEST)
+            for name, member in members.items():
+                info = copy.copy(member)
+                info.name = "./" + LSP_DEST + "/" + name
+                info.pax_headers = {}
+                info.uid = info.gid = 0
+                info.uname = info.gname = "root"
+                info.mode &= 0o777
+                if member.isfile():
+                    with pkg.extractfile(member) as stream:
+                        dst.addfile(info, stream)
+                else:
+                    dst.addfile(info)
+        return servers
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, required=True)
@@ -146,6 +234,8 @@ def main():
     parser.add_argument("--source-notices", type=Path)
     parser.add_argument("--pylsp-rootfs", type=Path, help="Same-run signed Ubuntu pylsp package rootfs")
     parser.add_argument("--pylsp-rootfs-sha256")
+    parser.add_argument("--lsp-bundle", type=Path, help="Optional owner-reviewed ARM64 offline LSP bundle")
+    parser.add_argument("--lsp-bundle-sha256")
     parser.add_argument("--agy-binary", type=Path)
     parser.add_argument("--agy-sha256")
     args = parser.parse_args()
@@ -162,6 +252,10 @@ def main():
         parser.error("Provide rootfs and reviewed SHA-256 together")
     if args.pylsp_rootfs and (not args.pylsp_rootfs.is_file() or args.pylsp_rootfs.is_symlink() or agy.digest(args.pylsp_rootfs) != args.pylsp_rootfs_sha256):
         raise SystemExit("Prepared Python LSP rootfs digest mismatch")
+    if bool(args.lsp_bundle) != bool(args.lsp_bundle_sha256):
+        parser.error("Provide optional LSP bundle and reviewed SHA-256 together")
+    if args.lsp_bundle and (not args.lsp_bundle.is_file() or args.lsp_bundle.is_symlink() or args.lsp_bundle.stat().st_size > 1024**3):
+        raise SystemExit("Invalid reviewed LSP bundle")
     target = agy.BUILD / "workbench-fs"
     if target.exists() or target.is_symlink():
         raise SystemExit("Refusing to overwrite workbench-fs")
@@ -193,6 +287,15 @@ def main():
             agy.overlay_import_slot(base, original)
         archive = stage / "rootfs.tar.gz"
         overlay(original, package, archive, source_documents)
+        lsp_inventory = None
+        if args.lsp_bundle:
+            bundle = stage / "reviewed-lsp.tar.gz"
+            shutil.copyfile(args.lsp_bundle, bundle)
+            if agy.digest(bundle) != args.lsp_bundle_sha256:
+                raise ValueError("Reviewed LSP bundle SHA-256 mismatch")
+            with_lsp = stage / "rootfs-with-lsp.tar.gz"
+            lsp_inventory = overlay_reviewed_lsp(archive, bundle, with_lsp)
+            archive = with_lsp
         fs = stage / "fs"
         subprocess.run([str(converter), str(archive), str(fs)], check=True)
         subprocess.run(["sqlite3", str(fs / "meta.db"), "PRAGMA wal_checkpoint(TRUNCATE);"], check=True)
@@ -220,6 +323,11 @@ def main():
             if not (fs / "data/usr/bin/pylsp").is_file():
                 raise ValueError("Prepared real pylsp executable missing")
             source_provenance += f"pylsp_rootfs_sha256={args.pylsp_rootfs_sha256}\npylsp_package_version=1.10.0-1\nclangd_package_version=1:18.1.3-1\n"
+        if lsp_inventory is not None:
+            for key, details in lsp_inventory.items():
+                if agy.digest(fs / "data" / LSP_DEST / LSP_ENTRIES[key]) != details["entrySHA256"]:
+                    raise ValueError("Reviewed LSP entry changed during conversion")
+            source_provenance += f"reviewed_lsp_bundle_sha256={args.lsp_bundle_sha256}\n"
         (fs / "provenance.txt").write_text(f"ubuntu_sha256={agy.UBUNTU_SHA}\nworkbench_source={ASSET}\nworkbench_sha256={SHA}\n" + source_provenance + (f"agy_sha256={args.agy_sha256}\n" if args.agy_binary else ""))
         if target.exists() or target.is_symlink():
             raise SystemExit("Target appeared during import")
