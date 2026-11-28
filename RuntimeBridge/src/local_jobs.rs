@@ -94,7 +94,7 @@ struct State {
 static STATE: Mutex<State> = Mutex::new(State {
     running:false, ready:false, mode:0, output:String::new(), raw:Vec::new(), total:0, controls:VecDeque::new(), stop:false, agent:None,
 });
-const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --jitless /opt/nexus/workbench/out/server-main.js --telemetry-level off --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
+const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --no-opt --no-sparkplug --liftoff-only /opt/nexus/workbench/out/server-main.js --telemetry-level off --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
 fn fail(message: &str) -> Value { json!({"ok":false,"error":message}) }
 fn valid_command(s: &str) -> bool { !s.trim().is_empty() && s.len() <= 2048 && !s.contains('\0') }
 fn parse_call(input:&str)->Option<Value> {
@@ -132,7 +132,7 @@ fn parse_workbench(input:&str)->Option<(String,Option<String>)> {
     if !valid_token(&token) || !process_probe::agy_digest_ok(&digest) {return None;}
     Some((token,Some(digest)))
 }
-const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --jitless /opt/nexus/workbench/out/server-main.js --telemetry-level off --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
+const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --no-opt --no-sparkplug --liftoff-only /opt/nexus/workbench/out/server-main.js --telemetry-level off --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
 fn parse_cli(input:&str)->Option<(String,String,String,Option<String>,Option<NativeSession>)> {
     if input.len()>16384 {return None;}
     let v:Value=serde_json::from_str(input).ok()?;
@@ -411,11 +411,35 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
             r
         }
         else if let Some((token,vsix))=workbench.as_ref() {
-            // Node and libuv stay in interpreted, ordinary syscall mode.
-            // libuv documents UV_USE_IO_URING=0 for disabling the optional fast path.
+            // Only this reviewed Linux guest binary may use guest Wasm baseline
+            // code generation. Asbestos interprets guest instructions; the host
+            // backing pages are never executable. Do not enable host JIT.
+            // V8 --jitless disables WebAssembly, breaking Node 22 Undici even
+            // for MessageChannel. Keep JS optimization disabled for the main
+            // entrypoints and permit guest Wasm Liftoff. These V8 flags cannot
+            // be passed via NODE_OPTIONS; child guest processes have no host JIT.
+            env.remove("NODE_OPTIONS");
             env.insert("UV_USE_IO_URING".into(),"0".into());
-            let runtime=rt.block_on(process_probe::local_hook_with_timeout(&guest,&env,
-                "test -r /opt/nexus/workbench/out/server-main.js && exec /opt/nexus/workbench/node --jitless -e 'const fs=require(\"fs\"); fs.stat(\"/tmp\",(e,s)=>{if(e||!s.isDirectory())process.exitCode=1;else console.log(\"NEXUS_NODE_ASYNC_OK\")})'",60));
+            let runtime=rt.block_on(process_probe::local_hook_with_timeout(&guest,&env,r#"
+set -eu
+test -r /opt/nexus/workbench/out/server-main.js
+exec /opt/nexus/workbench/node --no-opt --no-sparkplug --liftoff-only -e '
+const fs = require("node:fs");
+const { port1, port2 } = new MessageChannel();
+const wasm = Uint8Array.from([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,2,1,0,7,7,1,3,114,117,110,0,0,10,6,1,4,0,65,42,11]);
+if (new WebAssembly.Instance(new WebAssembly.Module(wasm)).exports.run() !== 42) throw Error("guest Wasm result");
+const deadline = setTimeout(() => { console.error("guest MessageChannel timeout"); process.exit(1); }, 10000);
+port1.addEventListener("message", event => {
+    if (event.data !== 42) throw Error("guest MessageChannel result");
+    port1.close(); port2.close(); clearTimeout(deadline);
+    fs.stat("/tmp", (err, stat) => {
+        if (err || !stat.isDirectory()) process.exitCode = 1;
+        else console.log("NEXUS_NODE_WASM_MESSAGE_ASYNC_OK");
+    });
+});
+port1.start(); port2.postMessage(42);
+'
+"#,60));
             let digest_verified=vsix.as_deref().map(|digest|
                 rt.block_on(process_probe::guest_file_digest(&guest,&env,"/opt/nexus/extension.vsix",digest))["passed"]==true);
             #[cfg(test)]
