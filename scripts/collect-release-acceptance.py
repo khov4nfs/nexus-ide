@@ -60,7 +60,7 @@ def gates(variant, full_vm=False):
     if variant == "workbench":
         rows["workbench-real-lsp"] = ("macOS guest Chromium editor and real Python LSP 1.10.0 via installed acceptance VSIX", {"ok": True, "shutdownClean": True, "nodeRuntimeVerified": True, "extensionDigestVerified": True, "extensionInstallVerified": True, "browserRequested": True, "extensionActivationVerified": True, "editorVerified": True, "lspVerified": True, "lspFixtureOnly": False, "realDiagnosticsVerified": True, "realCompletionVerified": True, "realServerVersion": "1.10.0"})
     if full_vm:
-        rows["full-vm-host"] = ("Linux ARM64 host TCI kernel Docker Compose restricted networking", {"ok": True, "tciBuildVerified": True, "linuxKernelBootVerified": True, "dockerEngineInHostTCIVerified": True, "composeInHostTCIVerified": True, "composeNetworkVerified": True, "loopbackForwardVerified": True, "internetTLSVerified": True, "registryPullVerified": True, "cleanShutdown": True, "physicalDeviceVerified": False})
+        rows["full-vm-host"] = ("Linux ARM64 host TCI kernel Docker Compose restricted networking", {"ok": True, "tciBuildVerified": True, "linuxKernelBootVerified": True, "dockerEngineInHostTCIVerified": True, "composeInHostTCIVerified": True, "composeNetworkVerified": True, "loopbackForwardVerified": True, "internetTLSVerified": True, "registryPullVerified": True, "restrictedRegistryEgressBlocked": True, "cleanShutdown": True, "physicalDeviceVerified": False})
         rows["full-vm-build"] = ("iPhoneOS Release app VM framework and source inventory", {"ok": True, "iosBackendCompiled": True, "physicalDeviceVerified": False, "ownerDistributionRecordMatched": True})
     return rows
 
