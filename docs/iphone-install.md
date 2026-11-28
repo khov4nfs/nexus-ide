@@ -37,3 +37,18 @@ For workbench builds the optional CI workflow now additionally requires Chromium
 For the reviewed local ACP lane, obtain a permitted upstream Linux ARM64 glibc standalone release from https://github.com/agentclientprotocol/claude-agent-acp/releases . Keep the adapter and its matching Claude CLI together as documented upstream; review licenses, release version, archive and hashes. Install in the saved local-tools Ubuntu environment using the reviewed PTY, authenticate through upstream's supported login, and exit cleanly. Restart Nexus, select Local ACP adapter, enter the absolute adapter argv JSON and reviewed executable SHA-256, then confirm a first message. If capability-gated session handle appears, copy it and finish cleanly; on next boot enter it explicitly for resume. This is a candidate transport, not tested with the upstream binary; no automatic installation, credential handoff or guarantee of compatibility. The adapter may access guest files and network. Native file/terminal grants disabled. No proprietary binaries redistributed.
 
 The new Docker prerequisites mode is diagnostic only; a positive capability or an installed CLI does not establish Docker Engine, Compose or a full-system Linux VM. No remote daemon is used. For the batch file and live LSP modes, see docs/production-acceptance.md; both are explicitly reviewed and require independent device testing.
+
+## Owner-attested device acceptance (0.8.0 candidate)
+After downloading the license-reviewed integrated candidate bundle, retain build.json, acceptance.json, SHA256SUMS and the exact unsigned IPA. In a trusted local Python 3.11+ environment, from this source revision:
+
+```sh
+python3 scripts/verify-device-acceptance.py --package ./release --record ./device-record.json --initialize
+```
+
+The generated record starts all checks false. Sign/install legitimately and run each named test on the actual iPhone, including real provider auth/inference, resume, hooks, batch conflict and LSP. Record the public device model, iOS version, installation method and actual component versions, never account details, keys, OAuth codes, UDID or private transcripts. For each passed check keep a redacted text observation in a private evidence folder named exactly <check>.txt and enter its SHA-256 into the record. Only acknowledge the manual review after observing the real outcomes. Then run:
+
+```sh
+python3 scripts/verify-device-acceptance.py --package ./release --record ./device-record.json --evidence ./private-evidence --output ./device-acceptance.json
+```
+
+Missing or changed evidence, wrong IPA identity, or pending checks prevents complete owner review. Successful validation checks consistency/completeness only; no independent attestation or production release is granted. Keep evidence local; never commit real credentials or account information. Full-system VM and Docker remain unsupported.
