@@ -13,7 +13,7 @@ const sessions=new Map(),accepted=new Set(),completed=new Set();
 let stopping=false, collection;
 function marker(name,value){fs.writeFileSync(path.join(ROOT,name),value);}
 function supported(doc){
-    return !stopping&&vscode.workspace.isTrusted&&doc.uri.scheme==='file'&&profileFor(doc.languageId)&&
+    return !stopping&&!doc.isClosed&&vscode.workspace.isTrusted&&doc.uri.scheme==='file'&&profileFor(doc.languageId)&&
         path.resolve(doc.uri.fsPath).startsWith(ROOT+'/')&&Buffer.byteLength(doc.getText(),'utf8')<=131072;
 }
 function snapshot(doc){return {uri:doc.uri.toString(),language:doc.languageId,version:doc.version,text:doc.getText()};}
@@ -101,11 +101,23 @@ exports.activate=function(context){
     collection=vscode.languages.createDiagnosticCollection('nexus-reviewed-lsp');
     context.subscriptions.push(collection);
     const scheduled=new Map();
-    // On-save diagnostics and explicit completion are bounded; a stale
-    // result never reaches a newer editor snapshot. Clear on every edit.
-    context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(e=>collection.delete(e.document.uri)));
+    // Debounced live diagnostics for normal files. Acceptance fixtures use
+    // explicit saves, so tests still prove real editor persistence.
+    function schedule(doc,delay){
+        if(!supported(doc))return;
+        const key=doc.uri.toString();
+        if(scheduled.has(key))clearTimeout(scheduled.get(key));
+        else if(scheduled.size>=24)return;
+        scheduled.set(key,setTimeout(()=>{scheduled.delete(key);diagnostics(doc);},delay));
+    }
+    context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(doc=>{if(!fixture(doc))schedule(doc,800);}));
+    context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(e=>{
+        collection.delete(e.document.uri);
+        if(e.contentChanges.length&&!fixture(e.document))schedule(e.document,800);
+    }));
     context.subscriptions.push(vscode.workspace.onDidCloseTextDocument(doc=>{
         collection.delete(doc.uri);
+        const key=doc.uri.toString();if(scheduled.has(key)){clearTimeout(scheduled.get(key));scheduled.delete(key);}
         const s=sessions.get(profileFor(doc.languageId));if(s)s.closeDocument(doc.uri.toString()).catch(()=>{});
     }));
     context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(doc=>{
@@ -114,9 +126,7 @@ exports.activate=function(context){
         if(f&&text===f.initial+f.suffix&&completed.has(f.filename)){
             marker(f.savedMarker,'saved');return;
         }
-        const key=doc.uri.toString();
-        if(scheduled.has(key))clearTimeout(scheduled.get(key));
-        scheduled.set(key,setTimeout(()=>{scheduled.delete(key);diagnostics(doc);},150));
+        schedule(doc,150);
     }));
     context.subscriptions.push({dispose(){for(const timer of scheduled.values())clearTimeout(timer);scheduled.clear();}});
     for(const language of ['python','c','cpp']){
