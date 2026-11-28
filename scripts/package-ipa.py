@@ -119,9 +119,9 @@ def verify(path, variant):
             if z.read(guest+"data/opt/nexus/extension.vsix") != b"NEXUS_VSIX_IMPORT_SLOT_V1\n":
                 raise ValueError("Expected empty VSIX import slot")
             provenance = z.read(guest+"provenance.txt").decode()
-            if not re.search(r"^pylsp_rootfs_sha256=[0-9a-f]{64}$", provenance, re.M) or "pylsp_package_version=1.10.0-1\n" not in provenance:
+            if not re.search(r"^pylsp_rootfs_sha256=[0-9a-f]{64}$", provenance, re.M) or "pylsp_package_version=1.10.0-1\n" not in provenance or "clangd_package_version=1:18.1.3-1\n" not in provenance:
                 raise ValueError("Missing pinned real Workbench Python LSP provenance")
-            for entry in ("data/opt/nexus/workbench/node","data/opt/nexus/workbench/bin/openvscode-server","data/usr/bin/pylsp"):
+            for entry in ("data/opt/nexus/workbench/node","data/opt/nexus/workbench/bin/openvscode-server","data/usr/bin/pylsp","data/usr/bin/clangd-18","data/opt/nexus-lsp-package-inventory.tsv"):
                 if guest+entry not in names:
                     raise ValueError("Missing workbench executable")
         elif guest+"workbench.sha256" in names:
