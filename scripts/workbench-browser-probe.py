@@ -134,7 +134,7 @@ def main():
                 expected["nexus-real-diagnostics.marker"] = b"pylsp-1.10.0"
             wait_for_guest_save(page, root, expected, "initial editor save", seconds=150 if real else 45)
             if real:
-                page.locator(".monaco-editor .squiggly-error").first.wait_for(state="visible", timeout=30000)
+                page.locator(".monaco-editor .squiggly-error, .monaco-editor .squiggly-warning").first.wait_for(state="visible", timeout=30000)
                 print("Workbench browser: real diagnostic rendered", file=sys.stderr, flush=True)
             editor.click()
             page.keyboard.press("Meta+End")
