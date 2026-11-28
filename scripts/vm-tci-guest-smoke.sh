@@ -9,9 +9,14 @@ export DOCKER_HOST=unix:///run/docker.sock
 unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
 daemon=
 containerd_pid=
+phase=boot
 finish() {
     rc=$?
     trap - EXIT
+    if [ "$rc" -ne 0 ]; then
+        echo "NEXUS_VM_FAIL:$rc"
+        echo "NEXUS_VM_FAIL_PHASE:$phase"
+    fi
     if [ -n "$daemon" ]; then
         kill -TERM "$daemon" 2>/dev/null || true
         wait "$daemon" 2>/dev/null || true
@@ -21,7 +26,10 @@ finish() {
         wait "$containerd_pid" 2>/dev/null || true
     fi
     if [ "$rc" -ne 0 ]; then
-        echo "NEXUS_VM_FAIL:$rc"
+        echo "Last Docker readiness probe:"
+        tail -n 20 /run/nexus-docker-probe.log 2>/dev/null || true
+        echo "Last Docker info:"
+        tail -n 20 /run/nexus-docker-info.log 2>/dev/null || true
         echo "Guest containerd log:"
         tail -n 100 /run/nexus-containerd.log 2>/dev/null || true
         echo "Guest dockerd log:"
@@ -102,6 +110,7 @@ esac
 # bootstrap timeout is too short for a cold guest. Start the real guest
 # service independently and wait for a successful gRPC Version response.
 # Keep both daemons on guest-local UNIX sockets, with separate state roots.
+phase=containerd_start
 containerd_socket=/run/nexus-containerd.sock
 printf 'version = 3\n' >/run/nexus-containerd.toml
 containerd --config /run/nexus-containerd.toml \
@@ -110,35 +119,51 @@ containerd --config /run/nexus-containerd.toml \
 containerd_pid=$!
 echo NEXUS_VM_CONTAINERD_START
 i=0
-until timeout 5s ctr --address "$containerd_socket" version >/run/nexus-containerd-version.txt 2>&1 &&
+until [ -S "$containerd_socket" ] && timeout 30s ctr --address "$containerd_socket" version >/run/nexus-containerd-version.txt 2>&1 &&
     grep -q '^Server:' /run/nexus-containerd-version.txt; do
     kill -0 "$containerd_pid"
     i=$((i+1))
-    test "$i" -lt 60
-    sleep 1
+    test "$i" -lt 20
+    sleep 3
 done
 echo NEXUS_VM_CONTAINERD_READY
 # Explicitly preserve the existing classic vfs driver contract for Docker 29.
 printf '{"features":{"containerd-snapshotter":false}}\n' >/run/nexus-dockerd.json
+phase=dockerd_start
 dockerd --config-file /run/nexus-dockerd.json --containerd "$containerd_socket" \
     --host "$DOCKER_HOST" --data-root /var/lib/docker \
     --exec-root /run/docker --pidfile /run/docker.pid \
     --exec-opt native.cgroupdriver=cgroupfs --storage-driver vfs \
     "$@" >/run/nexus-dockerd.log 2>&1 &
 daemon=$!
+# A lightweight HTTP ping avoids repeatedly starting the Go CLI and
+# collecting expensive system info on a single interpreter CPU.
+phase=dockerd_ping
 i=0
-until timeout 5s docker info >/dev/null 2>&1; do
+until [ -S /run/docker.sock ] &&
+    curl --unix-socket /run/docker.sock --noproxy '*' --fail --silent --show-error \
+        --connect-timeout 5 --max-time 30 http://localhost/_ping \
+        >/run/nexus-docker-ping.txt 2>/run/nexus-docker-probe.log &&
+    [ "$(cat /run/nexus-docker-ping.txt)" = OK ]; do
     kill -0 "$daemon"
     kill -0 "$containerd_pid"
     i=$((i+1))
-    test "$i" -lt 60
-    sleep 1
+    test "$i" -lt 120
+    sleep 5
 done
-test "$(docker info --format '{{.Driver}}')" = vfs
-test "$(docker info --format '{{.CgroupVersion}}')" = 2
+echo NEXUS_VM_DOCKER_API_READY
+# Still query the actual daemon for both properties, once, with a
+# realistic TCI deadline. API ping alone is not sufficient evidence.
+phase=dockerd_info
+timeout 180s docker info --format '{{.Driver}} {{.CgroupVersion}}' \
+    >/run/nexus-docker-info.txt 2>/run/nexus-docker-info.log
+test "$(cat /run/nexus-docker-info.txt)" = 'vfs 2'
+kill -0 "$daemon"
+kill -0 "$containerd_pid"
 echo NEXUS_VM_DOCKER_DAEMON_OK
 if [ "$network" -eq 2 ]; then
     # Public, explicit registry pull. Record resolved immutable digest; never run this mutable tag.
+    phase=registry_pull
     docker pull --platform linux/arm64 docker.io/library/busybox:1.37.0
     test "$(docker image inspect --format '{{.Architecture}}' docker.io/library/busybox:1.37.0)" = arm64
     digest=$(docker image inspect --format '{{index .RepoDigests 0}}' docker.io/library/busybox:1.37.0)
@@ -148,11 +173,14 @@ if [ "$network" -eq 2 ]; then
 fi
 # The image is made from a signed Ubuntu busybox-static package, not a
 # registry pull. The container has its own namespaces and no network.
+phase=docker_import
 mkdir -p /tmp/nexus-image/bin
 cp "$(command -v busybox)" /tmp/nexus-image/bin/busybox
 tar --numeric-owner -C /tmp/nexus-image -cf - . | docker import - nexus-vm-smoke:local >/dev/null
+phase=docker_run
 test "$(docker run --pull=never --network none --rm nexus-vm-smoke:local /bin/busybox echo NEXUS_CONTAINER_42)" = NEXUS_CONTAINER_42
 echo NEXUS_VM_DOCKER_RUN_OK
+phase=compose_volume
 mkdir -p /tmp/nexus-compose
 cd /tmp/nexus-compose
 cat >compose.yaml <<'YAML'
@@ -185,6 +213,7 @@ docker compose -p nexus-vm down --volumes
 test -z "$(docker ps -aq)"
 echo NEXUS_VM_COMPOSE_OK
 if [ "$network" -eq 1 ]; then
+    phase=compose_network
     mkdir -p /tmp/nexus-web/bin /tmp/nexus-web/www/cgi-bin
     cp "$(command -v busybox)" /tmp/nexus-web/bin/busybox
     ln -s busybox /tmp/nexus-web/bin/sh
@@ -218,6 +247,7 @@ YAML
     # Remove the internal client acknowledgement. Only the external
     # loopback request after this marker can satisfy the next assertion.
     docker exec "$web" /bin/busybox rm -f /tmp/nexus-forward-proof
+    phase=loopback_forward
     echo NEXUS_VM_FORWARD_READY
     i=0
     until docker exec "$web" /bin/busybox test -f /tmp/nexus-forward-proof; do
@@ -228,6 +258,7 @@ YAML
     docker compose -p nexus-network down --volumes
     test -z "$(docker ps -aq)"
 fi
+phase=daemon_shutdown
 kill -TERM "$daemon"
 wait "$daemon"
 daemon=
@@ -235,6 +266,7 @@ kill -TERM "$containerd_pid"
 wait "$containerd_pid"
 containerd_pid=
 echo NEXUS_VM_CONTAINERD_STOPPED
+phase=persistence
 next=$((previous+1))
 printf "%s\n" "$next" >"$counter.new"
 mv "$counter.new" "$counter"
