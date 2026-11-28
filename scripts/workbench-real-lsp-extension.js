@@ -11,7 +11,7 @@ const fixtures={
     cpp:{filename:'nexus-real-lsp.cpp',initial:'int broken = missing_nexus_cpp;\nstruct NexusCompletion { int nexus_value; };\nvoid probe() {\n    NexusCompletion item;\n    item',suffix:'.nexus_value',symbol:'missing_nexus_cpp',line:0,character:13,label:'nexus_value',completionLine:4,completionCharacter:9,diagnosticMarker:'nexus-cpp-diagnostics.marker',completionMarker:'nexus-cpp-completion.marker',savedMarker:'nexus-cpp-saved.marker',server:'clangd-18.1.3'}
 };
 const sessions=new Map(),accepted=new Set(),completed=new Set(),approvals=new Map();
-let projectIndex=false,previewText='',projectBusy=false;
+let projectIndex=false,previewText='',projectBusy=false,projectAcceptance=false;
 let stopping=false, collection, stopInProgress=null;
 function marker(name,value){fs.writeFileSync(path.join(ROOT,name),value);}
 function supported(doc){
@@ -96,9 +96,9 @@ async function stopAll(writeEvidence=false){
         const p=reports.python,c=reports.clangd;
         // Evidence must reflect actual initialized server processes, not just
         // successful marker writes or completion text.
-        const ok=[p,c].every(s=>s&&s.launches===1&&s.initializes===1&&s.diagnostics>=1&&s.completions>=1&&s.shutdownClean&&s.processExited&&!s.restarted&&s.opens>=1&&s.closes===s.opens)&&
+        const ok=projectAcceptance&&[p,c].every(s=>s&&s.launches===1&&s.initializes===1&&s.diagnostics>=1&&s.completions>=1&&s.shutdownClean&&s.processExited&&!s.restarted&&s.opens>=1&&s.closes===s.opens)&&
             p.snapshotRefreshes>=1&&c.changes>=2&&c.completions>=2&&c.peakDocuments>=2&&Object.values(fixtures).every(f=>completed.has(f.filename));
-        marker('nexus-persistent-lsp.json',JSON.stringify({ok,python:p,clangd:c,languages:['python','c','cpp']}));
+        marker('nexus-persistent-lsp.json',JSON.stringify({ok,python:p,clangd:c,languages:['python','c','cpp'],projectAcceptance}));
     }
     return Object.values(reports).every(r=>r.launches===0||r.processExited===true);
     })();
@@ -327,6 +327,50 @@ exports.activate=function(context){
             }catch(_){return [];}
         }
     }));
+    context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.projectFixture',async()=>{
+        if(!vscode.workspace.isTrusted||stopping||projectBusy||!Object.values(fixtures).every(f=>completed.has(f.filename)))return;
+        projectBusy=true;
+        try{
+            // An explicit, synthetic test only. Create a new directory with
+            // fixed filenames, never overwrite existing project files.
+            const folder=path.join(ROOT,'nexus-project-acceptance');
+            fs.mkdirSync(folder);
+            const header=path.join(folder,'shared.hpp'),source=path.join(folder,'main.cpp');
+            const h='inline int nexus_shared(int x) { return x + 1; }\n';
+            const c='#include "shared.hpp"\nint nexus_entry() { return nexus_shared(1); }\n';
+            fs.writeFileSync(header,h,{flag:'wx'});fs.writeFileSync(source,c,{flag:'wx'});
+            const huri=vscode.Uri.file(header),curi=vscode.Uri.file(source);
+            const hd=await vscode.workspace.openTextDocument(huri),cd=await vscode.workspace.openTextDocument(curi);
+            // Keep both buffers open for the real clangd cross-file index.
+            await vscode.window.showTextDocument(hd,{preview:false});
+            await vscode.window.showTextDocument(cd,{preview:false});
+            const pos={line:1,character:28};
+            const def=await projectRPC(cd,'textDocument/definition',{position:pos});
+            const defs=(Array.isArray(def.result)?def.result:[def.result]).map(location).filter(Boolean);
+            if(!defs.some(l=>l.uri.toString()===huri.toString()))throw Error('cross-file definition missing');
+            const refs=await projectRPC(cd,'textDocument/references',{position:pos,context:{includeDeclaration:true}});
+            const found=new Set((Array.isArray(refs.result)?refs.result:[]).map(location).filter(Boolean).map(l=>l.uri.toString()));
+            if(!found.has(huri.toString())||!found.has(curi.toString()))throw Error('cross-file references missing');
+            const baselines=await captureBaselines();
+            const renamed=await projectRPC(cd,'textDocument/rename',{position:pos,newName:'nexus_renamed'});
+            for(const [uri,base] of baselines)base.wireVersion=renamed.server.docs.get(uri)?.wireVersion??null;
+            const rows=plan(renamed.result,baselines,ROOT);
+            const expected=new Map([[huri.toString(),h.replace('nexus_shared','nexus_renamed')],[curi.toString(),c.replace('nexus_shared','nexus_renamed')]]);
+            if(rows.length!==2||!rows.every(r=>expected.get(r.uri)===r.replacement&&sameBaseline(r.uri,r.base)))throw Error('cross-file rename mismatch');
+            // This command is explicit approval for the two newly created
+            // synthetic files only, not user project files.
+            const edit=new vscode.WorkspaceEdit();
+            for(const r of rows)for(const e of r.rows){
+                const a=e.range.start,b=e.range.end;
+                edit.replace(vscode.Uri.parse(r.uri),new vscode.Range(a.line,a.character,b.line,b.character),e.text);
+            }
+            if(!await vscode.workspace.applyEdit(edit)||!await hd.save()||!await cd.save())throw Error('fixture edit failed');
+            if(![...expected].every(([uri,text])=>boundedFile(uri)===text))throw Error('fixture save mismatch');
+            projectAcceptance=true;
+            marker('nexus-project-lsp.marker','definition-references-rename');
+        }catch(_){vscode.window.showWarningMessage('Cross-file project acceptance failed');}
+        finally{projectBusy=false;}
+    }));
     context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.approve',approveOptional));
     context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.rename',()=>reviewProjectEdit(vscode.window.activeTextEditor,'rename')));
     context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.refactor',()=>reviewProjectEdit(vscode.window.activeTextEditor,'refactor')));
@@ -353,7 +397,7 @@ exports.activate=function(context){
     context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.restart',async()=>{
         if(!await stopAll(false)){vscode.window.showWarningMessage('A language server did not exit. Relaunch the guest before restarting.');return;}
         sessions.clear();stopping=false;
-        accepted.clear();completed.clear();
+        accepted.clear();completed.clear();projectAcceptance=false;
     }));
 };
 exports.deactivate=()=>stopAll(false);
