@@ -75,10 +75,56 @@ def stage(sysroot, target, utm, qemu):
                        ("QEMU-LICENSE", root / "Vendor/nexus-qemu/LICENSE"),
                        ("UTM-LICENSE", root / "Vendor/nexus-utm/LICENSE")):
         shutil.copy2(path, target / name)
+    # Inventory the actual fetched archives and Git dependency revisions.
+    # This is an audit input, not a legal approval or source offer.
+    utm_root = root / "Vendor/nexus-utm"
+    qemu_root = root / "Vendor/nexus-qemu"
+    def sha(path):
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+    sources = {}
+    for build in sorted(utm_root.glob("build-*")):
+        for item in sorted(build.iterdir()):
+            if item.is_file() and item.name.endswith((".tar.gz", ".tar.xz", ".tar.bz2", ".tgz")):
+                sources[item.name] = sha(item)
+            elif item.is_dir() and (item / ".git").exists():
+                sources[item.name] = command("git", "-C", str(item), "rev-parse", "HEAD").strip()
+    for item in sorted((qemu_root / "subprojects").glob("*")):
+        if item.is_dir() and (item / ".git").exists():
+            sources["qemu-subproject/" + item.name] = command("git", "-C", str(item), "rev-parse", "HEAD").strip()
+    for item in sorted((qemu_root / "subprojects/packagecache").glob("*")):
+        if item.is_file():
+            sources["qemu-packagecache/" + item.name] = sha(item)
+    notices = target / "DependencyNotices"
+    notices.mkdir()
+    notice_hashes = {}
+    roots = [("qemu", qemu_root), ("utm", utm_root)]
+    for build in sorted(utm_root.glob("build-*")):
+        roots.extend((item.name, item) for item in sorted(build.iterdir()) if item.is_dir())
+    for name, directory in roots:
+        for item in sorted(directory.iterdir()):
+            if item.is_file() and not item.is_symlink() and re.match(r"^(COPYING|LICENSE|LICENCE|COPYRIGHT|NOTICE)([._-].*)?$", item.name, re.I):
+                if item.stat().st_size > 2_000_000:
+                    raise ValueError("Unexpected notice size")
+                dest_notice = notices / (name + "-" + item.name)
+                shutil.copy2(item, dest_notice)
+                notice_hashes[dest_notice.name] = sha(dest_notice)
+    for item in sorted((qemu_root / "pc-bios").glob("*")):
+        if item.is_file() and (item.name == "README" or "license" in item.name.lower()):
+            dest_notice = notices / ("firmware-" + item.name)
+            shutil.copy2(item, dest_notice)
+            notice_hashes[dest_notice.name] = sha(dest_notice)
+    firmware_hashes = {p.relative_to(target / "Firmware").as_posix(): sha(p)
+                       for p in sorted((target / "Firmware").rglob("*")) if p.is_file()}
+    inventory = {"utmCommit": utm, "qemuCommit": qemu, "sources": sources,
+                 "noticeSHA256": notice_hashes, "firmwareSHA256": firmware_hashes,
+                 "qemuPatchSHA256": sha(utm_root / "patches/qemu-10.0.12-utm.patch"),
+                 "buildScriptSHA256": sha(root / "scripts/build-ios-vm.sh")}
+    (target / "source-inventory.json").write_text(json.dumps(inventory, sort_keys=True, indent=2) + "\n")
     (target / "provenance.json").write_text(json.dumps({
         "utmCommit": utm, "qemuCommit": qemu, "architecture": "arm64",
         "platform": "iPhoneOS", "interpreterOnlyEntryPoint": True,
-        "frameworkSHA256": hashes, "physicalDeviceVerified": False,
+        "frameworkSHA256": hashes, "sourceInventorySHA256": sha(target / "source-inventory.json"), "physicalDeviceVerified": False,
         "distributionReviewComplete": False
     }, indent=2) + "\n")
     print("Staged device framework closure:", ", ".join(sorted(hashes)))
