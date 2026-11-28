@@ -35,21 +35,43 @@ def main():
             # Only the synthetic local fixture workspace may be trusted here.
             print("Workbench browser: await remote command", file=sys.stderr, flush=True)
             deadline = time.monotonic() + 240
+            attempt = 0
+            # Quick Access computes its command picks when opened. A palette
+            # opened before remote registration can retain a stale command set.
+            widget = page.locator(".quick-input-widget:visible")
+            command_name = re.compile(r"^Nexus: Open CI Fixture(?:,|$)", re.I)
             while time.monotonic() < deadline:
+                attempt += 1
                 trust = page.get_by_role("button", name=re.compile(r"^Yes, I trust the authors", re.I))
                 if trust.first.is_visible():
-                    trust.first.click()
-                prompt = page.locator(".quick-input-widget:visible input:visible").first
-                if not prompt.is_visible():
-                    page.keyboard.press("F1")
+                    trust.first.click(timeout=5000)
+                prompt = widget.locator("input:visible").first
+                phase = "refresh palette"
                 try:
+                    if widget.first.is_visible():
+                        page.keyboard.press("Escape")
+                        widget.first.wait_for(state="hidden", timeout=5000)
+                    page.keyboard.press("F1")
+                    phase = "palette input"
                     prompt.wait_for(state="visible", timeout=5000)
                     prompt.fill(">Nexus: Open CI Fixture", timeout=5000)
-                    command = page.get_by_text("Nexus: Open CI Fixture", exact=True).first
-                    command.wait_for(state="visible", timeout=15000)
+                    phase = "command option"
+                    # Monaco highlights individual substrings and may append
+                    # description/keybinding text. Match the accessible option
+                    # label instead of an exact text node, then click that row.
+                    command = widget.get_by_role("option", name=command_name).first
+                    command.wait_for(state="visible", timeout=10000)
+                    phase = "invoke command"
+                    command.click(timeout=5000)
                 except PlaywrightTimeout:
+                    if phase == "invoke command":
+                        raise
+                    print(f"Workbench browser: attempt {attempt}, phase={phase}, "
+                          f"options={widget.get_by_role('option').count()}",
+                          file=sys.stderr, flush=True)
                     continue
-                prompt.press("Enter")
+                print(f"Workbench browser: invoked installed command on attempt {attempt}",
+                      file=sys.stderr, flush=True)
                 break
             else:
                 raise TimeoutError("Installed fixture command unavailable")
