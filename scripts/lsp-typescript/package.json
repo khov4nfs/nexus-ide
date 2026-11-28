@@ -1,0 +1,9 @@
+{
+  "name": "nexus-reviewed-typescript",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "typescript": "5.7.3",
+    "typescript-language-server": "4.3.4"
+  }
+}
