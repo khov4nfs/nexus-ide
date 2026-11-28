@@ -1374,6 +1374,70 @@ fn live_snapshot_diagnostic_correlation(){
     assert!(live_diagnostic_projection(&json!({"uri":"file:///tmp/unrelated.py","diagnostics":[]}),&second,"x",2,true,&retired).is_err());
     assert!(live_diagnostic_projection(&json!({"uri":second,"diagnostics":[]}),&second,"x",2,false,&[]).is_err());
 }
+// One reviewed server, multiple independent native snapshots. Logical
+// native paths never become guest paths. Unique wire URIs disambiguate
+// diagnostics from servers which omit document versions.
+pub(crate) async fn live_multi_lsp(guest:&IshInstance,env:&HashMap<String,String>,request:&crate::local_jobs::LspInput,first:&crate::local_jobs::MultiLspDocument)->Value{
+    use crate::local_jobs::{lsp_publish_document,lsp_wait,LspNext,same_lsp_family};
+    let mut opts=SpawnOpts::cmd(request.argv.iter().map(String::as_str));
+    opts.cwd=Some(Path::new("/tmp").to_path_buf());
+    opts.envp=Some(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect());
+    opts.pipe_stdin=true;
+    let Ok(session)=guest.spawn(opts)else{return json!({"ok":false,"error":"LSP spawn failed"});};
+    let mut capture=Capture::default();
+    let result:Result<(u32,usize),String>=async{
+        let deadline=Instant::now()+Duration::from_secs(120);
+        lsp_send(&session,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":"file:///tmp","workspaceFolders":null,"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"versionSupport":true},"synchronization":{"dynamicRegistration":false}}}}}),deadline).await?;
+        let init=lsp_reply(&session,&mut capture,1,deadline).await?;
+        let caps=init["capabilities"].as_object().ok_or("Missing LSP capabilities")?;
+        let sync=&init["capabilities"]["textDocumentSync"];
+        let kind=sync.as_u64().or_else(||if sync["openClose"]==true{sync["change"].as_u64()}else{None});
+        if caps.get("positionEncoding").is_some_and(|v|v!="utf-16")||!matches!(kind,Some(1|2)){return Err("Unsupported synchronization".into());}
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"initialized","params":{}}),deadline).await?;
+        let mut current=first.clone();
+        let mut version=1u32;
+        let mut opened=HashMap::<String,String>::new();
+        loop{
+            if !same_lsp_family(&first.language,&current.language){return Err("Document server family mismatch".into());}
+            if !opened.contains_key(&current.key)&&opened.len()>=8{return Err("Document limit".into());}
+            let deadline=Instant::now()+Duration::from_secs(120);
+            if let Some(old)=opened.remove(&current.key){
+                lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":old}}}),deadline).await?;
+            }
+            let uri=format!("file:///tmp/nexus-native-doc-{version}.{}",current.extension);
+            lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":current.language,"version":1,"text":current.text}}}),deadline).await?;
+            opened.insert(current.key.clone(),uri.clone());
+            let mut found=None;
+            for _ in 0..256{
+                let f=lsp_next(&session,&mut capture,deadline).await?;
+                if f.get("id").is_some(){return Err("Unexpected LSP reply".into());}
+                if f["method"]=="textDocument/publishDiagnostics"&&f["params"]["uri"]==uri{
+                    found=Some(lsp_project_version(&f["params"],&uri,&current.text,1,false)?);break;
+                }
+            }
+            if !lsp_publish_document(version,&current.key,found.ok_or("No correlated diagnostics")?){return Err("LSP stopped".into());}
+            match lsp_wait().await{
+                LspNext::Document(next)=>{version+=1;current=next;}
+                LspNext::Finish=>break,
+                _=>return Err("LSP stopped or invalid control".into()),
+            }
+        }
+        let count=opened.len();
+        let deadline=Instant::now()+Duration::from_secs(30);
+        for uri in opened.into_values(){lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":uri}}}),deadline).await?;}
+        lsp_send(&session,json!({"jsonrpc":"2.0","id":2,"method":"shutdown"}),deadline).await?;
+        if !lsp_reply(&session,&mut capture,2,deadline).await?.is_null(){return Err("Invalid shutdown".into());}
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"exit"}),deadline).await?;
+        drain(&session,&mut capture,deadline).await?;
+        if !capture.closed||capture.code!=Some(0)||capture.signal.unwrap_or(0)!=0{return Err("Unclean LSP exit".into());}
+        Ok((version,count))
+    }.await;
+    match result{
+        Ok((versions,documents))=>json!({"ok":true,"versions":versions,"documents":documents,"multiDocument":true,"transportClosed":true,"snapshotUriRefresh":true}),
+        Err(_)=>{let _=session.terminate().await;let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;json!({"ok":false,"transportClosed":closed,"error":"Multi-document LSP stopped or rejected"})}
+    }
+}
+
 pub(crate) async fn live_lsp(guest:&IshInstance,env:&HashMap<String,String>,request:&crate::local_jobs::LspInput,fixture:bool)->Value{
     use crate::local_jobs::{lsp_publish,lsp_wait,LspNext};
     let mut opts=SpawnOpts::cmd(request.argv.iter().map(String::as_str));
@@ -1433,7 +1497,7 @@ pub(crate) async fn live_lsp(guest:&IshInstance,env:&HashMap<String,String>,requ
                     }
                 }
                 LspNext::Finish=>break,
-                LspNext::Stop=>return Err("LSP stopped".into()),
+                LspNext::Stop|LspNext::Document(_)=>return Err("LSP stopped or invalid control".into()),
             }
         }
         let deadline=Instant::now()+Duration::from_secs(30);
