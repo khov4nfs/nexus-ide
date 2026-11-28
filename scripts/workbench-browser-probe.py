@@ -6,16 +6,52 @@ import re
 import signal
 import sys
 import time
+from pathlib import Path
 from urllib.parse import urlencode
 from playwright.sync_api import TimeoutError as PlaywrightTimeout, sync_playwright
 
 def timeout(*_):
     raise TimeoutError("Workbench browser test timed out")
 
+def wait_for_guest_save(page, root, expected, phase, seconds=45):
+    # Observe only fixed synthetic guest files. Do not create markers or
+    # write workspace data from the host/browser harness.
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        checks = {}
+        for name, value in expected.items():
+            try:
+                checks[name] = (root / name).read_bytes() == value
+            except OSError:
+                checks[name] = False
+        if all(checks.values()):
+            print(f"Workbench browser: {phase} confirmed on guest disk",
+                  file=sys.stderr, flush=True)
+            return
+        page.wait_for_timeout(250)
+    # No file contents, token or raw Playwright exception in diagnostics.
+    print(f"Workbench browser: {phase} not persisted: {checks}",
+          file=sys.stderr, flush=True)
+    raise TimeoutError("Guest save acknowledgement missing")
+
+def save_from_palette(page):
+    # Invoke the real Workbench save command, not a fixture-side write or
+    # a browser shortcut which may be intercepted by Chromium.
+    page.keyboard.press("F1")
+    widget = page.locator(".quick-input-widget:visible")
+    prompt = widget.locator("input:visible").first
+    prompt.wait_for(state="visible", timeout=10000)
+    prompt.fill(">File: Save", timeout=5000)
+    option = widget.get_by_role("option", name=re.compile(r"^File: Save(?:,|$)", re.I)).first
+    option.wait_for(state="visible", timeout=15000)
+    option.click(timeout=5000)
+    widget.first.wait_for(state="hidden", timeout=10000)
+
 def main():
     token = os.environ.get("NEXUS_WORKBENCH_TEST_TOKEN", "")
     if token != "f" * 64:
         raise ValueError("Expected synthetic CI token")
+    root = Path(os.environ["NEXUS_WORKBENCH_ROOTFS"]) / "root" / "nexus-workbench"
     url = "http://127.0.0.1:18765/?" + urlencode({"tkn": token, "folder": "/root/nexus-workbench"})
     signal.signal(signal.SIGALRM, timeout)
     signal.alarm(420)
@@ -83,19 +119,29 @@ def main():
             editor.click()
             page.keyboard.press("Meta+A")
             page.keyboard.insert_text("NEXUS_BROWSER_EDITOR_SAVED")
-            page.keyboard.press("Meta+S")
-            # Wait for the save event and extension-host disk write; Rust checks
-            # all markers and actual guest bytes after clean shutdown.
-            page.wait_for_timeout(1500)
+            save_from_palette(page)
+            wait_for_guest_save(page, root, {
+                "nexus-extension-activated.marker": b"activated",
+                "nexus-editor-saved.marker": b"saved",
+                "nexus-editor-fixture.txt": b"NEXUS_BROWSER_EDITOR_SAVED",
+            }, "initial editor save")
+            editor.click()
+            page.keyboard.press("Meta+End")
+            page.keyboard.press("End")
             page.keyboard.press("Enter")
             page.keyboard.press("Control+Space")
             suggestion = page.locator(".suggest-widget").get_by_text("NEXUS_LSP_COMPLETION", exact=True).first
             print("Workbench browser: await LSP completion", file=sys.stderr, flush=True)
             suggestion.wait_for(state="visible")
             page.keyboard.press("Enter")
-            page.keyboard.press("Meta+S")
-            page.wait_for_timeout(3000)
-            print("Workbench browser: completion accepted and save requested", file=sys.stderr, flush=True)
+            save_from_palette(page)
+            wait_for_guest_save(page, root, {
+                "nexus-editor-saved.marker": b"saved",
+                "nexus-lsp-transport.marker": b"completed",
+                "nexus-lsp-saved.marker": b"saved",
+                "nexus-editor-fixture.txt": b"NEXUS_BROWSER_EDITOR_SAVED\nNEXUS_LSP_COMPLETION",
+            }, "LSP completion save")
+            print("Workbench browser: completion accepted and persisted", file=sys.stderr, flush=True)
             context.close()
             browser.close()
     finally:
