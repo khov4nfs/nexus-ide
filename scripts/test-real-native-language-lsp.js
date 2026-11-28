@@ -8,6 +8,24 @@ const {createHash}=require('node:crypto');
 const {pathToFileURL}=require('node:url');
 const {Session}=require('./workbench-lsp-session');
 const {plan}=require('./workbench-lsp-edits');
+// Index invalidation can cancel an in-flight request even after initialize.
+// The probe has immutable fixture snapshots and no user cancellation token.
+// Retry only standard transient LSP errors; never retry a semantic rejection,
+// transport failure, invalid edit, or other JSON-RPC error.
+async function indexedRequest(request,accept=()=>true,{timeout=120000,maxAttempts=120,pause=500}={}){
+    const deadline=Date.now()+timeout;
+    for(let attempt=0;attempt<maxAttempts&&Date.now()<deadline;attempt++){
+        try{
+            const result=await request();
+            if(accept(result))return result;
+        }catch(e){
+            if(![-32800,-32801,-32802].includes(e.rpcCode))throw e;
+            console.error('Transient index request cancellation: '+e.rpcMethod+' ('+e.rpcCode+')');
+        }
+        if(attempt+1<maxAttempts&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,pause));
+    }
+    throw Error('Index request did not produce required evidence before deadline');
+}
 async function run(key,toolRoot,version){
     if(!['go','rust'].includes(key))throw Error('unsupported test profile');
     toolRoot=fs.realpathSync(toolRoot);
@@ -39,20 +57,13 @@ async function run(key,toolRoot,version){
             return {uri:pathToFileURL(absolute).href,language:key,version:1,text};
         });
         const [a,b]=docs;
-        // Indexing is asynchronous in real servers. Retry only successful
-        // empty responses (or capability not yet ready), never fabricate proof.
-        const deadline=Date.now()+120000;
-        let definitions=[];
-        while(Date.now()<deadline){
-            const result=await s.projectRequest(b,docs,'textDocument/definition',{position});
-            definitions=(Array.isArray(result)?result:[result]).filter(Boolean);
-            if(definitions.some(r=>(r.uri||r.targetUri)===a.uri))break;
-            await new Promise(resolve=>setTimeout(resolve,500));
-        }
-        assert.ok(definitions.some(r=>(r.uri||r.targetUri)===a.uri),key+' cross-file definition');
-        const refs=await s.projectRequest(a,docs,'textDocument/references',{position:declPosition,context:{includeDeclaration:true}});
-        assert.ok(Array.isArray(refs)&&refs.some(r=>r.uri===a.uri)&&refs.some(r=>r.uri===b.uri),key+' cross-file references');
-        const edit=await s.projectRequest(a,docs,'textDocument/rename',{position:declPosition,newName});
+        const hasDefinition=result=>(Array.isArray(result)?result:[result]).filter(Boolean).some(r=>(r.uri||r.targetUri)===a.uri);
+        const hasReferences=result=>Array.isArray(result)&&result.some(r=>r.uri===a.uri)&&result.some(r=>r.uri===b.uri);
+        const definitions=await indexedRequest(()=>s.projectRequest(b,docs,'textDocument/definition',{position}),hasDefinition);
+        assert.ok(hasDefinition(definitions),key+' cross-file definition');
+        const refs=await indexedRequest(()=>s.projectRequest(a,docs,'textDocument/references',{position:declPosition,context:{includeDeclaration:true}}),hasReferences);
+        assert.ok(hasReferences(refs),key+' cross-file references');
+        const edit=await indexedRequest(()=>s.projectRequest(a,docs,'textDocument/rename',{position:declPosition,newName}));
         const baseline=new Map(docs.map(d=>[d.uri,{text:d.text,wireVersion:s.docs.get(d.uri).wireVersion}]));
         const rows=plan(edit,baseline,root);
         assert.equal(rows.length,2,key+' rename file count');
@@ -65,4 +76,4 @@ async function run(key,toolRoot,version){
     }finally{await s.stop();fs.rmSync(root,{recursive:true,force:true});}
 }
 if(require.main===module)run(process.argv[2],process.argv[3],process.argv[4]).then(r=>console.log(JSON.stringify(r))).catch(e=>{console.error(e.stack);process.exitCode=1;});
-module.exports={run};
+module.exports={run,indexedRequest};
