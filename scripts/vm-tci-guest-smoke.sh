@@ -45,8 +45,9 @@ dpkg-query -W docker.io docker-compose-v2 busybox-static
 # Retain the vfs prerequisite. In network mode verify actual bridge NAT
 # and published ports, not a host Docker daemon or fake proxy.
 case " $(cat /proc/cmdline) " in
-    *" nexus.net=1 "*)
+    *" nexus.net=1 "*|*" nexus.net=2 "*)
         network=1
+        case " $(cat /proc/cmdline) " in *" nexus.net=2 "*) network=2;; esac
         modprobe virtio_net || true
         i=0
         iface=
@@ -61,7 +62,12 @@ case " $(cat /proc/cmdline) " in
         ip link set "$iface" up
         ip addr add 10.0.2.15/24 dev "$iface"
         ip route replace default via 10.0.2.2
-        # No external DNS or Internet is required for this gate.
+        if [ "$network" -eq 2 ]; then
+            printf "nameserver 10.0.2.3\n" >/etc/resolv.conf
+            curl --proto "=https" --tlsv1.2 --fail --silent --show-error --max-time 90 https://registry-1.docker.io/v2/ -o /tmp/registry-response -w "%{http_code}" > /tmp/registry-status || test "$(cat /tmp/registry-status)" = 401
+            test "$(cat /tmp/registry-status)" = 401
+            echo NEXUS_VM_INTERNET_TLS_OK
+        fi
         set -- --iptables=true --ip6tables=false --ip-forward=true --ip-masq=true --userland-proxy=false
         echo NEXUS_VM_NET_CONFIG_OK
         ;;
@@ -85,6 +91,15 @@ done
 test "$(docker info --format '{{.Driver}}')" = vfs
 test "$(docker info --format '{{.CgroupVersion}}')" = 2
 echo NEXUS_VM_DOCKER_DAEMON_OK
+if [ "$network" -eq 2 ]; then
+    # Public, explicit registry pull. Record resolved immutable digest; never run this mutable tag.
+    docker pull --platform linux/arm64 docker.io/library/busybox:1.37.0
+    test "$(docker image inspect --format '{{.Architecture}}' docker.io/library/busybox:1.37.0)" = arm64
+    digest=$(docker image inspect --format '{{index .RepoDigests 0}}' docker.io/library/busybox:1.37.0)
+    printf "%s\n" "$digest" | grep -Eq "^busybox@sha256:[0-9a-f]{64}$|^docker.io/library/busybox@sha256:[0-9a-f]{64}$"
+    echo "NEXUS_VM_REGISTRY_DIGEST:$digest"
+    echo NEXUS_VM_REGISTRY_PULL_OK
+fi
 # The image is made from a signed Ubuntu busybox-static package, not a
 # registry pull. The container has its own namespaces and no network.
 mkdir -p /tmp/nexus-image/bin
