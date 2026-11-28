@@ -740,6 +740,7 @@ jobs:
           "$RUNNER_TEMP/nexus-browser/bin/python" -m pip install 'playwright==1.51.0'
           "$RUNNER_TEMP/nexus-browser/bin/python" -m playwright install chromium
       - name: Boot reviewed real OpenVSCode and verify browser editor and extension activation
+        id: workbench_gate
         if: matrix.variant == 'workbench'
         timeout-minutes: 14
         run: |
@@ -756,8 +757,62 @@ jobs:
           python3 scripts/build-test-vsix.py "$RUNNER_TEMP/nexus-fixture.vsix"
           export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-fixture.vsix" | awk '{print $1}')"
           cat "$RUNNER_TEMP/nexus-fixture.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
+          touch "$RUNNER_TEMP/nexus-workbench-start"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
           python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["nodeRuntimeVerified"] is True and r["extensionDigestVerified"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is True and r["lspFixtureOnly"] is True' "$NEXUS_WORKBENCH_EVIDENCE"
+      - name: Collect bounded native crash stack (CI-only)
+        if: failure() && matrix.variant == 'workbench' && steps.workbench_gate.outcome == 'failure'
+        timeout-minutes: 2
+        run: |
+          python3 - <<'PY'
+          import json, os, time
+          from pathlib import Path
+          root = Path.home() / "Library/Logs/DiagnosticReports"
+          tmp = Path(os.environ["RUNNER_TEMP"])
+          marker = tmp / "nexus-workbench-start"
+          start = marker.stat().st_mtime if marker.exists() else time.time()
+          report = {"available": False, "scope": "synthetic Workbench CI only"}
+          for attempt in range(12):
+              for path in sorted(root.glob("nexus_guest_bridge*.ips"), key=lambda p: p.stat().st_mtime, reverse=True):
+                  if path.stat().st_mtime < start or path.stat().st_size > 16 * 1024 * 1024:
+                      continue
+                  try:
+                      raw = path.read_text()
+                      decoder = json.JSONDecoder()
+                      header, end = decoder.raw_decode(raw.lstrip())
+                      payload = decoder.raw_decode(raw.lstrip()[end:].lstrip())[0]
+                      if not str(payload.get("procName", "")).startswith("nexus_guest_bridge"):
+                          continue
+                      threads = payload.get("threads", [])
+                      index = payload.get("faultingThread")
+                      if not isinstance(index, int) or not 0 <= index < len(threads):
+                          continue
+                      images = payload.get("usedImages", [])
+                      frames = []
+                      for frame in threads[index].get("frames", [])[:40]:
+                          i = frame.get("imageIndex")
+                          image = images[i].get("name", "") if isinstance(i, int) and 0 <= i < len(images) else ""
+                          frames.append({"image": str(image)[:120], "symbol": str(frame.get("symbol", ""))[:200],
+                                         "offset": frame.get("imageOffset"), "symbolLocation": frame.get("symbolLocation")})
+                      report.update(available=True, exceptionType=payload.get("exception", {}).get("type"),
+                                    faultingThread=index, frames=frames)
+                      break
+                  except (OSError, ValueError, TypeError, IndexError, AttributeError):
+                      continue
+              if report["available"]:
+                  break
+              time.sleep(2)
+          (tmp / "nexus-workbench-crash.json").write_text(json.dumps(report, indent=2))
+          print(json.dumps(report))
+          PY
+      - name: Upload Workbench crash diagnostics
+        if: failure() && matrix.variant == 'workbench' && steps.workbench_gate.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbench-native-crash
+          path: ${{ runner.temp }}/nexus-workbench-crash.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Upload workbench loopback evidence
         if: always() && matrix.variant == 'workbench'
         uses: actions/upload-artifact@v4
