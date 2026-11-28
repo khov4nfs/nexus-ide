@@ -53,6 +53,40 @@ fn agent_send(ticket:u32,text:Option<String>)->Value{
     a.waiting=false;
     json!({"ok":true})
 }
+#[derive(Default)]
+struct LiveLsp {version:u32,waiting:bool,pending:Option<String>,finish:bool,diagnostics:Vec<Value>}
+static LIVE_LSP:Mutex<Option<LiveLsp>>=Mutex::new(None);
+pub(crate) enum LspNext {Change(String),Finish,Stop}
+pub(crate) fn lsp_publish(version:u32,diagnostics:Vec<Value>)->bool{
+    if stop_requested(){return false;}
+    let Ok(mut slot)=LIVE_LSP.lock()else{return false;};
+    let Some(s)=slot.as_mut()else{return false;};
+    s.version=version;s.diagnostics=diagnostics;s.waiting=version<10;true
+}
+pub(crate) async fn lsp_wait()->LspNext{
+    let until=std::time::Instant::now()+std::time::Duration::from_secs(180);
+    loop{
+        if stop_requested(){return LspNext::Stop;}
+        {
+            let Ok(mut slot)=LIVE_LSP.lock()else{return LspNext::Stop;};
+            let Some(s)=slot.as_mut()else{return LspNext::Stop;};
+            if let Some(text)=s.pending.take(){s.waiting=false;return LspNext::Change(text);}
+            if s.finish||s.version>=10||std::time::Instant::now()>=until{s.waiting=false;return LspNext::Finish;}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+fn lsp_control(version:u32,text:Option<String>)->Value{
+    if stop_requested(){return fail("LSP stopped");}
+    let Ok(mut slot)=LIVE_LSP.lock()else{return fail("LSP unavailable");};
+    let Some(s)=slot.as_mut()else{return fail("No live LSP");};
+    if s.version!=version||!s.waiting||s.finish||s.pending.is_some(){return fail("Stale or busy LSP version");}
+    if let Some(text)=text{if text.len()>8192||text.contains('\0'){return fail("Invalid snapshot");}s.pending=Some(text);s.diagnostics.clear();}else{s.finish=true;}
+    s.waiting=false;json!({"ok":true})
+}
+fn lsp_status()->Value{
+    LIVE_LSP.lock().ok().and_then(|slot|slot.as_ref().map(|s|json!({"active":true,"version":s.version,"waiting":s.waiting,"diagnostics":s.diagnostics}))).unwrap_or_else(||json!({"active":false}))
+}
 struct State {
     running: bool, ready: bool, mode: u8, output: String, raw: Vec<u8>, total: u64,
     controls: VecDeque<Control>, stop: bool, agent:Option<AgentMailbox>,
@@ -139,6 +173,37 @@ fn parse_adapter(input:&str)->Option<AdapterInput>{
     Some(AdapterInput{argv,digest:digest.into(),prompt:prompt.into(),resume})
 }
 pub(crate) struct TransferInput {pub name:String,pub text:Option<String>}
+struct BatchInput {push:bool,files:Vec<TransferInput>}
+fn transfer_component(s:&str)->bool{!s.is_empty()&&s.len()<=128&&!s.starts_with('.')&&s.bytes().all(|b|b.is_ascii_alphanumeric()||b"._-".contains(&b))}
+fn parse_batch(input:&str)->Option<BatchInput>{
+    if input.len()>262144{return None;}
+    let v:Value=serde_json::from_str(input).ok()?;
+    if v.as_object()?.len()!=3{return None;}
+    let push=match v["action"].as_str()?{"push"=>true,"pull"=>false,_=>return None};
+    let id=v["batch"].as_str()?;if !transfer_component(id)||id.len()>64{return None;}
+    let list=v["files"].as_array()?;if !(1..=8).contains(&list.len()){return None;}
+    let mut files=Vec::<TransferInput>::new();let mut total=0;
+    for f in list{
+        let name=f["path"].as_str()?;
+        if name.len()>256||name.split('/').count()>8||!name.split('/').all(transfer_component){return None;}
+        let name=format!("batches/{id}/{name}");
+        if files.iter().any(|x|x.name==name||x.name.starts_with(&format!("{name}/"))||name.starts_with(&format!("{}/",x.name))){return None;}
+        let text=if push{if f.as_object()?.len()!=2{return None;}let t=f["text"].as_str()?;if t.len()>8192||t.contains('\0'){return None;}total+=t.len();if total>32768{return None;}Some(t.to_owned())}else{if f.as_object()?.len()!=1{return None;}None};
+        files.push(TransferInput{name,text});
+    }
+    Some(BatchInput{push,files})
+}
+async fn run_batch(guest:&IshInstance,env:&HashMap<String,String>,batch:&BatchInput)->Value{
+    let mut results=Vec::new();let mut total=0u64;
+    for f in &batch.files{
+        let r=process_probe::workspace_transfer(guest,env,f).await;
+        if r["ok"]!=true{return json!({"ok":false,"completed":results.len(),"partialExportPossible":batch.push,"error":"Batch stopped; no native imports returned"});}
+        total+=r["bytes"].as_u64().unwrap_or(32769);
+        if total>32768{return json!({"ok":false,"completed":results.len(),"partialExportPossible":batch.push,"error":"Batch byte limit"});}
+        results.push(r);
+    }
+    json!({"ok":true,"action":if batch.push{"push"}else{"pull"},"files":results,"bytes":total,"completed":results.len()})
+}
 fn parse_transfer(input:&str)->Option<TransferInput>{
     if input.len()>65536{return None;}
     let v:Value=serde_json::from_str(input).ok()?;
@@ -211,6 +276,7 @@ fn enqueue(control: Control) -> Value {
 struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
+        if let Ok(mut slot)=LIVE_LSP.lock(){*slot=None;}
         if let Ok(mut s) = STATE.lock() { s.running = false; s.ready = false; s.controls.clear(); if let Some(a)=s.agent.as_mut(){a.waiting=false;a.pending=None;} }
     }
 }
@@ -233,15 +299,37 @@ async fn run_agent_session(guest:&IshInstance,env:&HashMap<String,String>,kind:&
     r["ok"]=json!(r["ok"]==true&&after.unwrap_or(true)&&verified_after&&!stop_requested());
     r
 }
+// Diagnostic only. Never start a daemon, run an image, mount anything, or
+// connect to a Docker socket. A positive primitive is not Engine support.
+fn container_capabilities(guest:&IshInstance,env:&HashMap<String,String>)->Value{
+    let tests=[
+        ("namespaceEntries","test -e /proc/self/ns/user && test -e /proc/self/ns/mnt && test -e /proc/self/ns/pid && test -e /proc/self/ns/net"),
+        ("userNamespace","command -v unshare >/dev/null && unshare --user --map-root-user /usr/bin/true"),
+        ("mountNamespace","command -v unshare >/dev/null && unshare --mount /usr/bin/true"),
+        ("cgroupV2Visible","test -r /sys/fs/cgroup/cgroup.controllers"),
+        ("overlayListed","grep -qw overlay /proc/filesystems"),
+        ("dockerCLIInstalled","command -v docker >/dev/null"),
+        ("daemonSocketVisible","test -S /var/run/docker.sock"),
+    ];
+    let mut rows=serde_json::Map::new();
+    for (name,script) in tests{
+        if stop_requested(){return fail("Capability probe cancelled");}
+        let argv=vec!["/bin/sh".into(),"-c".into(),script.into()];
+        let (status,_)=guest.run_oneshot(&argv,Path::new("/"),env,Some(5000));
+        rows.insert(name.into(),json!(status==0));
+    }
+    json!({"ok":true,"diagnosticOnly":true,"backend":"embedded-user-mode","capabilities":rows,"dockerEngineVerified":false,"composeVerified":false,"fullSystemVMVerified":false})
+}
 fn run(path: &Path, mode: u8, input: &str) -> Value {
     let call=if mode==4 {match parse_call(input) {Some(v)=>Some(v),None=>return fail("Invalid MCP call")}} else {None};
     let hooks=if mode==5 {match parse_hooks(input) {Some(v)=>Some(v),None=>return fail("Invalid hook plan")}} else {None};
     let workbench=if mode==3 {match parse_workbench(input) {Some(v)=>Some(v),None=>return fail("Invalid workbench launch")}} else {None};
     let cli=if mode==6 {match parse_cli(input) {Some(v)=>Some(v),None=>return fail("Invalid CLI launch")}} else {None};
-    let lsp=if mode==8 {match parse_lsp(input){Some(v)=>Some(v),None=>return fail("Invalid LSP snapshot request")}}else{None};
+    let lsp=if matches!(mode,8|12) {match parse_lsp(input){Some(v) if mode==8||v.completion.is_none()=>Some(v),_=>return fail("Invalid LSP snapshot request")}}else{None};
     let transfer=if mode==9 {match parse_transfer(input){Some(v)=>Some(v),None=>return fail("Invalid workspace transfer")}}else{None};
     let adapter=if mode==10 {match parse_adapter(input){Some(v)=>Some(v),None=>return fail("Invalid reviewed ACP adapter request")}}else{None};
-    if !matches!(mode,1..=6|8|9|10) ||
+    let batch=if mode==11 {match parse_batch(input){Some(v)=>Some(v),None=>return fail("Invalid batch transfer")}}else{None};
+    if !matches!(mode,1..=6|8|9|10|11|12|13) || (mode==13&&input!="probe") ||
         (matches!(mode,1|2) && !valid_command(input)) { return fail("Invalid local job"); }
     if !path.is_dir() || !path.parent().is_some_and(|p| p.join("meta.db").is_file()) {
         return fail("Missing prepared fakefs");
@@ -257,6 +345,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     *s = State { running:true,ready:false,mode:if native{7}else if matches!(mode,5|6) {1}else{mode},output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false,agent:if native{Some(AgentMailbox::default())}else{None} };
     drop(s);
     let _guard = Guard;
+    if mode==12{if let Ok(mut slot)=LIVE_LSP.lock(){*slot=Some(LiveLsp::default());}else{return fail("LSP mailbox unavailable");}}
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt, Err(_) => return fail("Runtime creation failed; restart app"),
     };
@@ -268,9 +357,11 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         ("TERM".into(),if matches!(mode,1|5|6) {"xterm-256color".into()} else {"dumb".into()}),("NODE_OPTIONS".into(),"--jitless".into())]);
     let libc = rt.block_on(process_probe::glibc_compat(&guest,&env));
     let mut result = if libc["passed"] != true { fail("Ubuntu compatibility failed") }
+        else if mode==13 {container_capabilities(&guest,&env)}
         else if let Some(request)=adapter.as_ref(){rt.block_on(crate::persistent_acp::local_adapter_session(&guest,&env,request,false))}
+        else if let Some(request)=batch.as_ref(){rt.block_on(run_batch(&guest,&env,request))}
         else if let Some(request)=transfer.as_ref(){rt.block_on(process_probe::workspace_transfer(&guest,&env,request))}
-        else if let Some(request)=lsp.as_ref(){rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}
+        else if let Some(request)=lsp.as_ref(){if mode==12{rt.block_on(process_probe::live_lsp(&guest,&env,request,false))}else{rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}}
         else if let Some(plan)=hooks.as_ref() {
             let before=plan["before"].as_str();
             let after=plan["after"].as_str();
@@ -336,6 +427,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let shutdown = rt.block_on(guest.shutdown()).is_ok();
     result["shutdownClean"] = json!(shutdown);
     result["ok"] = json!(result["ok"] == true && shutdown);
+    if mode==11 && result["ok"]!=true {result.as_object_mut().unwrap().remove("files");}
     if mode==9 && result["ok"]!=true {result.as_object_mut().unwrap().remove("text");}
     if mode==8 && result["ok"]!=true {let o=result.as_object_mut().unwrap();o.remove("diagnostics");o.remove("completions");}
     result
@@ -355,6 +447,14 @@ pub unsafe extern "C" fn nexus_local_run(path:*const c_char,mode:u8,input:*const
 }
 #[no_mangle]
 pub extern "C" fn nexus_local_progress() -> *mut c_char { ffi(progress) }
+#[no_mangle]
+pub extern "C" fn nexus_live_lsp_status()->*mut c_char{ffi(lsp_status)}
+/// # Safety
+/// text must be a NUL-terminated UTF-8 string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_live_lsp_change(version:u32,text:*const c_char)->*mut c_char{ffi(||match arg(text){Some(t)=>lsp_control(version,Some(t)),None=>fail("Missing snapshot")})}
+#[no_mangle]
+pub extern "C" fn nexus_live_lsp_finish(version:u32)->*mut c_char{ffi(||lsp_control(version,None))}
 /// # Safety
 /// Pointer must be valid NUL-terminated UTF-8 for the duration of the call.
 #[no_mangle]
@@ -554,6 +654,51 @@ mod tests {
         assert!(ok&&clean,"ACP adapter fixture failed: {r}");
     }
     #[test]
+    #[ignore = "requires Ubuntu fakefs; reports only observed primitives"]
+    fn real_container_capabilities(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let r=run(Path::new(&path),13,"probe");
+        assert_eq!(r["ok"],true);
+        assert_eq!(r["shutdownClean"],true);
+        assert_eq!(r["diagnosticOnly"],true);
+        assert_eq!(r["dockerEngineVerified"],false);
+        assert_eq!(r["composeVerified"],false);
+        assert_eq!(r["fullSystemVMVerified"],false);
+        assert_eq!(r["capabilities"].as_object().unwrap().len(),7);
+        std::fs::write(evidence,serde_json::to_vec_pretty(&r).unwrap()).unwrap();
+    }
+    #[test]
+    fn batch_input_bounds(){
+        let valid=json!({"action":"push","batch":"demo","files":[{"path":"src/a.txt","text":"hello"},{"path":"src/b.txt","text":""}]});
+        assert!(parse_batch(&valid.to_string()).is_some());
+        for path in ["../bad","src/.secret","src//bad","/root","src/a.txt/child","src/a.txt"]{
+            let mut v=valid.clone();v["files"][1]["path"]=json!(path);assert!(parse_batch(&v.to_string()).is_none());
+        }
+    }
+    #[test]
+    #[ignore = "requires independent Ubuntu guest boots"]
+    fn real_workspace_batch(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_BATCH_PHASE").expect("phase");
+        let req=match phase.as_str(){
+            "push"=>json!({"action":"push","batch":"fixture","files":[{"path":"src/a.txt","text":"Nexus Việt\n"},{"path":"docs/a.txt","text":"second"}]}),
+            "duplicate"=>json!({"action":"push","batch":"fixture","files":[{"path":"src/a.txt","text":"no"}]}),
+            "pull"=>json!({"action":"pull","batch":"fixture","files":[{"path":"src/a.txt"},{"path":"docs/a.txt"}]}),
+            "missing"=>json!({"action":"pull","batch":"fixture","files":[{"path":"src/a.txt"},{"path":"missing"}]}),
+            _=>panic!("unknown phase"),
+        };
+        let r=run(Path::new(&path),11,&req.to_string());
+        let ok=match phase.as_str(){
+            "push"=>r["ok"]==true&&r["completed"]==2,
+            "pull"=>r["ok"]==true&&r["files"][0]["text"]=="Nexus Việt\n"&&r["files"][1]["text"]=="second",
+            _=>r["ok"]==false&&r.get("files").is_none(),
+        }&&r["shutdownClean"]==true;
+        std::fs::write(evidence,serde_json::to_vec_pretty(&json!({"ok":ok,"phase":phase,"fixtureOnly":true,"shutdownClean":r["shutdownClean"]})).unwrap()).unwrap();
+        assert!(ok,"batch failed: {}",r["error"]);
+    }
+    #[test]
     fn transfer_input_bounds(){
         assert!(parse_transfer(r#"{"action":"push","name":"demo.txt","text":""}"#).is_some());
         for name in ["../demo",".hidden","/root/a","a/b","a b"]{
@@ -582,6 +727,48 @@ mod tests {
         }&&r["shutdownClean"]==true;
         std::fs::write(evidence,serde_json::to_vec_pretty(&json!({"ok":ok,"phase":phase,"shutdownClean":r["shutdownClean"],"fixtureOnly":true})).unwrap()).unwrap();
         assert!(ok,"transfer failed: {}",r["error"]);
+    }
+    #[test]
+    #[ignore = "requires independent Ubuntu boot"]
+    fn real_live_lsp_fixture(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let phase=std::env::var("NEXUS_LIVE_LSP_PHASE").expect("phase");
+        let input=parse_lsp(&json!({"argv":["/usr/bin/server"],"language":"python","extension":"py","text":"x = 1\n"}).to_string()).unwrap();
+        *LIVE_LSP.lock().unwrap()=Some(LiveLsp::default());
+        {let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=12;}
+        let driver=std::thread::spawn(||{
+            let until=std::time::Instant::now()+std::time::Duration::from_secs(30);
+            let mut sent=false;
+            while std::time::Instant::now()<until{
+                let p=lsp_status();
+                if p["waiting"]==true&&p["version"]==1&&!sent{
+                    assert_eq!(lsp_control(0,Some("stale".into()))["ok"],false);
+                    assert_eq!(lsp_control(1,Some("x = 2\n".into()))["ok"],true);
+                    assert_eq!(lsp_control(1,Some("duplicate".into()))["ok"],false);sent=true;
+                }else if p["waiting"]==true&&p["version"]==2{
+                    return (sent,p["diagnostics"][0]["message"]=="version two"&&lsp_control(2,None)["ok"]==true);
+                }
+                if !STATE.lock().unwrap().running{return (sent,false);}
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let _=enqueue(Control::Stop);(sent,false)
+        });
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin".into()),("HOME".into(),"/root".into()),("NEXUS_LIVE_LSP_PHASE".into(),phase.clone())]);
+        let r=rt.block_on(process_probe::live_lsp(&guest,&env,&input,true));
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        STATE.lock().unwrap().running=false;
+        let (sent,driven)=driver.join().unwrap();
+        *LIVE_LSP.lock().unwrap()=None;
+        let ok=clean&&sent&&r["transportClosed"]==true&&match phase.as_str(){
+            "success"=>driven&&r["ok"]==true&&r["versions"]==2,
+            "future"=>r["ok"]==false&&!driven&&r["fixtureError"]=="LSP diagnostic document mismatch",
+            _=>false,
+        };
+        std::fs::write(evidence,serde_json::to_vec_pretty(&json!({"ok":ok,"phase":phase,"fixtureOnly":true,"shutdownClean":clean})).unwrap()).unwrap();
+        assert!(ok,"live LSP fixture failed: {r}");
     }
     #[test]
     fn lsp_input_bounds(){
@@ -753,9 +940,10 @@ mod tests {
         });
         let root=guest_path.join("root/nexus-workbench");
         let activated=browser_ok&&std::fs::read(root.join("nexus-extension-activated.marker")).ok().as_deref()==Some(b"activated");
-        let editor_verified=activated&&std::fs::read(root.join("nexus-editor-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join("nexus-editor-fixture.txt")).ok().as_deref()==Some(b"NEXUS_BROWSER_EDITOR_SAVED");
-        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified)),
-            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":false});
+        let editor_verified=activated&&std::fs::read(root.join("nexus-editor-saved.marker")).ok().as_deref()==Some(b"saved");
+        let lsp_verified=editor_verified&&std::fs::read(root.join("nexus-lsp-transport.marker")).ok().as_deref()==Some(b"completed")&&std::fs::read(root.join("nexus-lsp-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join("nexus-editor-fixture.txt")).ok().as_deref()==Some(b"NEXUS_BROWSER_EDITOR_SAVED\nNEXUS_LSP_COMPLETION");
+        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified&&lsp_verified)),
+            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":lsp_verified,"lspFixtureOnly":true});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         println!("{report}");
         assert_eq!(report["ok"],true);

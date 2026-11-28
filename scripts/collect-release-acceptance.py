@@ -18,6 +18,7 @@ def gates(variant):
         rows[name] = ("synthetic ACP peer", {"ok": True, "fixtureOnly": True})
     for name in ("local-pty", "local-mcp", "local-call"):
         rows[name] = ("macOS guest local job", {"ok": True, "shutdownClean": True})
+    rows["container-capabilities"] = ("macOS guest prerequisite diagnostic only", {"ok": True, "shutdownClean": True, "diagnosticOnly": True, "dockerEngineVerified": False, "composeVerified": False, "fullSystemVMVerified": False})
     rows["slot-evidence"] = ("Ubuntu ELF fixture, not AGY", {"ok": True, "shutdownClean": True, "digestVerified": True})
     for name in ("google", "google-edit", "snapshot", "mcp-session", "terminal", "codex-probe"):
         rows[name] = ("synthetic protocol peer", {"ok": True, "fixtureOnly": True, "shutdownClean": True})
@@ -32,6 +33,8 @@ def gates(variant):
         "conversation-claude": ("create", "resume"),
         "lsp": ("success", "invalidUri", "invalidRange", "completion", "completionInvalid"),
         "transfer": ("push", "duplicate", "pull"),
+        "batch": ("push", "duplicate", "pull", "missing"),
+        "live-lsp": ("success", "future"),
     }
     for group, phases in groups.items():
         for phase in phases:
@@ -46,7 +49,7 @@ def gates(variant):
     for phase in ("write", "read", "scroll"):
         rows[f"persist-{phase}"] = ("macOS guest persistence", {"ok": True, "verified": True, "shutdownClean": True})
     if variant == "workbench":
-        rows["workbench"] = ("macOS guest Chromium editor and synthetic VSIX activation", {"ok": True, "shutdownClean": True, "extensionInstallVerified": True, "browserRequested": True, "extensionActivationVerified": True, "editorVerified": True, "lspVerified": False})
+        rows["workbench"] = ("macOS guest Chromium editor, synthetic VSIX and synthetic stdio LSP server", {"ok": True, "shutdownClean": True, "extensionInstallVerified": True, "browserRequested": True, "extensionActivationVerified": True, "editorVerified": True, "lspVerified": True, "lspFixtureOnly": True})
     return rows
 
 def read_json(path):
@@ -92,6 +95,7 @@ def collect(evidence, package, commit, variant):
         "ciAcceptancePassed": True, "checks": reports,
         "physicalDeviceVerified": False, "realProviderAuthVerified": False,
         "realProviderInferenceVerified": False, "productionReady": False,
+        "containerBackend": "embedded-user-mode", "dockerEngineVerified": False, "composeVerified": False, "fullSystemVMVerified": False,
         "remaining": ["signed physical iPhone acceptance", "real imported provider binaries and auth/inference",
                       "workbench editor/extension activation and LSP", "license and source obligations",
                       "full-system VM/Docker not implemented"],

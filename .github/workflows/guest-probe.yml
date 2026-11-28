@@ -26,6 +26,8 @@ on:
       - 'scripts/test-package-ipa.py'
       - 'scripts/collect-release-acceptance.py'
       - 'scripts/test-release-acceptance.py'
+      - 'scripts/verify-device-acceptance.py'
+      - 'scripts/test-device-acceptance.py'
       - 'scripts/build-glibc-rootfs.sh'
       - 'scripts/verify-glibc-evidence.py'
       - 'scripts/verify-acp-transport.py'
@@ -66,6 +68,7 @@ jobs:
           python3 scripts/test-workbench-import.py
           python3 scripts/test-package-ipa.py
           python3 scripts/test-release-acceptance.py
+          python3 scripts/test-device-acceptance.py
       - name: Install guest build dependencies
         run: brew install meson ninja llvm lld libarchive sqlite xcodegen
       - name: Build pinned runtime and rootfs
@@ -494,6 +497,40 @@ jobs:
           name: local-adapter-fixture-evidence
           path: ${{ runner.temp }}/nexus-adapter-*.json
           if-no-files-found: error
+      - name: Observe container prerequisites without enabling Docker
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-container-capabilities-fs"
+          export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-container-capabilities-fs/data"
+          export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-container-capabilities.json"
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_container_capabilities -- --ignored --nocapture --test-threads=1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: container-prerequisite-diagnostic
+          path: ${{ runner.temp }}/nexus-container-capabilities.json
+          if-no-files-found: error
+      - name: Verify nested multi-file transfer across independent boots
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-batch-fs"
+          export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-batch-fs/data"
+          for phase in push duplicate pull missing; do
+            export NEXUS_BATCH_PHASE="$phase"
+            export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-batch-$phase.json"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workspace_batch -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","shutdownClean"])' "$NEXUS_LOCAL_EVIDENCE"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workspace-batch-evidence
+          path: ${{ runner.temp }}/nexus-batch-*.json
+          if-no-files-found: error
       - name: Verify native/Linux file transfer across independent guest boots
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
@@ -512,6 +549,25 @@ jobs:
         with:
           name: workspace-transfer-evidence
           path: ${{ runner.temp }}/nexus-transfer-*.json
+          if-no-files-found: error
+      - name: Verify live LSP full document change and version correlation (synthetic peer)
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          for phase in success future; do
+            cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-live-lsp-$phase"
+            export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-live-lsp-$phase/data"
+            export NEXUS_LIVE_LSP_PHASE="$phase"
+            export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-live-lsp-$phase.json"
+            cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_live_lsp_fixture -- --ignored --nocapture --test-threads=1
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","fixtureOnly","shutdownClean"])' "$NEXUS_LOCAL_EVIDENCE"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: live-lsp-fixture-evidence
+          path: ${{ runner.temp }}/nexus-live-lsp-*.json
           if-no-files-found: error
       - name: Verify LSP snapshot diagnostics and invalid document rejection (synthetic peer)
         run: |
@@ -624,7 +680,7 @@ jobs:
           export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-fixture.vsix" | awk '{print $1}')"
           cat "$RUNNER_TEMP/nexus-fixture.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
-          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is False' "$NEXUS_WORKBENCH_EVIDENCE"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is True and r["lspFixtureOnly"] is True' "$NEXUS_WORKBENCH_EVIDENCE"
       - name: Upload workbench loopback evidence
         if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
         uses: actions/upload-artifact@v4
@@ -636,7 +692,7 @@ jobs:
         env:
           VARIANT: ${{ inputs.variant || 'ubuntu' }}
         run: |
-          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.7.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
+          xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.8.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
           python3 scripts/package-ipa.py --app "$RUNNER_TEMP/nexus-integrated/Build/Products/Release-iphoneos/NexusIDEUbuntuLab.app" --output "$RUNNER_TEMP/nexus-integrated-ipa" --variant "$VARIANT" --commit "$GITHUB_SHA"
       - name: Bind completed CI evidence to exact integrated IPA
         env:

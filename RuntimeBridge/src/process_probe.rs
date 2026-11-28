@@ -1168,7 +1168,16 @@ test ! -L /root
 test ! -L "$dir"
 mkdir -p "$dir"
 test -d "$dir"
-target="$dir/$1"
+rel=$1
+while [ "$rel" != "${rel#*/}" ]; do
+    part=${rel%%/*}
+    rel=${rel#*/}
+    dir="$dir/$part"
+    test ! -L "$dir"
+    if [ "$2" = push ]; then mkdir -p "$dir"; fi
+    test -d "$dir"
+done
+target="$dir/$rel"
 test ! -L "$target"
 if [ "$2" = push ]; then
     test ! -e "$target"
@@ -1178,7 +1187,7 @@ if [ "$2" = push ]; then
     IFS= read -r wire
     printf '%s' "$wire" | /usr/bin/base64 -d > "$tmp"
     test "$(wc -c < "$tmp")" -le 8192
-    ln "$tmp" "$target"
+    ln -T "$tmp" "$target"
 else
     test -f "$target"
     test "$(wc -c < "$target")" -le 8192
@@ -1275,9 +1284,12 @@ fn lsp_position(v:&Value,lines:&[&str])->Option<(usize,usize)>{
     Some((line,character))
 }
 fn lsp_project(params:&Value,request:&crate::local_jobs::LspInput)->Result<Vec<Value>,String>{
-    if params["uri"]!=request.uri||params.get("version").is_some_and(|v|!v.is_null()&&v.as_i64()!=Some(1)){return Err("LSP diagnostic document mismatch".into());}
+    lsp_project_version(params,&request.uri,&request.text,1,false)
+}
+fn lsp_project_version(params:&Value,uri:&str,text:&str,version:u32,strict:bool)->Result<Vec<Value>,String>{
+    if params["uri"]!=uri||(strict&&params["version"].as_u64()!=Some(version as u64))||params.get("version").is_some_and(|v|!v.is_null()&&v.as_u64()!=Some(version as u64)){return Err("LSP diagnostic document mismatch".into());}
     let items=params["diagnostics"].as_array().filter(|a|a.len()<=64).ok_or("LSP diagnostics limit")?;
-    let lines=request.text.split('\n').collect::<Vec<_>>();
+    let lines=text.split('\n').collect::<Vec<_>>();
     let mut result=Vec::new();
     let mut bytes=0;
     for item in items{
@@ -1325,6 +1337,80 @@ fn lsp_completions(value:&Value,request:&crate::local_jobs::LspInput)->Result<Ve
     }
     Ok(result)
 }
+// A single reviewed document and full-sync server. Versionless diagnostics are
+// not safe to associate with subsequent editor contents; fail closed.
+pub(crate) async fn live_lsp(guest:&IshInstance,env:&HashMap<String,String>,request:&crate::local_jobs::LspInput,fixture:bool)->Value{
+    use crate::local_jobs::{lsp_publish,lsp_wait,LspNext};
+    let mut opts=SpawnOpts::cmd(request.argv.iter().map(String::as_str));
+    #[cfg(test)]
+    if fixture{opts=shell(include_str!("../fixtures/lsp-live.sh"),env);}
+    #[cfg(not(test))]
+    if fixture{return json!({"ok":false});}
+    opts.cwd=Some(Path::new("/tmp").to_path_buf());
+    opts.envp=Some(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect());
+    opts.pipe_stdin=true;
+    let Ok(session)=guest.spawn(opts)else{return json!({"ok":false,"error":"LSP spawn failed"});};
+    let mut capture=Capture::default();
+    let result:Result<u32,String>=async{
+        let deadline=Instant::now()+Duration::from_secs(45);
+        lsp_send(&session,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"workspaceFolders":null,"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"versionSupport":true},"synchronization":{"dynamicRegistration":false}}}}}),deadline).await?;
+        let init=lsp_reply(&session,&mut capture,1,deadline).await?;
+        let caps=init["capabilities"].as_object().ok_or("Missing LSP capabilities")?;
+        let sync=&init["capabilities"]["textDocumentSync"];
+        if caps.get("positionEncoding").is_some_and(|v|v!="utf-16")||!(sync.as_u64()==Some(1)||(sync["change"].as_u64()==Some(1)&&sync["openClose"]==true)){return Err("Full synchronization unsupported".into());}
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"initialized","params":{}}),deadline).await?;
+        let mut text=request.text.clone();
+        let mut version=1u32;
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":request.uri,"languageId":request.language,"version":version,"text":text}}}),deadline).await?;
+        loop{
+            let deadline=Instant::now()+Duration::from_secs(45);
+            let mut found=None;
+            for _ in 0..128{
+                let frame=lsp_next(&session,&mut capture,deadline).await?;
+                if frame.get("id").is_some(){return Err("Unexpected reply".into());}
+                if frame["method"]=="textDocument/publishDiagnostics"{
+                    let p=&frame["params"];
+                    if p["uri"]==request.uri&&p["version"].as_u64().is_some_and(|v|v<version as u64){continue;}
+                    found=Some(lsp_project_version(p,&request.uri,&text,version,true)?);break;
+                }
+            }
+            if !lsp_publish(version,found.ok_or("No correlated diagnostics")?){return Err("LSP stopped".into());}
+            match lsp_wait().await{
+                LspNext::Change(next)=>{
+                    version+=1;text=next;
+                    lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":request.uri,"version":version},"contentChanges":[{"text":text}]}}),Instant::now()+Duration::from_secs(45)).await?;
+                }
+                LspNext::Finish=>break,
+                LspNext::Stop=>return Err("LSP stopped".into()),
+            }
+        }
+        let deadline=Instant::now()+Duration::from_secs(30);
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":request.uri}}}),deadline).await?;
+        lsp_send(&session,json!({"jsonrpc":"2.0","id":2,"method":"shutdown"}),deadline).await?;
+        if !lsp_reply(&session,&mut capture,2,deadline).await?.is_null(){return Err("Invalid shutdown".into());}
+        lsp_send(&session,json!({"jsonrpc":"2.0","method":"exit"}),deadline).await?;
+        drain(&session,&mut capture,deadline).await?;
+        if !capture.closed||capture.code!=Some(0)||capture.signal.unwrap_or(0)!=0{return Err("LSP shutdown failed".into());}
+        Ok(version)
+    }.await;
+    match result{
+        Ok(n)=>json!({"ok":true,"versions":n,"transportClosed":true}),
+        Err(error)=>{
+            // Keep the production report generic; the fixture needs to prove
+            // the exact rejection rather than pass on any unrelated failure.
+            #[cfg(test)]
+            let fixture_error=if fixture{Some(error.as_str())}else{None};
+            #[cfg(not(test))]
+            let fixture_error:Option<&str>=None;
+            let _=session.terminate().await;
+            let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;
+            let mut report=json!({"ok":false,"transportClosed":closed,"error":"Live LSP stopped, unsupported or invalid versioned diagnostics"});
+            if let Some(reason)=fixture_error{report["fixtureError"]=json!(reason);}
+            report
+        }
+    }
+}
+
 pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,String>,request:&crate::local_jobs::LspInput,fixture:bool)->Value{
     let mut opts=SpawnOpts::cmd(request.argv.iter().map(String::as_str));
     #[cfg(test)]
