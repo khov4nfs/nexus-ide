@@ -54,7 +54,7 @@ fn agent_send(ticket:u32,text:Option<String>)->Value{
     json!({"ok":true})
 }
 #[derive(Default)]
-struct LiveLsp {version:u32,waiting:bool,pending:Option<String>,finish:bool,diagnostics:Vec<Value>,multi:bool,document:Option<String>,pending_document:Option<MultiLspDocument>}
+struct LiveLsp {version:u32,waiting:bool,pending:Option<String>,finish:bool,diagnostics:Vec<Value>,multi:bool,document:Option<String>,pending_document:Option<MultiLspDocument>,language:Option<String>,documents:Vec<String>}
 static LIVE_LSP:Mutex<Option<LiveLsp>>=Mutex::new(None);
 pub(crate) enum LspNext {Change(String),Document(MultiLspDocument),Finish,Stop}
 #[derive(Clone)]
@@ -76,7 +76,7 @@ pub(crate) fn lsp_publish_document(version:u32,key:&str,diagnostics:Vec<Value>)-
     if stop_requested(){return false;}
     let Ok(mut slot)=LIVE_LSP.lock()else{return false;};
     let Some(s)=slot.as_mut().filter(|s|s.multi)else{return false;};
-    s.version=version;s.document=Some(key.into());s.diagnostics=diagnostics;s.waiting=version<64;true
+    s.version=version;s.document=Some(key.into());if !s.documents.iter().any(|k|k==key){s.documents.push(key.into());}s.diagnostics=diagnostics;s.waiting=version<64;true
 }
 pub(crate) fn lsp_publish(version:u32,diagnostics:Vec<Value>)->bool{
     if stop_requested(){return false;}
@@ -114,6 +114,7 @@ fn lsp_document_control(version:u32,input:&str)->Value{
     let Ok(mut slot)=LIVE_LSP.lock()else{return fail("LSP unavailable");};
     let Some(s)=slot.as_mut().filter(|s|s.multi)else{return fail("No multi-document LSP");};
     if s.version!=version||!s.waiting||s.finish||s.pending_document.is_some(){return fail("Stale or busy LSP version");}
+    if !s.language.as_deref().is_some_and(|lang|same_lsp_family(lang,&doc.language))||(!s.documents.contains(&doc.key)&&s.documents.len()>=8){return fail("Unsupported document family or limit");}
     s.pending_document=Some(doc);s.waiting=false;s.diagnostics.clear();json!({"ok":true})
 }
 fn lsp_status()->Value{
@@ -388,7 +389,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     *s = State { running:true,ready:false,mode:if native{7}else if matches!(mode,5|6) {1}else{mode},output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false,agent:if native{Some(AgentMailbox::default())}else{None} };
     drop(s);
     let _guard = Guard;
-    if mode==12{if let Ok(mut slot)=LIVE_LSP.lock(){*slot=Some(LiveLsp{multi:multi_document.is_some(),..Default::default()});}else{return fail("LSP mailbox unavailable");}}
+    if mode==12{if let Ok(mut slot)=LIVE_LSP.lock(){*slot=Some(LiveLsp{multi:multi_document.is_some(),language:multi_document.as_ref().map(|d|d.language.clone()),..Default::default()});}else{return fail("LSP mailbox unavailable");}}
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt, Err(_) => return fail("Runtime creation failed; restart app"),
     };
