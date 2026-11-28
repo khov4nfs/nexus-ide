@@ -182,22 +182,26 @@ private enum VMEngine {
         }
         return (pair[0], pair[1])
     }
-    static func args(root: URL, firmware: URL, ram: Int, serial: Int32, monitor: Int32) throws -> [String] {
+    static func args(root: URL, firmware: URL, ram: Int, network: Bool, serial: Int32, monitor: Int32) throws -> [String] {
         let file: [String: Any] = ["driver": "file", "filename": VMStore.file(root, .disk).path, "node-name": "rootfile"]
         let raw: [String: Any] = ["driver": "raw", "file": "rootfile", "node-name": "rootdisk"]
         func encode(_ value: [String: Any]) throws -> String {
             String(decoding: try JSONSerialization.data(withJSONObject: value), as: UTF8.self)
         }
-        return ["qemu-system-aarch64", "-L", firmware.path,
+        var args = ["qemu-system-aarch64", "-L", firmware.path,
                 "-machine", "virt,gic-version=3", "-cpu", "cortex-a57",
                 "-accel", "tcg,thread=single", "-smp", "1", "-m", String(ram),
-                "-nodefaults", "-no-user-config", "-display", "none", "-nic", "none", "-no-reboot",
+                "-nodefaults", "-no-user-config", "-display", "none", "-no-reboot",
                 "-kernel", VMStore.file(root, .kernel).path, "-initrd", VMStore.file(root, .initrd).path,
                 "-append", "root=/dev/vda rw rootwait console=ttyAMA0",
                 "-blockdev", try encode(file), "-blockdev", try encode(raw),
                 "-device", "virtio-blk-device,drive=rootdisk",
                 "-chardev", "socket,id=serial0,fd=\(serial)", "-serial", "chardev:serial0",
                 "-chardev", "socket,id=qmp0,fd=\(monitor)", "-mon", "chardev=qmp0,mode=control"]
+        if network {
+            args += ["-netdev", "user,id=nexusnet,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:18766-10.0.2.15:8080", "-device", "virtio-net-device,netdev=nexusnet"]
+        } else { args += ["-nic", "none"] }
+        return args
     }
 }
 
@@ -253,7 +257,7 @@ private enum VMEngine {
         do { try VMStore.reset(); status = "Private VM assets removed."; refresh() }
         catch { status = "Reset failed." }
     }
-    func start(ram: Int, claim: () -> Bool) {
+    func start(ram: Int, network: Bool, claim: () -> Bool) {
         guard !busy, !active, !consumed, ready, let root, [512, 768, 1024].contains(ram),
               let firmware = Bundle.main.resourceURL?.appendingPathComponent("FullVMFirmware"),
               FileManager.default.fileExists(atPath: firmware.path),
@@ -275,7 +279,7 @@ private enum VMEngine {
             do {
                 let s = try VMEngine.socketPair(); serialPair = s
                 let m = try VMEngine.socketPair(); monitorPair = m
-                let args = try VMEngine.args(root: root, firmware: firmware, ram: ram, serial: s.1, monitor: m.1)
+                let args = try VMEngine.args(root: root, firmware: firmware, ram: ram, network: network, serial: s.1, monitor: m.1)
                 try Data("dirty\n".utf8).write(to: VMStore.dirty(root), options: .atomic)
                 serial = s.0; monitor = m.0
                 active = true; busy = false; ready = false
@@ -417,13 +421,14 @@ private enum VMEngine {
     @State private var confirmReset = false
     @State private var confirmForce = false
     @State private var ram = 768
+    @State private var network = false
     @State private var command = ""
     var body: some View {
         NavigationStack {
             List {
                 Section("Local ARM64 full-system VM") {
                     Text(vm.status)
-                    Text("Experimental QEMU TCI. No JIT, network, shared native directory or remote backend. Import only trusted compatible Linux boot assets. A fatal QEMU error may terminate the app; memory and thermal limits are not yet qualified.")
+                    Text("Experimental QEMU TCI. No JIT, shared native directory or remote backend. Networking is off by default. Import only trusted compatible Linux boot assets. A fatal QEMU error may terminate the app; memory and thermal limits are not yet qualified.")
                         .font(.caption)
                     Picker("Asset", selection: $selected) {
                         ForEach(VMAsset.allCases) { asset in Text(asset.label).tag(asset) }
@@ -442,6 +447,9 @@ private enum VMEngine {
                     Picker("Guest memory (MiB)", selection: $ram) {
                         Text("512").tag(512); Text("768").tag(768); Text("1024").tag(1024)
                     }.disabled(vm.busy || model.guestClaimed)
+                    Toggle("Restricted guest network and local HTTP forwarding", isOn: $network)
+                        .disabled(vm.busy || model.guestClaimed)
+                    Text("Optional: isolated SLIRP, no internet or LAN egress; host 127.0.0.1:18766 forwards to guest 10.0.2.15:8080. Other apps may reach the local port. Only expose trusted, non-sensitive services.").font(.caption)
                     Button("Boot reviewed VM") { confirmStart = true }
                         .disabled(!vm.ready || vm.busy || model.guestClaimed)
                     if vm.busy { ProgressView() }
@@ -474,7 +482,7 @@ private enum VMEngine {
             if case .success(let url) = result { vm.importFile(url, kind: frozenKind, digest: frozenDigest) }
         }
         .confirmationDialog("Boot trusted Linux image on this device?", isPresented: $confirmStart, titleVisibility: .visible) {
-            Button("Boot offline interpreter VM") { vm.start(ram: ram) { model.claimGuest() } }
+            Button(network ? "Boot with restricted local network" : "Boot offline interpreter VM") { vm.start(ram: ram, network: network) { model.claimGuest() } }
         }
         .confirmationDialog("Delete all private VM boot assets and disk?", isPresented: $confirmReset, titleVisibility: .visible) {
             Button("Delete VM files", role: .destructive) { vm.reset() }
