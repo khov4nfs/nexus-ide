@@ -1,15 +1,36 @@
 'use strict';
 // Persistent, bounded stdio LSP client. No editor API or host dependencies.
 const {spawn}=require('child_process');
-const {randomBytes}=require('crypto');
+const {randomBytes,createHash}=require('crypto');
+const fs=require('fs');
 const path=require('path');
 const {pathToFileURL,fileURLToPath}=require('url');
 const ROOT='/root/nexus-workbench';
+const TOOL_ROOT='/opt/nexus/lsp';
 const PROFILES=Object.freeze({
     python:Object.freeze({name:'pylsp',version:/^1\.10\.0$/,snapshot:true,command:'/usr/bin/python3',args:['-u','-m','pylsp']}),
-    clangd:Object.freeze({name:'clangd',version:/\b18\.1\.3\b/,snapshot:false,command:'/usr/bin/clangd-18',args:['--background-index=false','--clang-tidy=false','--enable-config=false','--pch-storage=memory','-j=1','--offset-encoding=utf-16','--header-insertion=never','--header-insertion-decorators=false','--log=error']})
+    clangd:Object.freeze({name:'clangd',version:/\b18\.1\.3\b/,snapshot:false,command:'/usr/bin/clangd-18',args:['--background-index=false','--clang-tidy=false','--enable-config=false','--pch-storage=memory','-j=1','--offset-encoding=utf-16','--header-insertion=never','--header-insertion-decorators=false','--log=error']}),
+    typescript:Object.freeze({name:'typescript-language-server',snapshot:false,optional:true,node:true,entry:'typescript/node_modules/typescript-language-server/lib/cli.mjs',args:['--stdio'],settings:{},initializationOptions:{hostInfo:'nexus',disableAutomaticTypingAcquisition:true,tsserver:{path:TOOL_ROOT+'/typescript/node_modules/typescript/lib/tsserver.js'}}}),
+    rust:Object.freeze({name:'rust-analyzer',snapshot:false,optional:true,entry:'bin/rust-analyzer',args:[],settings:{cargo:{buildScripts:{enable:false},extraEnv:{CARGO_NET_OFFLINE:'true'}},procMacro:{enable:false},checkOnSave:false}}),
+    go:Object.freeze({name:'gopls',snapshot:false,optional:true,entry:'bin/gopls',args:['serve'],settings:{analyses:{},staticcheck:false}}),
+    bash:Object.freeze({name:'bash-language-server',snapshot:false,optional:true,node:true,entry:'bash/node_modules/bash-language-server/out/cli.js',args:['start'],settings:{}})
 });
-function profileFor(language){return language==='python'?'python':language==='c'||language==='cpp'?'clangd':null;}
+const LANGUAGES=Object.freeze({python:'python',c:'clangd',cpp:'clangd',typescript:'typescript',typescriptreact:'typescript',javascript:'typescript',javascriptreact:'typescript',rust:'rust',go:'go',shellscript:'bash'});
+function profileFor(language){return Object.hasOwn(LANGUAGES,language)?LANGUAGES[language]:null;}
+function reviewedProfile(key,approval){
+    const p=PROFILES[key];
+    if(!p.optional)return p;
+    if(!approval||typeof approval.version!=='string'||!/^[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,79}$/.test(approval.version)||!(/^[a-f0-9]{64}$/).test(approval.sha256))throw Error('reviewed optional server required');
+    const entry=path.join(TOOL_ROOT,p.entry);
+    if(fs.realpathSync(entry)!==entry)throw Error('unexpected server link');
+    const st=fs.statSync(entry);
+    if(!st.isFile()||st.size<1||st.size>128*1024*1024)throw Error('invalid server entry');
+    const fd=fs.openSync(entry,'r'),hash=createHash('sha256');
+    try{const buf=Buffer.alloc(65536);let n;while((n=fs.readSync(fd,buf,0,buf.length,null))!==0)hash.update(buf.subarray(0,n));}finally{fs.closeSync(fd);}
+    if(hash.digest('hex')!==approval.sha256)throw Error('server digest mismatch');
+    const flags=['--no-opt','--no-sparkplug','--no-maglev','--no-lazy','--liftoff-only','--single-threaded','--v8-pool-size=1'];
+    return {...p,command:p.node?'/opt/nexus/workbench/node':entry,args:p.node?[...flags,entry,...p.args]:p.args,reviewedVersion:approval.version};
+}
 function boundedSnapshot(doc,root){
     if(!doc||typeof doc.uri!=='string'||typeof doc.text!=='string'||!Number.isSafeInteger(doc.version)||doc.version<1||
         Buffer.byteLength(doc.text,'utf8')>131072||!profileFor(doc.language))throw Error('invalid snapshot');
@@ -18,9 +39,9 @@ function boundedSnapshot(doc,root){
     return filename;
 }
 class Session{
-    constructor(key,{root=ROOT,timeout=120000,spawnProcess=spawn}={}){
+    constructor(key,{root=ROOT,timeout=120000,spawnProcess=spawn,approval=null,projectIndex=false}={}){
         if(!Object.hasOwn(PROFILES,key))throw Error('unknown server');
-        this.profile=PROFILES[key];this.key=key;this.root=root;this.timeout=timeout;this.spawnProcess=spawnProcess;
+        this.profile=reviewedProfile(key,approval);if(key==='clangd'&&projectIndex)this.profile={...this.profile,args:this.profile.args.map(x=>x==='--background-index=false'?'--background-index=true':x)};this.key=key;this.root=root;this.timeout=timeout;this.spawnProcess=spawnProcess;
         this.nonce=randomBytes(8).toString('hex');this.sequence=0;this.id=0;
         this.pending=new Map();this.docs=new Map();this.wireDocs=new Map();
         this.buffer=Buffer.alloc(0);this.failure=null;this.child=null;this.starting=null;
@@ -93,7 +114,21 @@ class Session{
     dispatch(msg){
         if(!msg||msg.jsonrpc!=='2.0'||Array.isArray(msg))throw Error('invalid RPC');
         if(typeof msg.method==='string'){
-            if(msg.id!==undefined){this.send({id:msg.id,error:{code:-32601,message:'Unsupported server request'}});return;}
+            if(msg.id!==undefined){
+                if(msg.method==='workspace/configuration'&&Array.isArray(msg.params?.items)&&msg.params.items.length<=32){
+                    const settings=this.profile.settings||{};
+                    const result=msg.params.items.map(i=>{
+                        if(i?.scopeUri&&i.scopeUri!==pathToFileURL(this.root).href&&!i.scopeUri.startsWith(pathToFileURL(this.root).href+'/'))return null;
+                        const section=i?.section;
+                        if(!section||section===this.profile.name||section===this.key)return settings;
+                        return section.split('.').reduce((v,k)=>v&&Object.hasOwn(v,k)?v[k]:null,settings)??null;
+                    });
+                    this.send({id:msg.id,result});return;
+                }
+                if(msg.method==='workspace/workspaceFolders'){this.send({id:msg.id,result:[{uri:pathToFileURL(this.root).href,name:'Nexus workspace'}]});return;}
+                if(msg.method==='window/workDoneProgress/create'){this.send({id:msg.id,result:null});return;}
+                this.send({id:msg.id,error:{code:-32601,message:'Unsupported server request'}});return;
+            }
             if(msg.method!=='textDocument/publishDiagnostics')return;
             const p=msg.params,d=this.wireDocs.get(p?.uri);
             if(!d||!Array.isArray(p.diagnostics))return;
@@ -121,7 +156,7 @@ class Session{
         this.starting=(async()=>{
             const p=this.profile;
             this.child=this.spawnProcess(p.command,p.args,{cwd:this.root,stdio:['pipe','pipe','ignore'],
-                env:{PATH:'/usr/bin:/bin',HOME:'/root',LANG:'C.UTF-8',PYTHONFAULTHANDLER:'1'}});
+                env:{PATH:'/opt/nexus/lsp/bin:/usr/bin:/bin',HOME:'/root',LANG:'C.UTF-8',PYTHONFAULTHANDLER:'1',GOPROXY:'off',GOSUMDB:'off',GOTOOLCHAIN:'local',CARGO_NET_OFFLINE:'true',ISH_NODE_NO_ARG_INJECTION:'1'}});
             this.stats.launches++;
             this.exited=new Promise(resolve=>this.child.once('close',(code,signal)=>{this.stats.processExited=true;resolve({code,signal});}));
             this.child.on('error',e=>this.fail(e));
@@ -129,12 +164,14 @@ class Session{
             this.child.stdout.on('data',b=>this.receive(b));
             this.exited.then(()=>{if(!this.closing)this.fail(Error('LSP process exited'));});
             const result=await this.call('initialize',{processId:null,rootUri:pathToFileURL(this.root).href,workspaceFolders:[{uri:pathToFileURL(this.root).href,name:'Nexus workspace'}],
-                capabilities:{general:{positionEncodings:['utf-16']},offsetEncoding:['utf-16'],textDocument:{publishDiagnostics:{versionSupport:true},completion:{completionItem:{snippetSupport:false}},synchronization:{dynamicRegistration:false}}}});
+                initializationOptions:p.initializationOptions??p.settings??{},capabilities:{general:{positionEncodings:['utf-16']},offsetEncoding:['utf-16'],workspace:{configuration:true,workspaceFolders:true,applyEdit:false,workspaceEdit:{documentChanges:true}},textDocument:{publishDiagnostics:{versionSupport:true},completion:{completionItem:{snippetSupport:false}},synchronization:{dynamicRegistration:false}}}});
             const caps=result?.capabilities,sync=caps?.textDocumentSync;
             const kind=typeof sync==='number'?sync:sync?.openClose===true?sync.change:undefined;
-            if(result?.serverInfo?.name!==p.name||!p.version.test(result.serverInfo.version)||!caps?.completionProvider||
+            const identity=result?.serverInfo;
+            const verified=p.optional?(!identity||(identity.name===p.name&&(!identity.version||identity.version===p.reviewedVersion))):identity?.name===p.name&&p.version.test(identity.version);
+            if(!verified||!caps?.completionProvider||
                 ![1,2].includes(kind)||(caps.positionEncoding&&caps.positionEncoding!=='utf-16')||(result.offsetEncoding&&result.offsetEncoding!=='utf-16'))throw Error('unexpected server identity or capabilities');
-            this.stats.initializes++;this.notify('initialized',{});
+            this.capabilities=caps;this.stats.initializes++;this.notify('initialized',{});
         })().catch(e=>{this.fail(e);throw e;});
         return this.starting;
     }
@@ -177,7 +214,7 @@ class Session{
             const d=await this.sync(doc);
             if(d.diagnostics!==null)return d.diagnostics;
             return new Promise((resolve,reject)=>{
-                const timer=setTimeout(()=>this.fail(Error('LSP diagnostic timeout')),this.timeout);
+                const timer=setTimeout(()=>this.rejectWaiter(d,Error('No correlated diagnostics')),this.timeout);
                 d.waiter={resolve,reject,timer};
             });
         });
@@ -191,6 +228,18 @@ class Session{
             const items=Array.isArray(result)?result:result?.items;
             if(!Array.isArray(items))throw Error('invalid completion result');
             return items.slice(0,1000);
+        });
+    }
+    // Only real-URI sessions may offer project-wide navigation and edits.
+    // Sync all reviewed open buffers before the request; no server-supplied commands.
+    projectRequest(doc,openDocuments,method,params,token){
+        const cap={'textDocument/definition':'definitionProvider','textDocument/references':'referencesProvider','textDocument/rename':'renameProvider','textDocument/codeAction':'codeActionProvider','workspace/symbol':'workspaceSymbolProvider'}[method];
+        if(!cap||this.profile.snapshot||!Array.isArray(openDocuments)||openDocuments.length>12)return Promise.reject(Error('project operation unsupported'));
+        return this.enqueue(async()=>{
+            for(const item of openDocuments)await this.sync(item);
+            const d=await this.sync(doc);
+            if(!this.capabilities?.[cap])throw Error('server capability unavailable');
+            return this.call(method,method==='workspace/symbol'?params:{...params,textDocument:{uri:d.wire}},token);
         });
     }
     closeDocument(uri){return this.enqueue(()=>{const d=this.docs.get(uri);if(d)this.drop(d);});}
@@ -222,4 +271,4 @@ class Session{
         return this.closePromise;
     }
 }
-module.exports={Session,profileFor,PROFILES,ROOT};
+module.exports={Session,profileFor,PROFILES,LANGUAGES,TOOL_ROOT,ROOT};
