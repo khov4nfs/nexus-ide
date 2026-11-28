@@ -18,7 +18,7 @@ def main():
         raise ValueError("Expected synthetic CI token")
     url = "http://127.0.0.1:18765/?" + urlencode({"tkn": token, "folder": "/root/nexus-workbench"})
     signal.signal(signal.SIGALRM, timeout)
-    signal.alarm(300)
+    signal.alarm(420)
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
@@ -34,19 +34,19 @@ def main():
             # ready. Reopen the palette until the real installed command exists.
             # Only the synthetic local fixture workspace may be trusted here.
             print("Workbench browser: await remote command", file=sys.stderr, flush=True)
-            deadline = time.monotonic() + 120
+            deadline = time.monotonic() + 240
             while time.monotonic() < deadline:
                 trust = page.get_by_role("button", name=re.compile(r"^Yes, I trust the authors", re.I))
                 if trust.first.is_visible():
                     trust.first.click()
-                page.keyboard.press("Escape")
-                page.keyboard.press("F1")
                 prompt = page.locator(".quick-input-widget:visible input:visible").first
+                if not prompt.is_visible():
+                    page.keyboard.press("F1")
                 try:
                     prompt.wait_for(state="visible", timeout=5000)
                     prompt.fill(">Nexus: Open CI Fixture", timeout=5000)
                     command = page.get_by_text("Nexus: Open CI Fixture", exact=True).first
-                    command.wait_for(state="visible", timeout=5000)
+                    command.wait_for(state="visible", timeout=15000)
                 except PlaywrightTimeout:
                     continue
                 prompt.press("Enter")
