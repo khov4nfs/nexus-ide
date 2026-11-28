@@ -22,6 +22,7 @@ def gates(variant, full_vm=False):
     pylsp = {"ok": True, "fixtureOnly": False, "package": "python3-pylsp", "packageVersion": "1.10.0-1", "transportClosed": True, "shutdownClean": True, "physicalDeviceVerified": False}
     rows["real-pylsp-completion"] = ("macOS-hosted Ubuntu guest, real pinned Python LSP completion", {**pylsp, "completionVerified": True})
     rows["real-pylsp-live-refresh"] = ("macOS-hosted Ubuntu guest, real pinned Python LSP distinct snapshot URI refresh", {**pylsp, "initialDiagnosticVerified": True, "refreshedDiagnosticVerified": True, "snapshotUriRefresh": True, "versions": 2})
+    rows["real-pylsp-multi-document"] = ("macOS-hosted Ubuntu guest, real Python LSP native multi-document snapshots", {**pylsp, "documentCorrelationVerified": True, "multiDocument": True, "documents": 2, "versions": 3, "snapshotUriRefresh": True})
     rows["container-capabilities"] = ("macOS guest prerequisite diagnostic only", {"ok": True, "shutdownClean": True, "diagnosticOnly": True, "dockerEngineVerified": False, "composeVerified": False, "fullSystemVMVerified": False})
     rows["slot-evidence"] = ("Ubuntu ELF fixture, not AGY", {"ok": True, "shutdownClean": True, "digestVerified": True})
     for name in ("google", "google-edit", "snapshot", "mcp-session", "terminal", "codex-probe"):
