@@ -1449,20 +1449,31 @@ set -eu
 /usr/bin/python3 -u -c '
 import threading
 import queue
+import time
+# Python Event.wait uses a monotonic absolute futex deadline on glibc.
+start = time.monotonic()
+assert not threading.Event().wait(0.15), "unset event unexpectedly signaled"
+elapsed = time.monotonic() - start
+assert 0.12 <= elapsed <= 5, f"monotonic event timeout mismatch: {elapsed}"
 for i in range(3):
     messages = queue.Queue()
-    t = threading.Thread(target=lambda: messages.put(("thread", threading.get_ident())))
+    def worker():
+        time.sleep(0.05)
+        messages.put(("thread", threading.get_ident()))
+    t = threading.Thread(target=worker)
     t.start()
     t.join(5)
     assert not t.is_alive(), "thread join timed out"
     kind, ident = messages.get_nowait()
     assert kind == "thread" and ident != threading.get_ident()
-    timer = threading.Timer(0.05, lambda: messages.put(("timer", threading.get_ident())))
+    started = time.monotonic()
+    timer = threading.Timer(0.15, lambda: messages.put(("timer", threading.get_ident(), time.monotonic())))
     timer.start()
     timer.join(5)
     assert not timer.is_alive(), "timer join timed out"
-    kind, ident = messages.get_nowait()
+    kind, ident, fired = messages.get_nowait()
     assert kind == "timer" and ident != threading.get_ident()
+    assert 0.12 <= fired - started <= 5, f"timer deadline mismatch: {fired - started}"
 print("NEXUS_PYTHON_THREADS_OK")
 '
 "#;

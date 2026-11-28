@@ -124,6 +124,16 @@
         "    if (args.pidfd != 0 || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0)\n        return _EINVAL;",
         "    // pidfd is an output pointer only when CLONE_PIDFD is requested.\n    // glibc 2.39 pthread_create supplies &pd->tid in this field even\n    // without CLONE_PIDFD. Ignore that unused field, as Linux does.\n    // Do not implement pidfds, set_tid or cgroup placement here.\n    if ((args.flags & CLONE_PIDFD_) || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0)\n        return _EINVAL;"
       ]
+    ],
+    "kernel/futex.c": [
+      [
+        "            // FUTEX_WAIT_BITSET uses absolute CLOCK_REALTIME timeout;\n            // convert to relative for our futex_wait implementation.\n            struct timespec now;\n            clock_gettime(CLOCK_REALTIME, &now);",
+        "            // Linux WAIT_BITSET deadlines use CLOCK_MONOTONIC by default.\n            // Only FUTEX_CLOCK_REALTIME selects the wall clock. glibc\n            // pthread clock waits otherwise expire immediately on Darwin.\n            struct timespec now;\n            clockid_t clock = (op & FUTEX_CLOCK_REALTIME_) ? CLOCK_REALTIME : CLOCK_MONOTONIC;\n            if (clock_gettime(clock, &now) < 0)\n                return _EINVAL;"
+      ],
+      [
+        "                int64_t remain_ms = (deadline_ns - now_ns) / 1000000LL;\n                if (remain_ms <= 0) { err = _ETIMEDOUT; break; }\n                poll_ms = remain_ms > 100 ? 100 : (int)remain_ms;",
+        "                int64_t remain_ns = deadline_ns - now_ns;\n                if (remain_ns <= 0) { err = _ETIMEDOUT; break; }\n                // Round positive sub-millisecond waits up, not down.\n                poll_ms = remain_ns >= 100000000LL ? 100 : (int)((remain_ns + 999999LL) / 1000000LL);"
+      ]
     ]
   }
 }
