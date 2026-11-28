@@ -54,9 +54,30 @@ fn agent_send(ticket:u32,text:Option<String>)->Value{
     json!({"ok":true})
 }
 #[derive(Default)]
-struct LiveLsp {version:u32,waiting:bool,pending:Option<String>,finish:bool,diagnostics:Vec<Value>}
+struct LiveLsp {version:u32,waiting:bool,pending:Option<String>,finish:bool,diagnostics:Vec<Value>,multi:bool,document:Option<String>,pending_document:Option<MultiLspDocument>}
 static LIVE_LSP:Mutex<Option<LiveLsp>>=Mutex::new(None);
-pub(crate) enum LspNext {Change(String),Finish,Stop}
+pub(crate) enum LspNext {Change(String),Document(MultiLspDocument),Finish,Stop}
+#[derive(Clone)]
+pub(crate) struct MultiLspDocument {pub key:String,pub extension:String,pub language:String,pub text:String}
+fn multi_lsp_document(key:&str,text:&str)->Option<MultiLspDocument>{
+    if key.is_empty()||key.len()>256||!key.split('/').all(|p|!p.is_empty()&&!p.starts_with('.')&&p.bytes().all(|b|b.is_ascii_alphanumeric()||b"._+-".contains(&b)))||text.len()>8192||text.contains('\0'){return None;}
+    let extension=key.rsplit_once('.')?.1.to_ascii_lowercase();
+    let language=match extension.as_str(){
+        "py"=>"python","c"|"h"=>"c","cc"|"cpp"|"cxx"|"hpp"|"hh"|"hxx"=>"cpp",
+        "ts"=>"typescript","tsx"=>"typescriptreact","js"|"mjs"|"cjs"=>"javascript","jsx"=>"javascriptreact",
+        "rs"=>"rust","go"=>"go","sh"|"bash"=>"shellscript","swift"=>"swift","json"=>"json","html"=>"html","css"=>"css","yaml"|"yml"=>"yaml",
+        _=>return None,
+    };
+    Some(MultiLspDocument{key:key.into(),extension,language:language.into(),text:text.into()})
+}
+fn lsp_family(language:&str)->&str{match language{"c"|"cpp"=>"clangd","typescript"|"typescriptreact"|"javascript"|"javascriptreact"=>"typescript",other=>other}}
+pub(crate) fn same_lsp_family(a:&str,b:&str)->bool{lsp_family(a)==lsp_family(b)}
+pub(crate) fn lsp_publish_document(version:u32,key:&str,diagnostics:Vec<Value>)->bool{
+    if stop_requested(){return false;}
+    let Ok(mut slot)=LIVE_LSP.lock()else{return false;};
+    let Some(s)=slot.as_mut().filter(|s|s.multi)else{return false;};
+    s.version=version;s.document=Some(key.into());s.diagnostics=diagnostics;s.waiting=version<64;true
+}
 pub(crate) fn lsp_publish(version:u32,diagnostics:Vec<Value>)->bool{
     if stop_requested(){return false;}
     let Ok(mut slot)=LIVE_LSP.lock()else{return false;};
@@ -70,8 +91,9 @@ pub(crate) async fn lsp_wait()->LspNext{
         {
             let Ok(mut slot)=LIVE_LSP.lock()else{return LspNext::Stop;};
             let Some(s)=slot.as_mut()else{return LspNext::Stop;};
+            if let Some(doc)=s.pending_document.take(){s.waiting=false;return LspNext::Document(doc);}
             if let Some(text)=s.pending.take(){s.waiting=false;return LspNext::Change(text);}
-            if s.finish||s.version>=10||std::time::Instant::now()>=until{s.waiting=false;return LspNext::Finish;}
+            if s.finish||s.version>=(if s.multi{64}else{10})||std::time::Instant::now()>=until{s.waiting=false;return LspNext::Finish;}
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -81,11 +103,21 @@ fn lsp_control(version:u32,text:Option<String>)->Value{
     let Ok(mut slot)=LIVE_LSP.lock()else{return fail("LSP unavailable");};
     let Some(s)=slot.as_mut()else{return fail("No live LSP");};
     if s.version!=version||!s.waiting||s.finish||s.pending.is_some(){return fail("Stale or busy LSP version");}
-    if let Some(text)=text{if text.len()>8192||text.contains('\0'){return fail("Invalid snapshot");}s.pending=Some(text);s.diagnostics.clear();}else{s.finish=true;}
+    if let Some(text)=text{if s.multi||text.len()>8192||text.contains('\0'){return fail("Invalid snapshot");}s.pending=Some(text);s.diagnostics.clear();}else{s.finish=true;}
     s.waiting=false;json!({"ok":true})
 }
+fn lsp_document_control(version:u32,input:&str)->Value{
+    if stop_requested()||input.len()>65536{return fail("LSP stopped or request too large");}
+    let Ok(v)=serde_json::from_str::<Value>(input)else{return fail("Invalid document JSON");};
+    if v.as_object().map(|o|o.len())!=Some(2){return fail("Invalid document fields");}
+    let Some(doc)=v["document"].as_str().zip(v["text"].as_str()).and_then(|(key,text)|multi_lsp_document(key,text))else{return fail("Invalid document snapshot");};
+    let Ok(mut slot)=LIVE_LSP.lock()else{return fail("LSP unavailable");};
+    let Some(s)=slot.as_mut().filter(|s|s.multi)else{return fail("No multi-document LSP");};
+    if s.version!=version||!s.waiting||s.finish||s.pending_document.is_some(){return fail("Stale or busy LSP version");}
+    s.pending_document=Some(doc);s.waiting=false;s.diagnostics.clear();json!({"ok":true})
+}
 fn lsp_status()->Value{
-    LIVE_LSP.lock().ok().and_then(|slot|slot.as_ref().map(|s|json!({"active":true,"version":s.version,"waiting":s.waiting,"diagnostics":s.diagnostics}))).unwrap_or_else(||json!({"active":false}))
+    LIVE_LSP.lock().ok().and_then(|slot|slot.as_ref().map(|s|json!({"active":true,"version":s.version,"waiting":s.waiting,"document":s.document,"multiDocument":s.multi,"diagnostics":s.diagnostics}))).unwrap_or_else(||json!({"active":false}))
 }
 struct State {
     running: bool, ready: bool, mode: u8, output: String, raw: Vec<u8>, total: u64,
@@ -325,7 +357,18 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     let hooks=if mode==5 {match parse_hooks(input) {Some(v)=>Some(v),None=>return fail("Invalid hook plan")}} else {None};
     let workbench=if mode==3 {match parse_workbench(input) {Some(v)=>Some(v),None=>return fail("Invalid workbench launch")}} else {None};
     let cli=if mode==6 {match parse_cli(input) {Some(v)=>Some(v),None=>return fail("Invalid CLI launch")}} else {None};
-    let lsp=if matches!(mode,8|12) {match parse_lsp(input){Some(v) if mode==8||v.completion.is_none()=>Some(v),_=>return fail("Invalid LSP snapshot request")}}else{None};
+    let mut multi_document=None;
+    let mut lsp_wire=None;
+    if mode==12{
+        if let Ok(mut v)=serde_json::from_str::<Value>(input){
+            if let Some(key)=v.as_object_mut().and_then(|o|o.remove("document")){
+                let Some(doc)=key.as_str().zip(v["text"].as_str()).and_then(|(key,text)|multi_lsp_document(key,text))else{return fail("Invalid multi-document snapshot");};
+                if v["extension"]!=doc.extension||!v["language"].as_str().is_some_and(|lang|same_lsp_family(lang,&doc.language)){return fail("Document language mismatch");}
+                multi_document=Some(doc);lsp_wire=Some(v.to_string());
+            }
+        }
+    }
+    let lsp=if matches!(mode,8|12) {match parse_lsp(lsp_wire.as_deref().unwrap_or(input)){Some(v) if mode==8||v.completion.is_none()=>Some(v),_=>return fail("Invalid LSP snapshot request")}}else{None};
     let transfer=if mode==9 {match parse_transfer(input){Some(v)=>Some(v),None=>return fail("Invalid workspace transfer")}}else{None};
     let adapter=if mode==10 {match parse_adapter(input){Some(v)=>Some(v),None=>return fail("Invalid reviewed ACP adapter request")}}else{None};
     let batch=if mode==11 {match parse_batch(input){Some(v)=>Some(v),None=>return fail("Invalid batch transfer")}}else{None};
@@ -345,7 +388,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
     *s = State { running:true,ready:false,mode:if native{7}else if matches!(mode,5|6) {1}else{mode},output:String::new(),raw:Vec::new(),total:0,controls:VecDeque::new(),stop:false,agent:if native{Some(AgentMailbox::default())}else{None} };
     drop(s);
     let _guard = Guard;
-    if mode==12{if let Ok(mut slot)=LIVE_LSP.lock(){*slot=Some(LiveLsp::default());}else{return fail("LSP mailbox unavailable");}}
+    if mode==12{if let Ok(mut slot)=LIVE_LSP.lock(){*slot=Some(LiveLsp{multi:multi_document.is_some(),..Default::default()});}else{return fail("LSP mailbox unavailable");}}
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt, Err(_) => return fail("Runtime creation failed; restart app"),
     };
@@ -361,7 +404,7 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
         else if let Some(request)=adapter.as_ref(){rt.block_on(crate::persistent_acp::local_adapter_session(&guest,&env,request,false))}
         else if let Some(request)=batch.as_ref(){rt.block_on(run_batch(&guest,&env,request))}
         else if let Some(request)=transfer.as_ref(){rt.block_on(process_probe::workspace_transfer(&guest,&env,request))}
-        else if let Some(request)=lsp.as_ref(){if mode==12{rt.block_on(process_probe::live_lsp(&guest,&env,request,false))}else{rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}}
+        else if let Some(request)=lsp.as_ref(){if mode==12{if let Some(doc)=multi_document.as_ref(){rt.block_on(process_probe::live_multi_lsp(&guest,&env,request,doc))}else{rt.block_on(process_probe::live_lsp(&guest,&env,request,false))}}else{rt.block_on(process_probe::lsp_diagnostics(&guest,&env,request,false))}}
         else if let Some(plan)=hooks.as_ref() {
             let before=plan["before"].as_str();
             let after=plan["after"].as_str();
@@ -506,6 +549,8 @@ pub extern "C" fn nexus_live_lsp_status()->*mut c_char{ffi(lsp_status)}
 pub unsafe extern "C" fn nexus_live_lsp_change(version:u32,text:*const c_char)->*mut c_char{ffi(||match arg(text){Some(t)=>lsp_control(version,Some(t)),None=>fail("Missing snapshot")})}
 #[no_mangle]
 pub extern "C" fn nexus_live_lsp_finish(version:u32)->*mut c_char{ffi(||lsp_control(version,None))}
+#[no_mangle]
+pub unsafe extern "C" fn nexus_live_lsp_document(version:u32,input:*const c_char)->*mut c_char{ffi(||match arg(input){Some(t)=>lsp_document_control(version,t),None=>fail("Missing document snapshot")})}
 /// # Safety
 /// Pointer must be valid NUL-terminated UTF-8 for the duration of the call.
 #[no_mangle]
@@ -823,6 +868,12 @@ mod tests {
     }
     #[test]
     fn lsp_input_bounds(){
+        assert!(multi_lsp_document("src/main.rs","fn main() {}").is_some());
+        assert!(multi_lsp_document("../main.rs","").is_none());
+        assert!(multi_lsp_document("src/.hidden.go","").is_none());
+        assert!(multi_lsp_document("src/main.go","\0").is_none());
+        assert!(same_lsp_family("typescript","javascriptreact"));
+        assert!(!same_lsp_family("python","go"));
         let valid=json!({"argv":["/usr/bin/server","--stdio"],"language":"python","extension":"py","text":"x = 1"});
         assert!(parse_lsp(&valid.to_string()).is_some());
         let mut v=valid.clone();v["argv"]=json!(["../../server"]);assert!(parse_lsp(&v.to_string()).is_none());
