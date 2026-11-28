@@ -6,6 +6,7 @@ const path=require('path');
 const {Session,profileFor,ROOT}=require('./lsp-session.js');
 const fixtures={
     python:{filename:'nexus-real-lsp.py',initial:'missing_nexus_symbol\nclass NexusCompletion:\n    nexus_value = 42\nitem = NexusCompletion()\nitem',suffix:'.nexus_value',symbol:'missing_nexus_symbol',line:0,character:0,label:'nexus_value',completionLine:4,completionCharacter:5,diagnosticMarker:'nexus-real-diagnostics.marker',completionMarker:'nexus-real-completion.marker',savedMarker:'nexus-lsp-saved.marker',server:'pylsp-1.10.0'},
+    c:{filename:'nexus-real-lsp.c',initial:'int broken = missing_nexus_c;\nstruct NexusC { int nexus_c_value; };\nvoid probe_c(void) {\n    struct NexusC item;\n    item',suffix:'.nexus_c_value',symbol:'missing_nexus_c',line:0,character:13,label:'nexus_c_value',completionLine:4,completionCharacter:9,diagnosticMarker:'nexus-c-diagnostics.marker',completionMarker:'nexus-c-completion.marker',savedMarker:'nexus-c-saved.marker',server:'clangd-18.1.3'},
     cpp:{filename:'nexus-real-lsp.cpp',initial:'int broken = missing_nexus_cpp;\nstruct NexusCompletion { int nexus_value; };\nvoid probe() {\n    NexusCompletion item;\n    item',suffix:'.nexus_value',symbol:'missing_nexus_cpp',line:0,character:13,label:'nexus_value',completionLine:4,completionCharacter:9,diagnosticMarker:'nexus-cpp-diagnostics.marker',completionMarker:'nexus-cpp-completion.marker',savedMarker:'nexus-cpp-saved.marker',server:'clangd-18.1.3'}
 };
 const sessions=new Map(),accepted=new Set(),completed=new Set();
@@ -87,12 +88,12 @@ async function stopAll(writeEvidence=false){
         reports[key]={...await s.stop(),restarted:!!s.restarted};
     }));
     collection?.clear();
-    if(writeEvidence&&accepted.has(fixtures.python.filename)&&accepted.has(fixtures.cpp.filename)){
+    if(writeEvidence&&Object.values(fixtures).every(f=>accepted.has(f.filename))){
         const p=reports.python,c=reports.clangd;
         // Evidence must reflect actual initialized server processes, not just
         // successful marker writes or completion text.
         const ok=[p,c].every(s=>s&&s.launches===1&&s.initializes===1&&s.diagnostics>=1&&s.completions>=1&&s.shutdownClean&&!s.restarted&&s.opens>=1&&s.closes===s.opens)&&
-            p.snapshotRefreshes>=1&&c.changes>=1&&completed.has(fixtures.python.filename)&&completed.has(fixtures.cpp.filename);
+            p.snapshotRefreshes>=1&&c.changes>=2&&c.completions>=2&&c.peakDocuments>=2&&Object.values(fixtures).every(f=>completed.has(f.filename));
         marker('nexus-persistent-lsp.json',JSON.stringify({ok,python:p,clangd:c,languages:['python','c','cpp']}));
     }
 }
@@ -151,6 +152,7 @@ exports.activate=function(context){
     }
     context.subscriptions.push(vscode.commands.registerCommand('nexus.fixture.open',()=>openFixture(fixtures.python)));
     context.subscriptions.push(vscode.commands.registerCommand('nexus.fixture.cpp',()=>openFixture(fixtures.cpp)));
+    context.subscriptions.push(vscode.commands.registerCommand('nexus.fixture.c',()=>openFixture(fixtures.c)));
     context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.stop',()=>stopAll(true)));
     context.subscriptions.push(vscode.commands.registerCommand('nexus.lsp.restart',async()=>{
         await stopAll(false);sessions.clear();stopping=false;
