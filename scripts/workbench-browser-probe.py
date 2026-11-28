@@ -97,7 +97,7 @@ def wait_for_persistent_shutdown(page, root):
         except (OSError, ValueError):
             page.wait_for_timeout(250)
             continue
-        assert evidence["ok"] is True
+        assert evidence["ok"] is True and evidence["projectAcceptance"] is True
         assert evidence["languages"] == ["python","c","cpp"]
         for key in ("python","clangd"):
             server=evidence[key]
@@ -121,7 +121,7 @@ def main():
     initial = "missing_nexus_symbol\nclass NexusCompletion:\n    nexus_value = 42\nitem = NexusCompletion()\nitem" if real else "NEXUS_BROWSER_EDITOR_SAVED"
     label = "nexus_value" if real else "NEXUS_LSP_COMPLETION"
     final = initial + ("." if real else "\n") + label
-    signal.alarm(1200 if real else 420)
+    signal.alarm(1500 if real else 420)
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
@@ -224,6 +224,10 @@ def main():
             if real:
                 exercise_c_family(page, root, "cpp")
                 exercise_c_family(page, root, "c")
+                run_command(page, "Nexus: Run Synthetic Cross-file Acceptance")
+                wait_for_guest_save(page, root, {"nexus-project-lsp.marker": b"definition-references-rename",
+                    "nexus-project-acceptance/shared.hpp": b"inline int nexus_renamed(int x) { return x + 1; }\n",
+                    "nexus-project-acceptance/main.cpp": b'#include "shared.hpp"\nint nexus_entry() { return nexus_renamed(1); }\n'}, "real cross-file rename persisted", seconds=180)
                 wait_for_persistent_shutdown(page, root)
             context.close()
             browser.close()
