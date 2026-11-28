@@ -1,4 +1,6 @@
+import hashlib
 import importlib.util
+import json
 import io
 from pathlib import Path
 import tarfile
@@ -79,6 +81,43 @@ class OverlayTests(unittest.TestCase):
             fake.write_bytes(b"x" * workbench.SOURCE_DOCUMENTS["LICENSE.txt"][0])
             with self.assertRaisesRegex(ValueError, "Git blob mismatch"):
                 workbench.verify_source_document(fake, "LICENSE.txt")
+
+
+    def test_reviewed_optional_lsp_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base.tar.gz"
+            with tarfile.open(base, "w:gz") as t:
+                add(t, "./opt")
+                add(t, "./opt/nexus")
+            entry = workbench.LSP_ENTRIES["typescript"]
+            data = b"synthetic JS fixture, not a language server"
+            for bad in ("none", "digest", "symlink", "escape"):
+                bundle = root / f"bundle-{bad}.tar.gz"
+                digest = hashlib.sha256(data).hexdigest() if bad != "digest" else "0" * 64
+                record = {"schemaVersion":1,"architecture":"arm64","servers":{"typescript":{"version":"4.3.4","entrySHA256":digest}}}
+                with tarfile.open(bundle, "w:gz") as t:
+                    for parent in reversed(Path(entry).parents):
+                        if str(parent) != ".":
+                            add(t, parent.as_posix())
+                    add(t, entry, data)
+                    add(t, "notices")
+                    add(t, "notices/README.txt", b"synthetic test only")
+                    add(t, "manifest.json", json.dumps(record).encode())
+                    if bad == "symlink":
+                        add(t, "bin")
+                        add(t, "bin/unsafe", link="/etc/passwd")
+                    if bad == "escape":
+                        add(t, "../escape", b"x")
+                out = root / f"output-{bad}.tar.gz"
+                if bad != "none":
+                    with self.assertRaises(ValueError):
+                        workbench.overlay_reviewed_lsp(base,bundle,out)
+                else:
+                    inventory=workbench.overlay_reviewed_lsp(base,bundle,out)
+                    self.assertEqual(inventory,record["servers"])
+                    with tarfile.open(out,"r:gz") as t:
+                        self.assertEqual(t.extractfile("./"+workbench.LSP_DEST+"/"+entry).read(),data)
 
 if __name__ == "__main__":
     unittest.main()
