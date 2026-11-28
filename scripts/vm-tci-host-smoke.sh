@@ -43,32 +43,31 @@ cp "$tmp/import/kernel" "$tmp/kernel"
 cp "$tmp/import/initrd" "$tmp/initrd"
 cp --sparse=always "$tmp/import/disk" "$tmp/root.ext4"
 
-# TCI, not KVM/HVF, no external networking, no host shared filesystem.
-# QEMU exit and all ordered guest markers are required.
-timeout --signal=TERM --kill-after=20s 45m "$qemu" \
-    -machine virt,gic-version=3 -cpu cortex-a57 -accel tcg,thread=single \
-    -smp 1 -m 2048 -nodefaults -display none -monitor none -serial stdio \
-    -nic none -no-reboot -kernel "$tmp/kernel" -initrd "$tmp/initrd" \
-    -append 'root=/dev/vda rw rootwait console=ttyAMA0 init=/usr/local/sbin/nexus-vm-smoke' \
-    -drive "if=none,file=$tmp/root.ext4,format=raw,id=root" \
-    -device virtio-blk-device,drive=root </dev/null 2>&1 | tee "$out/serial.txt"
+# Run the exact restricted network topology implemented in the iOS backend.
+# The HTTP request originates on the host; only an actual container response
+# and guest-side acknowledgement can satisfy the gate.
+python3 "$here/vm-tci-network-probe.py" "$out" "$qemu" "$tmp/kernel" "$tmp/initrd" "$tmp/root.ext4"
 python3 - "$out" "$pin" <<'PY'
 import json, re, sys
 from pathlib import Path
 out = Path(sys.argv[1])
 lines = (out / "serial.txt").read_text(errors="replace").replace("\r", "").splitlines()
 kernel = [line for line in lines if re.fullmatch(r"NEXUS_VM_KERNEL:[0-9A-Za-z._+-]+", line)]
-markers = ["NEXUS_VM_CGROUP2_OK", "NEXUS_VM_DOCKER_DAEMON_OK",
-           "NEXUS_VM_DOCKER_RUN_OK", "NEXUS_VM_COMPOSE_OK", "NEXUS_VM_CLEAN_SHUTDOWN"]
+markers = ["NEXUS_VM_CGROUP2_OK", "NEXUS_VM_NET_CONFIG_OK", "NEXUS_VM_DOCKER_DAEMON_OK",
+           "NEXUS_VM_DOCKER_RUN_OK", "NEXUS_VM_COMPOSE_OK", "NEXUS_VM_COMPOSE_NETWORK_OK",
+           "NEXUS_VM_FORWARD_READY", "NEXUS_VM_FORWARD_OK", "NEXUS_VM_CLEAN_SHUTDOWN"]
 assert len(kernel) == 1 and not any("NEXUS_VM_FAIL:" in line for line in lines)
 assert all(lines.count(marker) == 1 for marker in markers)
 positions = [lines.index(kernel[0]), *(lines.index(marker) for marker in markers)]
 assert positions == sorted(positions)
-report = {"ok": True, "scope": "Linux ARM64 CI host QEMU TCI, offline vfs container smoke",
+http = json.loads((out / "forward-http.json").read_text())
+assert http == {"ok": True, "status": 200, "body": "NEXUS_VM_HTTP_42"}
+report = {"ok": True, "scope": "Linux ARM64 CI host QEMU TCI, restricted SLIRP and vfs container smoke",
           "qemuCommit": sys.argv[2], "kernel": kernel[0].split(":", 1)[1],
           "tciBuildVerified": True, "linuxKernelBootVerified": True,
           "dockerEngineInHostTCIVerified": True, "composeInHostTCIVerified": True,
-          "cleanShutdown": True, "iosBackendImplemented": False,
+          "composeNetworkVerified": True, "loopbackForwardVerified": True,
+          "cleanShutdown": True, "iosBackendVerified": False,
           "physicalDeviceVerified": False, "productionReady": False}
 (out / "vm-tci-host-evidence.json").write_text(json.dumps(report, indent=2) + "\n")
 print(json.dumps(report))
