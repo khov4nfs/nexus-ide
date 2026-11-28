@@ -27,7 +27,7 @@ mkdir "$tmp/qemu-build"
     "$tmp/qemu/configure" --target-list=aarch64-softmmu \
         --without-default-features --enable-tcg --enable-tcg-interpreter \
         --disable-kvm --disable-hvf --disable-plugins --disable-docs \
-        --disable-werror --with-fdt=system
+        --disable-werror --enable-fdt=system
     grep -q '^#define CONFIG_TCG_INTERPRETER 1$' config-host.h
     ! grep -Eq '^#define CONFIG_(KVM|HVF) 1$' config-host.h
     ninja -j "$(nproc)" qemu-system-aarch64
