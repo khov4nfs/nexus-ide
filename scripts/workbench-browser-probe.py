@@ -1,6 +1,7 @@
 """CI-only Chromium UI test for the pinned local OpenVSCode guest.
 No user credentials, remote workspace, screenshots, or browser log export.
 """
+import json
 import os
 import re
 import signal
@@ -47,6 +48,67 @@ def save_from_palette(page):
     option.click(timeout=5000)
     widget.first.wait_for(state="hidden", timeout=10000)
 
+def run_command(page, title):
+    page.keyboard.press("F1")
+    widget = page.locator(".quick-input-widget:visible")
+    prompt = widget.locator("input:visible").first
+    prompt.wait_for(state="visible", timeout=15000)
+    prompt.fill(">" + title)
+    widget.get_by_role("option", name=re.compile("^" + re.escape(title) + r"(?:,|$)", re.I)).first.click(timeout=30000)
+    widget.first.wait_for(state="hidden", timeout=15000)
+
+def exercise_c_family(page, root, language):
+    cpp = language == "cpp"
+    filename = "nexus-real-lsp." + language
+    label = "nexus_value" if cpp else "nexus_c_value"
+    initial = ("int broken = missing_nexus_cpp;\nstruct NexusCompletion { int nexus_value; };\nvoid probe() {\n    NexusCompletion item;\n    item"
+               if cpp else "int broken = missing_nexus_c;\nstruct NexusC { int nexus_c_value; };\nvoid probe_c(void) {\n    struct NexusC item;\n    item")
+    run_command(page, "Nexus: Open C++ CI Fixture" if cpp else "Nexus: Open C CI Fixture")
+    page.get_by_text(filename, exact=True).first.wait_for(state="visible")
+    editor = page.locator(".editor-instance .monaco-editor .view-lines:visible").first
+    editor.wait_for(state="visible")
+    editor.click()
+    page.keyboard.press("Meta+A")
+    page.keyboard.insert_text(initial)
+    save_from_palette(page)
+    wait_for_guest_save(page, root, {filename: initial.encode(),
+                        "nexus-"+language+"-diagnostics.marker": b"clangd-18.1.3"}, language+" diagnostics", seconds=150)
+    page.locator(".monaco-editor .squiggly-error, .monaco-editor .squiggly-warning").first.wait_for(state="visible", timeout=30000)
+    editor.click()
+    page.keyboard.press("Meta+End")
+    page.keyboard.press("End")
+    page.keyboard.insert_text(".")
+    page.keyboard.press("Control+Space")
+    suggestion = page.locator(".suggest-widget").get_by_text(label, exact=True).first
+    suggestion.wait_for(state="visible", timeout=150000)
+    page.keyboard.press("Enter")
+    save_from_palette(page)
+    wait_for_guest_save(page, root, {filename: (initial+"."+label).encode(),
+                        "nexus-"+language+"-completion.marker": b"clangd-18.1.3",
+                        "nexus-"+language+"-saved.marker": b"saved"}, language+" completion", seconds=90)
+    print("Workbench browser: actual "+language+" diagnostic and completion persisted", file=sys.stderr, flush=True)
+
+def wait_for_persistent_shutdown(page, root):
+    run_command(page, "Nexus: Stop Language Servers")
+    deadline = time.monotonic()+45
+    while time.monotonic()<deadline:
+        try:
+            evidence=json.loads((root/"nexus-persistent-lsp.json").read_bytes())
+        except (OSError, ValueError):
+            page.wait_for_timeout(250)
+            continue
+        assert evidence["ok"] is True
+        assert evidence["languages"] == ["python","c","cpp"]
+        for key in ("python","clangd"):
+            server=evidence[key]
+            assert server["launches"] == 1 and server["initializes"] == 1
+            assert server["shutdownClean"] is True and server["restarted"] is False
+            assert server["opens"] == server["closes"]
+        assert evidence["python"]["snapshotRefreshes"] >= 1
+        assert evidence["clangd"]["peakDocuments"] >= 2 and evidence["clangd"]["changes"] >= 2
+        return
+    raise TimeoutError("Persistent LSP shutdown evidence unavailable")
+
 def main():
     token = os.environ.get("NEXUS_WORKBENCH_TEST_TOKEN", "")
     if token != "f" * 64:
@@ -59,7 +121,7 @@ def main():
     initial = "missing_nexus_symbol\nclass NexusCompletion:\n    nexus_value = 42\nitem = NexusCompletion()\nitem" if real else "NEXUS_BROWSER_EDITOR_SAVED"
     label = "nexus_value" if real else "NEXUS_LSP_COMPLETION"
     final = initial + ("." if real else "\n") + label
-    signal.alarm(660 if real else 420)
+    signal.alarm(1200 if real else 420)
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
@@ -159,6 +221,10 @@ def main():
                 expected["nexus-real-completion.marker"] = b"pylsp-1.10.0"
             wait_for_guest_save(page, root, expected, "LSP completion save", seconds=90 if real else 45)
             print("Workbench browser: completion accepted and persisted", file=sys.stderr, flush=True)
+            if real:
+                exercise_c_family(page, root, "cpp")
+                exercise_c_family(page, root, "c")
+                wait_for_persistent_shutdown(page, root)
             context.close()
             browser.close()
     finally:
