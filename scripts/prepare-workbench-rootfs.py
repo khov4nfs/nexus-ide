@@ -215,9 +215,11 @@ def main():
                     raise ValueError("Source document conversion mismatch")
             source_provenance = f"workbench_source_commit={SOURCE_COMMIT}\n" + "".join(f"workbench_source_{name}_sha256={hashlib.sha256(data).hexdigest()}\n" for name, data in source_documents.items())
         if args.pylsp_rootfs:
+            if not (fs / "data/usr/bin/clangd-18").exists() or not (fs / "data/opt/nexus-lsp-package-inventory.tsv").is_file():
+                raise ValueError("Prepared clangd or package inventory missing")
             if not (fs / "data/usr/bin/pylsp").is_file():
                 raise ValueError("Prepared real pylsp executable missing")
-            source_provenance += f"pylsp_rootfs_sha256={args.pylsp_rootfs_sha256}\npylsp_package_version=1.10.0-1\n"
+            source_provenance += f"pylsp_rootfs_sha256={args.pylsp_rootfs_sha256}\npylsp_package_version=1.10.0-1\nclangd_package_version=1:18.1.3-1\n"
         (fs / "provenance.txt").write_text(f"ubuntu_sha256={agy.UBUNTU_SHA}\nworkbench_source={ASSET}\nworkbench_sha256={SHA}\n" + source_provenance + (f"agy_sha256={args.agy_sha256}\n" if args.agy_binary else ""))
         if target.exists() or target.is_symlink():
             raise SystemExit("Target appeared during import")
