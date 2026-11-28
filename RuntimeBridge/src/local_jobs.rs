@@ -94,7 +94,7 @@ struct State {
 static STATE: Mutex<State> = Mutex::new(State {
     running:false, ready:false, mode:0, output:String::new(), raw:Vec::new(), total:0, controls:VecDeque::new(), stop:false, agent:None,
 });
-const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
+const WORKBENCH: &str = "umask 077; mkdir -p /root/nexus-workbench /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --no-opt --no-sparkplug --no-maglev --no-lazy --liftoff-only --single-threaded --v8-pool-size=1 /opt/nexus/workbench/out/server-main.js --telemetry-level off --force-disable-user-env --host 127.0.0.1 --port 18765 --connection-token \"$NEXUS_WORKBENCH_TOKEN\" --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions /root/nexus-workbench";
 fn fail(message: &str) -> Value { json!({"ok":false,"error":message}) }
 fn valid_command(s: &str) -> bool { !s.trim().is_empty() && s.len() <= 2048 && !s.contains('\0') }
 fn parse_call(input:&str)->Option<Value> {
@@ -132,7 +132,7 @@ fn parse_workbench(input:&str)->Option<(String,Option<String>)> {
     if !valid_token(&token) || !process_probe::agy_digest_ok(&digest) {return None;}
     Some((token,Some(digest)))
 }
-const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/bin/openvscode-server --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
+const INSTALL_VSIX:&str="umask 077; mkdir -p /root/nexus-vscode-data /root/nexus-vscode-extensions && exec /opt/nexus/workbench/node --no-opt --no-sparkplug --no-maglev --no-lazy --liftoff-only --single-threaded --v8-pool-size=1 /opt/nexus/workbench/out/server-main.js --telemetry-level off --server-data-dir /root/nexus-vscode-data --extensions-dir /root/nexus-vscode-extensions --install-extension /opt/nexus/extension.vsix";
 fn parse_cli(input:&str)->Option<(String,String,String,Option<String>,Option<NativeSession>)> {
     if input.len()>16384 {return None;}
     let v:Value=serde_json::from_str(input).ok()?;
@@ -411,14 +411,65 @@ fn run(path: &Path, mode: u8, input: &str) -> Value {
             r
         }
         else if let Some((token,vsix))=workbench.as_ref() {
-            let installed=vsix.as_deref().map(|digest| {
-                let verified=rt.block_on(process_probe::guest_file_digest(&guest,&env,"/opt/nexus/extension.vsix",digest))["passed"]==true;
-                verified && !stop_requested() && rt.block_on(process_probe::local_hook_with_timeout(&guest,&env,INSTALL_VSIX,120))
+            // Only this reviewed Linux guest binary may use guest Wasm baseline
+            // code generation. Asbestos interprets guest instructions; the host
+            // backing pages are never executable. Do not enable host JIT.
+            // V8 --jitless disables WebAssembly, breaking Node 22 Undici even
+            // for MessageChannel. Keep JS optimization disabled for the main
+            // entrypoints and permit guest Wasm Liftoff. These V8 flags cannot
+            // be passed via NODE_OPTIONS; child guest processes have no host JIT.
+            // The pinned litter-ish kernel/exec.c also injects --jitless
+            // into every guest node exec, independently of NODE_OPTIONS.
+            // Use its explicit per-environment compatibility opt-out only
+            // in this reviewed Workbench lane; leave other guest lanes alone.
+            // V8 background GC/compilation can race in ARM64 emulation.
+            // Keep those tasks serial in the reviewed server and its inherited
+            // execArgv (extension host). This does not disable Node async I/O
+            // or guest Wasm, and never requests host executable memory.
+            // Retain the upstream heap cap for Node descendants as well.
+            // Workbench receives an explicit guest environment. Skip the
+            // upstream interactive login-shell environment probe (which
+            // spawns another detached Node/shell before the extension host).
+            // The actual extension host and editor gates remain mandatory.
+            env.insert("SHELL".into(),"/bin/sh".into());
+            env.insert("ISH_NODE_NO_ARG_INJECTION".into(),"1".into());
+            env.insert("NODE_OPTIONS".into(),"--max-old-space-size=512".into());
+            env.insert("UV_USE_IO_URING".into(),"0".into());
+            let runtime=rt.block_on(process_probe::local_hook_with_timeout(&guest,&env,r#"
+set -eu
+test -r /opt/nexus/workbench/out/server-main.js
+exec /opt/nexus/workbench/node --no-opt --no-sparkplug --no-maglev --no-lazy --liftoff-only --single-threaded --v8-pool-size=1 -e '
+const fs = require("node:fs");
+const { port1, port2 } = new MessageChannel();
+const wasm = Uint8Array.from([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,2,1,0,7,7,1,3,114,117,110,0,0,10,6,1,4,0,65,42,11]);
+if (new WebAssembly.Instance(new WebAssembly.Module(wasm)).exports.run() !== 42) throw Error("guest Wasm result");
+const deadline = setTimeout(() => { console.error("guest MessageChannel timeout"); process.exit(1); }, 10000);
+port1.addEventListener("message", event => {
+    if (event.data !== 42) throw Error("guest MessageChannel result");
+    port1.close(); port2.close(); clearTimeout(deadline);
+    fs.stat("/tmp", (err, stat) => {
+        if (err || !stat.isDirectory()) process.exitCode = 1;
+        else console.log("NEXUS_NODE_WASM_MESSAGE_ASYNC_OK");
+    });
+});
+port1.start(); port2.postMessage(42);
+'
+"#,60));
+            let digest_verified=vsix.as_deref().map(|digest|
+                rt.block_on(process_probe::guest_file_digest(&guest,&env,"/opt/nexus/extension.vsix",digest))["passed"]==true);
+            #[cfg(test)]
+            if std::env::var_os("NEXUS_WORKBENCH_CI_TRACE").is_some(){
+                eprintln!("CI Workbench preflight: node={runtime}, vsix digest={digest_verified:?}");
+            }
+            let installed=vsix.as_deref().map(|_| {
+                runtime && digest_verified==Some(true) && !stop_requested() && rt.block_on(process_probe::local_hook_with_timeout(&guest,&env,INSTALL_VSIX,120))
             });
-            let mut r=if installed.unwrap_or(true) && !stop_requested() {
+            let mut r=if runtime && installed.unwrap_or(true) && !stop_requested() {
                 env.insert("NEXUS_WORKBENCH_TOKEN".into(),token.clone());
                 rt.block_on(process_probe::local_process(&guest,&env,WORKBENCH,true))
-            } else {fail("Reviewed VSIX verification or installation failed, or launch cancelled")};
+            } else {fail(if !runtime{"Workbench Node async preflight failed"}else if digest_verified==Some(false){"Reviewed VSIX digest mismatch"}else{"Reviewed VSIX installation failed, or launch cancelled"})};
+            r["nodeRuntimeVerified"]=json!(runtime);
+            r["extensionDigestVerified"]=json!(digest_verified);
             r["extensionInstalled"]=json!(installed);
             r
         } else {
@@ -779,7 +830,30 @@ mod tests {
         let mut v=valid.clone();v["text"]=json!("x".repeat(8193));assert!(parse_lsp(&v.to_string()).is_none());
     }
     #[test]
-    #[ignore = "requires fresh Ubuntu fakefs; synthetic LSP Content-Length peer"]
+    #[ignore = "requires prepared real pylsp ARM64 Ubuntu fakefs"]
+    fn real_pylsp_snapshot(){
+        let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
+        let evidence=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guest=IshInstance::boot(Path::new(&path),Some(Path::new("/"))).unwrap();
+        let env=HashMap::from([("PATH".into(),"/usr/bin:/bin:/usr/sbin:/sbin".into()),("HOME".into(),"/root".into()),("LANG".into(),"C.UTF-8".into()),("PYTHONFAULTHANDLER".into(),"1".into())]);
+        {let mut s=STATE.lock().unwrap();s.running=true;s.stop=false;s.mode=8;}
+        let version=rt.block_on(process_probe::verify_pylsp_for_ci(&guest,&env));
+        let threads=version.is_ok()&&rt.block_on(process_probe::verify_python_threads_for_ci(&guest,&env));
+        let r=if threads{
+            let input=parse_lsp(&json!({"argv":["/usr/bin/python3","-u","-m","pylsp","-v"],"language":"python","extension":"py","text":"x = missing_nexus_symbol"}).to_string()).unwrap();
+            rt.block_on(process_probe::lsp_diagnostics(&guest,&env,&input,false))
+        }else{json!({"ok":false,"error":"Prepared server or Python thread regression failed"})};
+        let clean=rt.block_on(guest.shutdown()).is_ok();
+        STATE.lock().unwrap().running=false;
+        let diagnosed=r["diagnostics"].as_array().is_some_and(|a|a.iter().any(|d|d["message"].as_str().is_some_and(|m|m.contains("missing_nexus_symbol"))&&d["range"]["start"]["line"]==0&&d["range"]["start"]["character"]==4));
+        let ok=version.as_deref()==Ok("1.10.0-1")&&threads&&r["ok"]==true&&r["transportClosed"]==true&&diagnosed&&clean;
+        let report=json!({"ok":ok,"fixtureOnly":false,"scope":"macOS-hosted Ubuntu guest","package":"python3-pylsp","packageVersion":version.ok(),"pythonThreadsVerified":threads,"diagnosticVerified":diagnosed,"transportClosed":r["transportClosed"],"shutdownClean":clean,"physicalDeviceVerified":false});
+        std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(ok,"real pylsp snapshot gate: {report}; {}",r["error"]);
+    }
+    #[test]
+    #[ignore = "requires separate Ubuntu fakefs"]
     fn real_lsp_diagnostic_fixture(){
         let path=std::env::var_os("NEXUS_LOCAL_ROOTFS").expect("rootfs");
         let report=std::env::var_os("NEXUS_LOCAL_EVIDENCE").expect("evidence");
@@ -924,11 +998,28 @@ mod tests {
             std::process::Command::new(std::env::var_os("NEXUS_WORKBENCH_BROWSER_PYTHON").unwrap())
                 .arg(std::env::var_os("NEXUS_WORKBENCH_BROWSER_SCRIPT").expect("browser script"))
                 .env("NEXUS_WORKBENCH_TEST_TOKEN",&token)
-                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit())
                 .status().is_ok_and(|s|s.success())
         }else{false};
+        eprintln!("CI Workbench: requesting stop; browser_ok={browser_ok}");
         let stop=enqueue(Control::Stop);
+        let stop_deadline=Instant::now()+Duration::from_secs(90);
+        while !worker.is_finished() && Instant::now()<stop_deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !worker.is_finished() {
+            let report=json!({"ok":false,"ready":ready,"httpStatus":status,"shutdownClean":false,
+                "browserRequested":browser_requested,"browserCompleted":browser_ok,
+                "error":"Workbench runtime did not exit within stop watchdog"});
+            std::fs::write(&evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            eprintln!("{report}");
+            // CI-only isolated test executable. Never continue with a stuck
+            // guest or claim a clean shutdown, even if editor bytes exist.
+            std::process::exit(1);
+        }
         let closed=worker.join().expect("workbench owner");
+        // CI-only fixed synthetic input; returned status contains no server URL or token.
+        eprintln!("CI Workbench final process status: {closed}");
         let extension_verified=vsix.as_ref().map(|_| {
             closed["extensionInstalled"]==true &&
                 std::fs::read_dir(guest_path.join("root/nexus-vscode-extensions")).ok().is_some_and(|dirs|
@@ -942,8 +1033,8 @@ mod tests {
         let activated=browser_ok&&std::fs::read(root.join("nexus-extension-activated.marker")).ok().as_deref()==Some(b"activated");
         let editor_verified=activated&&std::fs::read(root.join("nexus-editor-saved.marker")).ok().as_deref()==Some(b"saved");
         let lsp_verified=editor_verified&&std::fs::read(root.join("nexus-lsp-transport.marker")).ok().as_deref()==Some(b"completed")&&std::fs::read(root.join("nexus-lsp-saved.marker")).ok().as_deref()==Some(b"saved")&&std::fs::read(root.join("nexus-editor-fixture.txt")).ok().as_deref()==Some(b"NEXUS_BROWSER_EDITOR_SAVED\nNEXUS_LSP_COMPLETION");
-        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified&&lsp_verified)),
-            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":lsp_verified,"lspFixtureOnly":true});
+        let report=json!({"ok":ready && matches!(status,Some(200|302|303|307)) && stop["ok"]==true && closed["ok"]==true && closed["shutdownClean"]==true && extension_verified.unwrap_or(true)&&(!browser_requested||(activated&&editor_verified&&lsp_verified)),
+            "ready":ready,"httpStatus":status,"shutdownClean":closed["shutdownClean"],"nodeRuntimeVerified":closed["nodeRuntimeVerified"],"extensionDigestVerified":closed["extensionDigestVerified"],"extensionInstallVerified":extension_verified,"browserRequested":browser_requested,"extensionActivationVerified":activated,"editorVerified":editor_verified,"lspVerified":lsp_verified,"lspFixtureOnly":true});
         std::fs::write(evidence,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         println!("{report}");
         assert_eq!(report["ok"],true);

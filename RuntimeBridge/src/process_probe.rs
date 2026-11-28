@@ -918,7 +918,13 @@ async fn run_hook(guest:&IshInstance,env:&HashMap<String,String>,command:&str,se
         let _=session.terminate().await;
         let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
     }
-    result.is_ok() && capture.closed && capture.exited && capture.code==Some(0) && capture.signal.unwrap_or(0)==0 && !cancel()
+    let ok=result.is_ok() && capture.closed && capture.exited && capture.code==Some(0) && capture.signal.unwrap_or(0)==0 && !cancel();
+    #[cfg(test)]
+    if std::env::var_os("NEXUS_WORKBENCH_CI_TRACE").is_some(){
+        // Only this synthetic CI workflow enables tracing. No user data.
+        eprintln!("CI Workbench hook ok={ok}: {:?}; transport={:?}",capture.evidence(),result.err());
+    }
+    ok
 }
 
 // Codex app-server JSONL intentionally does not use ACP's JSON-RPC version
@@ -1263,6 +1269,11 @@ async fn lsp_next(session:&IshSession,capture:&mut Capture,deadline:Instant)->Re
         if crate::local_jobs::stop_requested()||Instant::now()>=deadline{return Err("LSP cancelled or timed out".into());}
         if let Some(f)=lsp_frame(&mut capture.stdout)?{return Ok(f);}
         if capture.exited||capture.closed||!capture.pty.is_empty(){return Err("LSP process stopped".into());}
+        // Only CI's fixed synthetic document may produce server trace output.
+        #[cfg(test)]
+        if std::env::var_os("NEXUS_PYLSP_TRACE").is_some()&&!capture.stderr.is_empty(){
+            eprintln!("pylsp stderr: {}",String::from_utf8_lossy(&capture.stderr));
+        }
         capture.stderr.clear();
         capture.poll(session,deadline).await?;
     }
@@ -1411,6 +1422,77 @@ pub(crate) async fn live_lsp(guest:&IshInstance,env:&HashMap<String,String>,requ
     }
 }
 
+// CI-only: verify the real package inside the imported disposable ARM64 guest.
+// APT runs on the Linux preparation runner, never in the app or shipped rootfs.
+#[cfg(test)]
+pub(crate) async fn verify_pylsp_for_ci(guest:&IshInstance,env:&HashMap<String,String>)->Result<String,String>{
+    let script=r#"
+set -eu
+test "$(dpkg-query -W -f='${Version}' python3-pylsp)" = 1.10.0-1
+test -x /usr/bin/pylsp
+/usr/bin/python3 -c 'import pylsp, pyflakes; from importlib.metadata import version; assert version("python-lsp-server") == "1.10.0"'
+printf '%s\n' NEXUS_PYLSP_1_10_0
+"#;
+    let mut opts=shell(script,env);opts.pipe_stdin=false;
+    let session=guest.spawn(opts).map_err(|_|"Package verification process spawn failed")?;
+    let mut capture=Capture::default();
+    let result=drain(&session,&mut capture,Instant::now()+Duration::from_secs(60)).await;
+    if result.is_err(){let _=session.terminate().await;let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;}
+    if result.is_err()||!capture.closed||capture.code!=Some(0)||capture.signal.unwrap_or(0)!=0||capture.stdout!=b"NEXUS_PYLSP_1_10_0\n"{
+        // This guest has only CI packages and fixed synthetic source, no user credentials.
+        eprintln!("CI pylsp package verification: {:?}",capture.evidence());
+        return Err("Prepared Python LSP Server guest verification failed".into());
+    }
+    Ok("1.10.0-1".into())
+}
+
+// CI-only regression for glibc pthread_create/clone3 and real timer dispatch.
+// Validate actual cross-thread execution, join, and repeated creation in guest.
+#[cfg(test)]
+pub(crate) async fn verify_python_threads_for_ci(guest:&IshInstance,env:&HashMap<String,String>)->bool{
+    let script=r#"
+set -eu
+/usr/bin/python3 -u -c '
+import threading
+import queue
+import time
+# Python Event.wait uses a monotonic absolute futex deadline on glibc.
+start = time.monotonic()
+assert not threading.Event().wait(0.15), "unset event unexpectedly signaled"
+elapsed = time.monotonic() - start
+assert 0.12 <= elapsed <= 5, f"monotonic event timeout mismatch: {elapsed}"
+for i in range(3):
+    messages = queue.Queue()
+    def worker():
+        time.sleep(0.05)
+        messages.put(("thread", threading.get_ident()))
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(5)
+    assert not t.is_alive(), "thread join timed out"
+    kind, ident = messages.get_nowait()
+    assert kind == "thread" and ident != threading.get_ident()
+    started = time.monotonic()
+    timer = threading.Timer(0.15, lambda: messages.put(("timer", threading.get_ident(), time.monotonic())))
+    timer.start()
+    timer.join(5)
+    assert not timer.is_alive(), "timer join timed out"
+    kind, ident, fired = messages.get_nowait()
+    assert kind == "timer" and ident != threading.get_ident()
+    assert 0.12 <= fired - started <= 5, f"timer deadline mismatch: {fired - started}"
+print("NEXUS_PYTHON_THREADS_OK")
+'
+"#;
+    let mut opts=shell(script,env);opts.pipe_stdin=false;
+    let Ok(session)=guest.spawn(opts)else{return false;};
+    let mut capture=Capture::default();
+    let result=drain(&session,&mut capture,Instant::now()+Duration::from_secs(40)).await;
+    if result.is_err(){let _=session.terminate().await;let _=drain(&session,&mut capture,Instant::now()+TIMEOUT).await;}
+    let ok=result.is_ok()&&capture.closed&&capture.code==Some(0)&&capture.signal.unwrap_or(0)==0&&capture.stdout==b"NEXUS_PYTHON_THREADS_OK\n";
+    if !ok{eprintln!("CI Python thread regression: {:?}",capture.evidence());}
+    ok
+}
+
 pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,String>,request:&crate::local_jobs::LspInput,fixture:bool)->Value{
     let mut opts=SpawnOpts::cmd(request.argv.iter().map(String::as_str));
     #[cfg(test)]
@@ -1422,14 +1504,25 @@ pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,Strin
     opts.pipe_stdin=true;
     let Ok(session)=guest.spawn(opts)else{return json!({"ok":false,"error":"LSP spawn failed"});};
     let mut capture=Capture::default();
-    let deadline=Instant::now()+Duration::from_secs(45);
+    // Keep the production deadline bounded; allow extra cold-start time only
+    // for the real-server integration test running under the interpreter.
+    #[cfg(test)]
+    let seconds=if std::env::var_os("NEXUS_PYLSP_TRACE").is_some(){120}else{45};
+    #[cfg(not(test))]
+    let seconds=45;
+    let deadline=Instant::now()+Duration::from_secs(seconds);
+    let mut stage="initialize";
     let result:Result<Value,String>=async{
-        lsp_send(&session,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"workspaceFolders":null,"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"versionSupport":true},"completion":{"completionItem":{"snippetSupport":false}}}},"clientInfo":{"name":"nexus-ios","version":"0.7.0"}}}),deadline).await?;
+        lsp_send(&session,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":"file:///tmp","workspaceFolders":null,"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"publishDiagnostics":{"versionSupport":true},"completion":{"completionItem":{"snippetSupport":false}}}},"clientInfo":{"name":"nexus-ios","version":"0.8.0"}}}),deadline).await?;
         let init=lsp_reply(&session,&mut capture,1,deadline).await?;
         let caps=init["capabilities"].as_object().ok_or("Missing LSP capabilities")?;
         if caps.get("positionEncoding").is_some_and(|v|v!="utf-16"){return Err("Unsupported LSP position encoding".into());}
+        stage="initialized";
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"initialized","params":{}}),deadline).await?;
+        stage="didOpen";
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":request.uri,"languageId":request.language,"version":1,"text":request.text}}}),deadline).await?;
+        stage="document response";
+        let deadline=Instant::now()+Duration::from_secs(seconds);
         let (projected,shutdown_id)=if let Some((line,character))=request.completion{
             if !caps.get("completionProvider").is_some_and(Value::is_object){return Err("Server does not advertise completion".into());}
             lsp_send(&session,json!({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":request.uri},"position":{"line":line,"character":character},"context":{"triggerKind":1}}}),deadline).await?;
@@ -1444,9 +1537,12 @@ pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,Strin
         }
         (json!({"diagnostics":found.ok_or("No push diagnostics received")?}),2)
         };
+        stage="didClose and shutdown";
+        let deadline=Instant::now()+Duration::from_secs(30);
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":request.uri}}}),deadline).await?;
         lsp_send(&session,json!({"jsonrpc":"2.0","id":shutdown_id,"method":"shutdown"}),deadline).await?;
         if !lsp_reply(&session,&mut capture,shutdown_id,deadline).await?.is_null(){return Err("Invalid LSP shutdown response".into());}
+        stage="exit";
         lsp_send(&session,json!({"jsonrpc":"2.0","method":"exit"}),deadline).await?;
         drain(&session,&mut capture,deadline).await?;
         if !capture.exited||capture.code!=Some(0)||capture.signal.unwrap_or(0)!=0||!capture.closed{return Err("LSP shutdown failed".into());}
@@ -1454,7 +1550,15 @@ pub(crate) async fn lsp_diagnostics(guest:&IshInstance,env:&HashMap<String,Strin
     }.await;
     match result{
         Ok(mut d)=>{d["ok"]=json!(true);d["snapshotOnly"]=json!(true);d["transportClosed"]=json!(true);d},
-        Err(_)=>{let _=session.terminate().await;let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;json!({"ok":false,"error":"LSP request rejected, unsupported, cancelled or timed out","transportClosed":closed})}
+        Err(error)=>{
+            #[cfg(test)]
+            eprintln!("CI LSP failure at {stage}: {error}; pending stderr: {}",String::from_utf8_lossy(&capture.stderr));
+            #[cfg(not(test))]
+            let _=(error,stage);
+            let _=session.terminate().await;
+            let closed=drain(&session,&mut capture,Instant::now()+TIMEOUT).await.is_ok()&&capture.closed;
+            json!({"ok":false,"error":"LSP request rejected, unsupported, cancelled or timed out","transportClosed":closed})
+        }
     }
 }
 
@@ -1476,16 +1580,27 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
     };
     let mut capture = Capture::default();
     capture.rolling_pty = !workbench;
-    let deadline = Instant::now() + Duration::from_secs(1800);
+    let mut deadline = Instant::now() + Duration::from_secs(1800);
     let mut stopped = false;
+    let mut force_stop_at = None;
     let result: Result<(),String> = async {
         loop {
             for control in take_control() {
                 match control {
                     Control::Stop => {
-                        if !stopped && !capture.exited {
-                            session.terminate().await.map_err(|_| "Stop failed".to_owned())?;
+                        if !stopped {
                             stopped = true;
+                            // Do not reuse the 30-minute job deadline after Stop.
+                            // Give the reviewed Workbench server a chance to
+                            // dispose its extension hosts before escalation.
+                            let now = Instant::now();
+                            deadline = now + Duration::from_secs(30);
+                            if workbench && !capture.exited {
+                                session.signal(15).await.map_err(|_| "Graceful stop failed".to_owned())?;
+                                force_stop_at = Some(now + Duration::from_secs(15));
+                            } else if !capture.closed {
+                                session.terminate().await.map_err(|_| "Stop failed".to_owned())?;
+                            }
                         }
                     }
                     Control::Input(bytes) if !workbench && !stopped && !capture.exited =>
@@ -1493,6 +1608,12 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
                     Control::Resize(cols,rows) if !workbench && !stopped && !capture.exited =>
                         session.resize(cols,rows).await.map_err(|_| "Resize failed".to_owned())?,
                     _ => {}
+                }
+            }
+            if force_stop_at.is_some_and(|at| Instant::now() >= at) {
+                force_stop_at = None;
+                if !capture.closed {
+                    session.terminate().await.map_err(|_| "Forced stop failed".to_owned())?;
                 }
             }
             capture.poll(&session, deadline).await?;
@@ -1515,6 +1636,13 @@ pub(crate) async fn local_process(guest: &IshInstance, env: &HashMap<String,Stri
         let _ = drain(&session,&mut capture,Instant::now()+TIMEOUT).await;
     }
     if !workbench { publish_output(&capture.pty,false,capture.truncated_pty,capture.pty_total); }
+    #[cfg(test)]
+    if workbench && std::env::var_os("NEXUS_WORKBENCH_CI_TRACE").is_some(){
+        // The test token is synthetic; redact it anyway before logging.
+        let output=capture.evidence().to_string();
+        let output=env.get("NEXUS_WORKBENCH_TOKEN").filter(|s|!s.is_empty()).map_or_else(||output.clone(),|s|output.replace(s,"[redacted]"));
+        eprintln!("CI Workbench server lifecycle: {output}");
+    }
     json!({"ok":result.is_ok() && capture.closed && capture.exited,
         "stopped":stopped,"exitCode":capture.code,"termSignal":capture.signal,"outputTruncated":capture.truncated_pty,
         "closed":capture.closed,"error":if result.is_err() { Some("Local process deadline, output limit or transport failure") } else { None }})

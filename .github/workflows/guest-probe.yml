@@ -29,6 +29,8 @@ on:
       - 'scripts/verify-device-acceptance.py'
       - 'scripts/test-device-acceptance.py'
       - 'scripts/build-glibc-rootfs.sh'
+      - 'scripts/prepare-ci-pylsp-rootfs.sh'
+      - 'scripts/ci-pylsp-native-probe.py'
       - 'scripts/verify-glibc-evidence.py'
       - 'scripts/verify-acp-transport.py'
       - 'Sources/NexusCore/**'
@@ -53,9 +55,30 @@ on:
 permissions:
   contents: read
 jobs:
+  prepare-real-pylsp:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare signed Ubuntu packages in CI-only ARM64 rootfs
+        run: bash scripts/prepare-ci-pylsp-rootfs.sh "$RUNNER_TEMP/nexus-pylsp-stage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-pylsp-rootfs
+          path: ${{ runner.temp }}/nexus-pylsp-stage/*
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
   cross-build:
+    needs: prepare-real-pylsp
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu","workbench"]') || fromJSON(format('["{0}"]', inputs.variant || 'ubuntu')) }}
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -77,7 +100,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: meson-diagnostics
+          name: meson-diagnostics${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: |
             Vendor/litter-ish/build/**/meson-logs/meson-log.txt
             RuntimeBridge/target/**/meson-logs/meson-log.txt
@@ -104,7 +127,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: guest-probe-evidence
+          name: guest-probe-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-guest-evidence.json
           if-no-files-found: warn
           retention-days: 7
@@ -130,7 +153,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: glibc-compatibility-evidence
+          name: glibc-compatibility-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-glibc-evidence.json
           if-no-files-found: warn
           retention-days: 7
@@ -193,7 +216,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: acp-transport-fixture-evidence
+          name: acp-transport-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: |
             ${{ runner.temp }}/nexus-acp-evidence.json
             ${{ runner.temp }}/nexus-acp-cancel-evidence.json
@@ -221,7 +244,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: local-job-evidence
+          name: local-job-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: |
             ${{ runner.temp }}/nexus-local-pty.json
             ${{ runner.temp }}/nexus-local-mcp.json
@@ -243,7 +266,7 @@ jobs:
       - name: Upload import slot evidence
         uses: actions/upload-artifact@v4
         with:
-          name: agy-import-slot-evidence
+          name: agy-import-slot-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-slot-evidence.json
           if-no-files-found: error
       - name: Official-login transport fixture (no Google account or AGY)
@@ -263,7 +286,7 @@ jobs:
       - name: Upload Google login fixture evidence
         uses: actions/upload-artifact@v4
         with:
-          name: google-login-fixture-evidence
+          name: google-login-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-google.json
           if-no-files-found: error
       - name: Verify Google-mode ACP staged edit (synthetic peer)
@@ -284,7 +307,7 @@ jobs:
       - name: Upload Google staged edit evidence
         uses: actions/upload-artifact@v4
         with:
-          name: google-staged-edit-evidence
+          name: google-staged-edit-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-google-edit.json
           if-no-files-found: error
       - name: Verify ACP virtual snapshot scope (synthetic peer)
@@ -302,7 +325,7 @@ jobs:
       - name: Upload scoped snapshot evidence
         uses: actions/upload-artifact@v4
         with:
-          name: acp-snapshot-fixture-evidence
+          name: acp-snapshot-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-snapshot.json
           if-no-files-found: error
       - name: Verify local MCP session descriptor (synthetic peer)
@@ -320,7 +343,7 @@ jobs:
       - name: Upload MCP session descriptor evidence
         uses: actions/upload-artifact@v4
         with:
-          name: mcp-session-descriptor-evidence
+          name: mcp-session-descriptor-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-mcp-session.json
           if-no-files-found: error
       - name: Verify restricted ACP terminal transport (synthetic peer)
@@ -338,7 +361,7 @@ jobs:
       - name: Upload ACP terminal fixture evidence
         uses: actions/upload-artifact@v4
         with:
-          name: acp-terminal-fixture-evidence
+          name: acp-terminal-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-terminal.json
           if-no-files-found: error
       - name: Verify ACP reviewed permission decisions and cancellation (synthetic peer)
@@ -357,7 +380,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: acp-review-fixture-evidence
+          name: acp-review-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-acp-review-*.json
           if-no-files-found: error
       - name: Verify reviewed ACP turn hooks (synthetic peer)
@@ -376,7 +399,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: acp-turn-hook-evidence
+          name: acp-turn-hook-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-acp-hooks-*.json
           if-no-files-found: error
       - name: Verify ACP session load across independent guest processes (synthetic peer)
@@ -395,7 +418,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: acp-resume-fixture-evidence
+          name: acp-resume-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-acp-resume-*.json
           if-no-files-found: error
       - name: Verify saved Google AGY session load after fresh synthetic login
@@ -419,7 +442,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: google-resume-fixture-evidence
+          name: google-resume-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-google-resume-*.json
           if-no-files-found: error
       - name: Verify Codex app-server JSONL handshake (synthetic peer)
@@ -435,7 +458,7 @@ jobs:
           python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","initializeVerified","accountReadVerified","fixtureOnly","shutdownClean"]) and r["accountPresent"] is False' "$NEXUS_LOCAL_EVIDENCE"
       - uses: actions/upload-artifact@v4
         with:
-          name: codex-app-server-fixture-evidence
+          name: codex-app-server-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-codex-probe.json
           if-no-files-found: error
       - name: Verify native Codex turn policy and correlation (synthetic peer)
@@ -454,7 +477,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: codex-native-turn-fixture-evidence
+          name: codex-native-turn-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-codex-turn-*.json
           if-no-files-found: error
       - name: Verify Claude native JSON account and text result (synthetic peer)
@@ -473,7 +496,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: claude-native-fixture-evidence
+          name: claude-native-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-claude-*.json
           if-no-files-found: error
       - name: Verify native multi-turn and saved session resume (synthetic peers)
@@ -495,7 +518,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: native-conversation-fixture-evidence
+          name: native-conversation-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-conversation-*.json
           if-no-files-found: error
       - name: Verify local ACP adapter multi-turn and callback rejection (synthetic peer)
@@ -518,7 +541,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: local-adapter-fixture-evidence
+          name: local-adapter-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-adapter-*.json
           if-no-files-found: error
       - name: Observe container prerequisites without enabling Docker
@@ -533,7 +556,7 @@ jobs:
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_container_capabilities -- --ignored --nocapture --test-threads=1
       - uses: actions/upload-artifact@v4
         with:
-          name: container-prerequisite-diagnostic
+          name: container-prerequisite-diagnostic${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-container-capabilities.json
           if-no-files-found: error
       - name: Verify nested multi-file transfer across independent boots
@@ -552,7 +575,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: workspace-batch-evidence
+          name: workspace-batch-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-batch-*.json
           if-no-files-found: error
       - name: Verify native/Linux file transfer across independent guest boots
@@ -571,7 +594,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: workspace-transfer-evidence
+          name: workspace-transfer-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-transfer-*.json
           if-no-files-found: error
       - name: Verify live LSP full document change and version correlation (synthetic peer)
@@ -590,7 +613,7 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: live-lsp-fixture-evidence
+          name: live-lsp-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-live-lsp-*.json
           if-no-files-found: error
       - name: Verify LSP snapshot diagnostics and invalid document rejection (synthetic peer)
@@ -609,9 +632,33 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: lsp-diagnostics-fixture-evidence
+          name: lsp-diagnostics-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-lsp-*.json
           if-no-files-found: error
+      - name: Download CI-only ARM64 rootfs prepared on Linux
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-pylsp-rootfs
+          path: ${{ runner.temp }}/nexus-pylsp-stage
+      - name: Verify actual pinned Python LSP Server diagnostics in disposable Ubuntu guest
+        run: |
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export CC="$(xcrun --sdk macosx --find clang)"
+          (cd "$RUNNER_TEMP/nexus-pylsp-stage" && shasum -a 256 -c SHA256SUMS)
+          Vendor/litter-ish/build/host-fakefsify/tools/fakefsify "$RUNNER_TEMP/nexus-pylsp-stage/pylsp-rootfs.tar.gz" "$RUNNER_TEMP/nexus-real-pylsp-fs"
+          export NEXUS_LOCAL_ROOTFS="$RUNNER_TEMP/nexus-real-pylsp-fs/data"
+          export NEXUS_LOCAL_EVIDENCE="$RUNNER_TEMP/nexus-real-pylsp.json"
+          export NEXUS_PYLSP_TRACE=1
+          cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_pylsp_snapshot -- --ignored --nocapture --test-threads=1
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(r[k] is True for k in ["ok","pythonThreadsVerified","diagnosticVerified","transportClosed","shutdownClean"]) and r["fixtureOnly"] is False and r["physicalDeviceVerified"] is False and r["packageVersion"] == "1.10.0-1"' "$NEXUS_LOCAL_EVIDENCE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-pylsp-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
+          path: ${{ runner.temp }}/nexus-real-pylsp.json
+          if-no-files-found: warn
       - name: Verify original CLI import slots (Ubuntu ELF fixture only)
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
@@ -631,7 +678,7 @@ jobs:
       - name: Upload CLI import slot evidence
         uses: actions/upload-artifact@v4
         with:
-          name: original-cli-import-fixture-evidence
+          name: original-cli-import-fixture-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-cli-*.json
           if-no-files-found: error
       - name: Verify local PTY lifecycle hooks
@@ -651,7 +698,7 @@ jobs:
       - name: Upload local hook evidence
         uses: actions/upload-artifact@v4
         with:
-          name: local-hook-evidence
+          name: local-hook-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-hooks-*.json
           if-no-files-found: error
       - name: Verify persisted guest across independent runtime processes
@@ -671,25 +718,31 @@ jobs:
       - name: Upload persistent guest evidence
         uses: actions/upload-artifact@v4
         with:
-          name: persistent-local-guest-evidence
+          name: persistent-local-guest-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-persist-*.json
           if-no-files-found: error
       - name: Optional reviewed workbench asset for device test
-        if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
+        if: matrix.variant == 'workbench'
         run: |
           asset="$RUNNER_TEMP/openvscode-server-v1.109.5-linux-arm64.tar.gz"
           curl --proto '=https' --tlsv1.2 --fail --location --retry 2 https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v1.109.5/openvscode-server-v1.109.5-linux-arm64.tar.gz -o "$asset"
-          python3 scripts/prepare-workbench-rootfs.py --archive "$asset" --confirm-local-use
+          source=https://raw.githubusercontent.com/gitpod-io/openvscode-server/4ffe2270acdf711bbefecc3e8c79f4b3631640e5
+          for name in LICENSE.txt ThirdPartyNotices.txt; do
+            curl --proto '=https' --tlsv1.2 --fail --location --retry 2 "$source/$name" -o "$RUNNER_TEMP/$name"
+          done
+          python3 scripts/prepare-workbench-rootfs.py --archive "$asset" --source-license "$RUNNER_TEMP/LICENSE.txt" --source-notices "$RUNNER_TEMP/ThirdPartyNotices.txt" --confirm-local-use
           mv RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/plain-ubuntu-staged"
           bash scripts/stage-ubuntu-device.sh --workbench
       - name: Prepare pinned CI-only Chromium browser harness
-        if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
+        if: matrix.variant == 'workbench'
         run: |
           python3 -m venv "$RUNNER_TEMP/nexus-browser"
           "$RUNNER_TEMP/nexus-browser/bin/python" -m pip install 'playwright==1.51.0'
           "$RUNNER_TEMP/nexus-browser/bin/python" -m playwright install chromium
       - name: Boot reviewed real OpenVSCode and verify browser editor and extension activation
-        if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
+        id: workbench_gate
+        if: matrix.variant == 'workbench'
+        timeout-minutes: 14
         run: |
           export PATH="$(brew --prefix lld)/bin:$PATH"
           export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
@@ -698,38 +751,93 @@ jobs:
           cp -a RuntimeAssets/ubuntu-fs "$RUNNER_TEMP/nexus-workbench-fs"
           export NEXUS_WORKBENCH_ROOTFS="$RUNNER_TEMP/nexus-workbench-fs/data"
           export NEXUS_WORKBENCH_EVIDENCE="$RUNNER_TEMP/nexus-workbench.json"
+          export NEXUS_WORKBENCH_CI_TRACE=1
           export NEXUS_WORKBENCH_BROWSER_PYTHON="$RUNNER_TEMP/nexus-browser/bin/python"
           export NEXUS_WORKBENCH_BROWSER_SCRIPT="$GITHUB_WORKSPACE/scripts/workbench-browser-probe.py"
           python3 scripts/build-test-vsix.py "$RUNNER_TEMP/nexus-fixture.vsix"
           export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-fixture.vsix" | awk '{print $1}')"
           cat "$RUNNER_TEMP/nexus-fixture.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
+          touch "$RUNNER_TEMP/nexus-workbench-start"
           cargo test --manifest-path RuntimeBridge/Cargo.toml --lib real_workbench_loopback -- --ignored --nocapture --test-threads=1
-          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is True and r["lspFixtureOnly"] is True' "$NEXUS_WORKBENCH_EVIDENCE"
-      - name: Upload workbench loopback evidence
-        if: github.event_name == 'workflow_dispatch' && inputs.variant == 'workbench'
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["ok"] is True and r["ready"] is True and r["httpStatus"] in [200,302,303,307] and r["shutdownClean"] is True and r["nodeRuntimeVerified"] is True and r["extensionDigestVerified"] is True and r["extensionInstallVerified"] is True and r["browserRequested"] is True and r["extensionActivationVerified"] is True and r["editorVerified"] is True and r["lspVerified"] is True and r["lspFixtureOnly"] is True' "$NEXUS_WORKBENCH_EVIDENCE"
+      - name: Collect bounded native crash stack (CI-only)
+        if: failure() && matrix.variant == 'workbench' && steps.workbench_gate.outcome == 'failure'
+        timeout-minutes: 2
+        run: |
+          python3 - <<'PY'
+          import json, os, time
+          from pathlib import Path
+          root = Path.home() / "Library/Logs/DiagnosticReports"
+          tmp = Path(os.environ["RUNNER_TEMP"])
+          marker = tmp / "nexus-workbench-start"
+          start = marker.stat().st_mtime if marker.exists() else time.time()
+          report = {"available": False, "scope": "synthetic Workbench CI only"}
+          for attempt in range(12):
+              for path in sorted(root.glob("nexus_guest_bridge*.ips"), key=lambda p: p.stat().st_mtime, reverse=True):
+                  if path.stat().st_mtime < start or path.stat().st_size > 16 * 1024 * 1024:
+                      continue
+                  try:
+                      raw = path.read_text()
+                      decoder = json.JSONDecoder()
+                      header, end = decoder.raw_decode(raw.lstrip())
+                      payload = decoder.raw_decode(raw.lstrip()[end:].lstrip())[0]
+                      if not str(payload.get("procName", "")).startswith("nexus_guest_bridge"):
+                          continue
+                      threads = payload.get("threads", [])
+                      index = payload.get("faultingThread")
+                      if not isinstance(index, int) or not 0 <= index < len(threads):
+                          continue
+                      images = payload.get("usedImages", [])
+                      frames = []
+                      for frame in threads[index].get("frames", [])[:40]:
+                          i = frame.get("imageIndex")
+                          image = images[i].get("name", "") if isinstance(i, int) and 0 <= i < len(images) else ""
+                          frames.append({"image": str(image)[:120], "symbol": str(frame.get("symbol", ""))[:200],
+                                         "offset": frame.get("imageOffset"), "symbolLocation": frame.get("symbolLocation")})
+                      report.update(available=True, exceptionType=payload.get("exception", {}).get("type"),
+                                    faultingThread=index, frames=frames)
+                      break
+                  except (OSError, ValueError, TypeError, IndexError, AttributeError):
+                      continue
+              if report["available"]:
+                  break
+              time.sleep(2)
+          (tmp / "nexus-workbench-crash.json").write_text(json.dumps(report, indent=2))
+          print(json.dumps(report))
+          PY
+      - name: Upload Workbench crash diagnostics
+        if: failure() && matrix.variant == 'workbench' && steps.workbench_gate.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: workbench-loopback-evidence
+          name: workbench-native-crash
+          path: ${{ runner.temp }}/nexus-workbench-crash.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload workbench loopback evidence
+        if: always() && matrix.variant == 'workbench'
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbench-loopback-evidence${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-workbench.json
-          if-no-files-found: error
+          if-no-files-found: warn
       - name: Build and verify integrated Release IPA
         env:
-          VARIANT: ${{ inputs.variant || 'ubuntu' }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           xcodebuild -project NexusIDEUbuntuLab.xcodeproj -scheme NexusIDEUbuntuLab -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/nexus-integrated" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" MARKETING_VERSION=0.8.0 CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
           python3 scripts/package-ipa.py --app "$RUNNER_TEMP/nexus-integrated/Build/Products/Release-iphoneos/NexusIDEUbuntuLab.app" --output "$RUNNER_TEMP/nexus-integrated-ipa" --variant "$VARIANT" --commit "$GITHUB_SHA"
       - name: Bind completed CI evidence to exact integrated IPA
         env:
-          VARIANT: ${{ inputs.variant || 'ubuntu' }}
+          VARIANT: ${{ matrix.variant }}
         run: python3 scripts/collect-release-acceptance.py --evidence "$RUNNER_TEMP" --package "$RUNNER_TEMP/nexus-integrated-ipa" --commit "$GITHUB_SHA" --variant "$VARIANT"
       - name: Create untouched device acceptance template bound to exact IPA
         env:
-          VARIANT: ${{ inputs.variant || 'ubuntu' }}
+          VARIANT: ${{ matrix.variant }}
         run: python3 scripts/verify-device-acceptance.py --package "$RUNNER_TEMP/nexus-integrated-ipa" --record "$RUNNER_TEMP/nexus-integrated-ipa/device-record-template.json" --initialize --expected-commit "$GITHUB_SHA" --expected-variant "$VARIANT"
       - name: Upload acceptance metadata (no IPA)
         uses: actions/upload-artifact@v4
         with:
-          name: NexusIDE-integrated-acceptance
+          name: NexusIDE-integrated-acceptance${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: |
             ${{ runner.temp }}/nexus-integrated-ipa/acceptance.json
             ${{ runner.temp }}/nexus-integrated-ipa/build.json
@@ -739,7 +847,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.license_reviewed
         uses: actions/upload-artifact@v4
         with:
-          name: NexusIDE-integrated-unsigned
+          name: NexusIDE-integrated-unsigned${{ github.event_name == 'pull_request' && format('-{0}', matrix.variant) || '' }}
           path: ${{ runner.temp }}/nexus-integrated-ipa/*
           if-no-files-found: error
           retention-days: 14

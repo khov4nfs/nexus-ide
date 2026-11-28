@@ -52,5 +52,33 @@ class OverlayTests(unittest.TestCase):
                         self.assertEqual(t.extractfile("./" + workbench.VSIX_SLOT).read(), workbench.VSIX_MARKER)
                         self.assertEqual(t.getmember(p + "/bin/link").linkname, "../node")
 
+    def test_missing_license_requires_pinned_source_documents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base.tar.gz"
+            package = root / "package.tar.gz"
+            with tarfile.open(base, "w:gz") as t:
+                add(t, "./opt")
+            with tarfile.open(package, "w:gz") as t:
+                prefix = workbench.PREFIX
+                add(t, prefix)
+                add(t, prefix + "/bin")
+                add(t, prefix + "/bin/openvscode-server", b"fixture")
+                add(t, prefix + "/node", b"fixture")
+            with self.assertRaisesRegex(ValueError, "Missing release license"):
+                workbench.overlay(base, package, root / "reject.tar.gz")
+            docs = {"LICENSE.txt": b"fixture license", "ThirdPartyNotices.txt": b"fixture notices"}
+            out = root / "accept.tar.gz"
+            workbench.overlay(base, package, out, docs)
+            with tarfile.open(out, "r:gz") as t:
+                prefix = "./" + workbench.DEST + "/"
+                self.assertEqual(t.extractfile(prefix + "LICENSE.txt").read(), docs["LICENSE.txt"])
+                for name, data in docs.items():
+                    self.assertEqual(t.extractfile(prefix + "NEXUS-UPSTREAM-" + name).read(), data)
+            fake = root / "fake-license"
+            fake.write_bytes(b"x" * workbench.SOURCE_DOCUMENTS["LICENSE.txt"][0])
+            with self.assertRaisesRegex(ValueError, "Git blob mismatch"):
+                workbench.verify_source_document(fake, "LICENSE.txt")
+
 if __name__ == "__main__":
     unittest.main()

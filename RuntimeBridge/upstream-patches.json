@@ -36,7 +36,7 @@
     "embed/host/src/instance.rs": [
       [
         "            if guard.is_some() {\n                return Ok(());\n            }\n            let timed_out = exit\n                .cv\n                .wait_for(&mut guard, Duration::from_secs(5))\n                .timed_out();\n            if timed_out && guard.is_none() {\n                Err(IshError::Supervisor(\"kernel exit timeout\".into()))\n            } else {\n                Ok(())\n            }",
-        "            let deadline = std::time::Instant::now() + Duration::from_secs(5);\n            while guard.is_none() {\n                let remaining = deadline.saturating_duration_since(std::time::Instant::now());\n                if remaining.is_zero() {\n                    return Err(IshError::Supervisor(\"kernel exit timeout\".into()));\n                }\n                exit.cv.wait_for(&mut guard, remaining);\n            }\n            match *guard {\n                Some(0) => Ok(()),\n                Some(status) => Err(IshError::Supervisor(format!(\"kernel exit status {status}\"))),\n                None => Err(IshError::Supervisor(\"kernel exit timeout\".into())),\n            }"
+        "            let deadline = std::time::Instant::now() + Duration::from_secs(20);\n            while guard.is_none() {\n                let remaining = deadline.saturating_duration_since(std::time::Instant::now());\n                if remaining.is_zero() {\n                    return Err(IshError::Supervisor(\"kernel exit timeout\".into()));\n                }\n                exit.cv.wait_for(&mut guard, remaining);\n            }\n            match *guard {\n                Some(0) => Ok(()),\n                Some(status) => Err(IshError::Supervisor(format!(\"kernel exit status {status}\"))),\n                None => Err(IshError::Supervisor(\"kernel exit timeout\".into())),\n            }"
       ],
       [
         "eprintln!(\"[ish-out] {frame:?}\");",
@@ -53,6 +53,10 @@
       [
         "if let Err(e) = ish_embed_protocol::write_frame(&mut writer, &frame) {\n            if trace {\n                eprintln!(\"[ish-out] writer write_frame error: {e}\");",
         "if ish_embed_protocol::write_frame(&mut writer, &frame).is_err() {\n            if trace {\n                eprintln!(\"[ish-out] writer write_frame error\");"
+      ],
+      [
+        "/// Sends `Shutdown` and waits up to 5 s for the kernel exit hook to",
+        "/// Sends `Shutdown` and waits up to 20 s for the kernel exit hook to"
       ]
     ],
     "embed/supervisor/src/session.rs": [
@@ -103,6 +107,22 @@
       [
         ".filter(|(_, s)| s.eof && s.exited_announced)",
         ".filter(|(_, s)| s.eof && s.stderr_eof && s.exited_announced)"
+      ],
+      [
+        "        let timeout = if shutdown_requested && sessions.is_empty() {\n            0 // drain mode complete\n        } else if sessions.is_empty() {",
+        "        let timeout = if shutdown_requested {\n            50 // keep reaping adopted descendants even after sessions close\n        } else if sessions.is_empty() {"
+      ],
+      [
+        "        if n == 0 && shutdown_requested && sessions.is_empty() {\n            return Ok(());\n        }\n",
+        "        // An empty session table does not imply that PID 1 has no children.\n"
+      ],
+      [
+        "        // 5) During shutdown, escalate SIGTERM to SIGKILL after the first\n        //    pass. This is a coarse policy — the host can wait or hard-kill\n        //    iSH if it really wants out.\n        if shutdown_requested && !sessions.is_empty() {\n            kill_all(&sessions, libc::SIGKILL);\n        }",
+        "        // 5) PID 1 must reap adopted children, not only tracked sessions.\n        // Workbench can fork extension hosts and independent process groups.\n        // Never exit init until waitpid reports ECHILD and all streams close.\n        if shutdown_requested {\n            let no_children = reap_children(&mut sessions)?;\n            if no_children && sessions.is_empty() {\n                return Ok(());\n            }\n            // This supervisor runs as PID 1 inside the emulated guest.\n            // The guest kill(-1) excludes init and targets guest tasks only.\n            if unsafe { libc::getpid() } != 1 {\n                return Err(io::Error::new(io::ErrorKind::Other, \"shutdown requires guest PID 1\"));\n            }\n            if !no_children {\n                unsafe { libc::kill(-1, libc::SIGKILL); }\n            }\n        }"
+      ],
+      [
+        "fn reap_children(sessions: &mut HashMap<u32, Session>) -> io::Result<()> {\n    loop {\n        let mut status: libc::c_int = 0;\n        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };\n        if pid <= 0 {\n            return Ok(());\n        }",
+        "fn reap_children(sessions: &mut HashMap<u32, Session>) -> io::Result<bool> {\n    loop {\n        let mut status: libc::c_int = 0;\n        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };\n        if pid == 0 {\n            return Ok(false); // child exists, not yet waitable\n        }\n        if pid < 0 {\n            let err = io::Error::last_os_error();\n            if err.raw_os_error() == Some(libc::ECHILD) {\n                return Ok(true);\n            }\n            if err.kind() == io::ErrorKind::Interrupted {\n                continue;\n            }\n            return Err(err);\n        }"
       ]
     ],
     "fs/tty.c": [
@@ -113,6 +133,26 @@
       [
         "        while (tty->bufsize < min) {\n            err = _EIO;\n            if (pty_is_half_closed_master(tty))\n                goto error;",
         "        while (tty->bufsize < min) {\n            err = _EIO;\n            if (tty->hung_up || pty_is_half_closed_master(tty)) {\n                // The master is noncanonical; preserve even a short tail.\n                if (tty->driver == &pty_master && tty->bufsize > 0)\n                    break;\n                goto error;\n            }"
+      ]
+    ],
+    "kernel/fork.c": [
+      [
+        "#define CLONE_SIGHAND_ 0x00000800\n",
+        "#define CLONE_SIGHAND_ 0x00000800\n#define CLONE_PIDFD_ 0x00001000\n"
+      ],
+      [
+        "    if (args.pidfd != 0 || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0)\n        return _EINVAL;",
+        "    // pidfd is an output pointer only when CLONE_PIDFD is requested.\n    // glibc 2.39 pthread_create supplies &pd->tid in this field even\n    // without CLONE_PIDFD. Ignore that unused field, as Linux does.\n    // Do not implement pidfds, set_tid or cgroup placement here.\n    if ((args.flags & CLONE_PIDFD_) || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0)\n        return _EINVAL;"
+      ]
+    ],
+    "kernel/futex.c": [
+      [
+        "            // FUTEX_WAIT_BITSET uses absolute CLOCK_REALTIME timeout;\n            // convert to relative for our futex_wait implementation.\n            struct timespec now;\n            clock_gettime(CLOCK_REALTIME, &now);",
+        "            // Linux WAIT_BITSET deadlines use CLOCK_MONOTONIC by default.\n            // Only FUTEX_CLOCK_REALTIME selects the wall clock. glibc\n            // pthread clock waits otherwise expire immediately on Darwin.\n            struct timespec now;\n            clockid_t clock = (op & FUTEX_CLOCK_REALTIME_) ? CLOCK_REALTIME : CLOCK_MONOTONIC;\n            if (clock_gettime(clock, &now) < 0)\n                return _EINVAL;"
+      ],
+      [
+        "                int64_t remain_ms = (deadline_ns - now_ns) / 1000000LL;\n                if (remain_ms <= 0) { err = _ETIMEDOUT; break; }\n                poll_ms = remain_ms > 100 ? 100 : (int)remain_ms;",
+        "                int64_t remain_ns = deadline_ns - now_ns;\n                if (remain_ns <= 0) { err = _ETIMEDOUT; break; }\n                // Round positive sub-millisecond waits up, not down.\n                poll_ms = remain_ns >= 100000000LL ? 100 : (int)((remain_ns + 999999LL) / 1000000LL);"
       ]
     ]
   }
