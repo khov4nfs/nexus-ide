@@ -27,10 +27,10 @@ async function main(){
             assert.ok((Array.isArray(def)?def:[def]).some(r=>(r.uri||r.targetUri)===a.uri),language+' cross-file definition');
             const refs=await s.projectRequest(b,docs,'textDocument/references',{position:pos,context:{includeDeclaration:true}});
             assert.ok(refs.some(r=>r.uri===a.uri)&&refs.some(r=>r.uri===b.uri),language+' references');
-            const edit=await s.projectRequest(b,docs,'textDocument/rename',{position:pos,newName:replacement});
+            const edit=await s.projectRequest(a,docs,'textDocument/rename',{position:{line:0,character:14},newName:replacement});
             const baseline=new Map(docs.map(d=>[d.uri,{text:d.text,wireVersion:s.docs.get(d.uri).wireVersion}]));
             const rows=plan(edit,baseline,root);
-            assert.equal(rows.length,2);
+            assert.equal(rows.length,2,language+' rename affected files');
             for(const r of rows){
                 assert.equal(r.replacement,baseline.get(r.uri).text.replaceAll(name,replacement));
             }
@@ -46,4 +46,4 @@ async function main(){
         console.log(JSON.stringify({ok:true,scope:'host real pinned TypeScript LSP, not iPhone',server:'4.3.4',typescript:'5.7.3',entrySHA256:sha256,stats:report}));
     }finally{await s.stop();fs.rmSync(root,{recursive:true,force:true});}
 }
-main().catch(e=>{console.error(e.message);process.exitCode=1;});
+main().catch(e=>{console.error(e.stack);process.exitCode=1;});
