@@ -56,6 +56,8 @@ on:
       - 'scripts/workbench-real-lsp-extension.js'
       - 'scripts/workbench-lsp-session.js'
       - 'scripts/test-workbench-lsp-session.js'
+      - 'scripts/workbench-lsp-edits.js'
+      - 'scripts/test-workbench-lsp-edits.js'
       - 'scripts/workbench-browser-probe.py'
       - 'scripts/test-agy-import.py'
       - 'scripts/stage-ubuntu-device.sh'
@@ -836,7 +838,8 @@ jobs:
           export NEXUS_WORKBENCH_BROWSER_SCRIPT="$GITHUB_WORKSPACE/scripts/workbench-browser-probe.py"
           node --check scripts/workbench-real-lsp-extension.js
           node --check scripts/workbench-lsp-session.js
-          node --test scripts/test-workbench-lsp-session.js
+          node --check scripts/workbench-lsp-edits.js
+          node --test scripts/test-workbench-lsp-session.js scripts/test-workbench-lsp-edits.js
           python3 scripts/build-real-workbench-vsix.py "$RUNNER_TEMP/nexus-real-pylsp.vsix"
           export NEXUS_WORKBENCH_VSIX_SHA="$(shasum -a 256 "$RUNNER_TEMP/nexus-real-pylsp.vsix" | awk '{print $1}')"
           cat "$RUNNER_TEMP/nexus-real-pylsp.vsix" > "$NEXUS_WORKBENCH_ROOTFS/opt/nexus/extension.vsix"
