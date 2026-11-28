@@ -212,11 +212,10 @@ async function reviewProjectEdit(editor,operation){
         if(stopping||!vscode.workspace.isTrusted||!rows.every(r=>sameBaseline(r.uri,r.base)))throw Error('workspace changed during review');
         const edit=new vscode.WorkspaceEdit();
         for(const r of rows){
-            // Full replacement only after all ranges, baselines and paths
-            // have been validated. VS Code owns the text-edit transaction.
-            const last=r.base.text.split('\n');
-            const endLine=last.length-1,endChar=last[endLine].length;
-            edit.replace(vscode.Uri.parse(r.uri),new vscode.Range(0,0,endLine,endChar),r.replacement);
+            for(const e of r.rows){
+                const a=e.range.start,b=e.range.end;
+                edit.replace(vscode.Uri.parse(r.uri),new vscode.Range(a.line,a.character,b.line,b.character),e.text);
+            }
         }
         if(!await vscode.workspace.applyEdit(edit))throw Error('editor rejected workspace edit');
         vscode.window.showInformationMessage('Reviewed workspace edit applied. Review and save changed buffers.');
