@@ -31,6 +31,7 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Trusted guest Internet mode may access local network services only when you explicitly enable it."
         INFOPLIST_KEY_CFBundleDisplayName: Nexus IDE Ubuntu
         SWIFT_VERSION: '5.0'
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) NEXUS_UBUNTU_LAB $(NEXUS_VM_SWIFT_FLAGS)"
