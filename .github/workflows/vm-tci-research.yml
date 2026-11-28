@@ -1,8 +1,11 @@
 name: Full-system TCI research gate
 on:
   workflow_dispatch:
+  workflow_call:
   pull_request:
     paths:
+      - 'scripts/prepare-full-vm-image.sh'
+      - 'scripts/vm-tci-network-probe.py'
       - 'scripts/vm-tci-host-smoke.sh'
       - 'scripts/vm-tci-guest-smoke.sh'
       - '.github/workflows/vm-tci-research.yml'
@@ -18,12 +21,14 @@ jobs:
           persist-credentials: false
       - name: Validate research scripts
         run: |
+          bash -n scripts/prepare-full-vm-image.sh
+          python3 -m py_compile scripts/vm-tci-network-probe.py
           bash -n scripts/vm-tci-host-smoke.sh
           sh -n scripts/vm-tci-guest-smoke.sh
       - name: Install host-only build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev libffi-dev python3-venv e2fsprogs
+          sudo apt-get install -y build-essential ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev libffi-dev libslirp-dev python3-venv e2fsprogs
       - name: Compile TCI and execute actual Linux kernel, Docker and Compose
         run: bash scripts/vm-tci-host-smoke.sh "$RUNNER_TEMP/nexus-vm-tci"
       - name: Preserve host research evidence (no disk or IPA)
